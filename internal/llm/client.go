@@ -165,7 +165,7 @@ CRITICAL JSON RULES:
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": userPrompt},
 		},
-		"max_completion_tokens": 1024,
+		"max_completion_tokens": 2048,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
