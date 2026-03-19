@@ -219,10 +219,11 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 
 	// Source hint cross-check (fuzzy): if the LLM thinks this is from a
 	// completely unrelated service, don't trust the pattern.
-	// "nginx" matches "demo-nginx", "nginx-proxy" matches "nginx", etc.
-	if verdict.SourceHint != "" &&
-		!strings.Contains(strings.ToLower(evt.SourceName), strings.ToLower(verdict.SourceHint)) &&
-		!strings.Contains(strings.ToLower(verdict.SourceHint), strings.ToLower(evt.SourceName)) {
+	// Docker Swarm names look like "captain-nginx.1.hjfscqq05nqt..." — we extract
+	// the short service name (before first ".") for comparison.
+	// LLM hints are verbose like "nginx access logs in docker container" — we check
+	// if any significant word from the hint appears in the source name, or vice versa.
+	if verdict.SourceHint != "" && !sourceHintMatches(evt.SourceName, verdict.SourceHint) {
 		log.Printf("[analyzer] Source hint mismatch: LLM says %q, actual is %q — skipping pattern",
 			verdict.SourceHint, evt.SourceName)
 		return false
@@ -281,6 +282,87 @@ func mapActionToVerdict(action string) patternstore.Verdict {
 	default:
 		return patternstore.VerdictUnknown
 	}
+}
+
+// sourceHintMatches checks whether the LLM's source hint plausibly refers to
+// the same service as the actual source name.
+//
+// Docker Swarm names look like "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo".
+// The LLM returns verbose hints like "nginx access logs in docker container".
+//
+// Strategy:
+//  1. Extract the short name from the source (before first ".") → "captain-nginx"
+//  2. Check if the short name appears in the hint, or vice versa
+//  3. Tokenize both and look for any shared word of 4+ chars that isn't
+//     a common filler word (docker, container, log, access, service, etc.)
+func sourceHintMatches(sourceName, sourceHint string) bool {
+	nameLower := strings.ToLower(sourceName)
+	hintLower := strings.ToLower(sourceHint)
+
+	// Direct containment (handles simple cases like "nginx" / "demo-nginx")
+	if strings.Contains(nameLower, hintLower) || strings.Contains(hintLower, nameLower) {
+		return true
+	}
+
+	// Extract short name: "captain-nginx.1.hjfsc..." → "captain-nginx"
+	shortName := nameLower
+	if dotIdx := strings.Index(nameLower, "."); dotIdx > 0 {
+		shortName = nameLower[:dotIdx]
+	}
+
+	// Check short name against hint
+	if strings.Contains(hintLower, shortName) {
+		return true
+	}
+
+	// Check if hint contains any segment of the short name split by "-"
+	// "captain-nginx" → check "captain", "nginx" against hint
+	// "srv-captain--api" → check "srv", "captain", "api"
+	segments := strings.FieldsFunc(shortName, func(r rune) bool { return r == '-' })
+	for _, seg := range segments {
+		if len(seg) < 4 {
+			continue // skip short segments like "srv"
+		}
+		if isFillerWord(seg) {
+			continue
+		}
+		if strings.Contains(hintLower, seg) {
+			return true
+		}
+	}
+
+	// Reverse: check if any significant word from the hint appears in the source name
+	hintWords := strings.FieldsFunc(hintLower, func(r rune) bool {
+		return r == ' ' || r == '/' || r == '(' || r == ')' || r == ':'
+	})
+	for _, word := range hintWords {
+		if len(word) < 4 {
+			continue
+		}
+		if isFillerWord(word) {
+			continue
+		}
+		if strings.Contains(nameLower, word) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isFillerWord returns true for common words that appear in LLM source hints
+// but don't actually identify a specific service.
+func isFillerWord(word string) bool {
+	switch word {
+	case "docker", "container", "containerized", "containers",
+		"logs", "logging", "access", "error", "service",
+		"server", "running", "inside", "from", "with",
+		"http", "https", "application", "startup", "message",
+		"messages", "info", "build", "script", "system",
+		"entry", "entrypoint", "daemon", "process":
+		return true
+	}
+	return false
 }
 
 // GetStats returns a snapshot of current pipeline statistics.
