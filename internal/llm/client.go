@@ -165,7 +165,7 @@ CRITICAL JSON RULES:
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": userPrompt},
 		},
-		"max_completion_tokens": 2048,
+		"max_completion_tokens": 4096,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -215,6 +215,13 @@ CRITICAL JSON RULES:
 
 	// Parse the structured verdict from the LLM's response
 	content := chatResp.Choices[0].Message.Content
+	if content == "" {
+		// Log the raw response to understand why content is empty.
+		// Common causes: reasoning tokens consumed entire budget,
+		// content filter, or model returned content in a different field.
+		log.Printf("[llm] Empty content from LLM. Raw response (first 500 bytes): %s", truncateStr(string(rawBody), 500))
+		return nil, fmt.Errorf("LLM returned empty content")
+	}
 	var verdict Verdict
 	if err := json.Unmarshal([]byte(content), &verdict); err != nil {
 		// LLM sometimes wraps JSON in markdown code blocks
@@ -319,4 +326,11 @@ func sanitizeJSON(s string) string {
 	}
 
 	return result.String()
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
