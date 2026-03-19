@@ -1,0 +1,134 @@
+package notifier
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// EmailNotifier sends alert emails via the Resend API.
+type EmailNotifier struct {
+	config     EmailConfig
+	httpClient *http.Client
+}
+
+func NewEmailNotifier(cfg EmailConfig) *EmailNotifier {
+	if cfg.From == "" {
+		cfg.From = "VaultGuardian LogWatch <alerts@vaultdec.com>"
+	}
+	return &EmailNotifier{
+		config: cfg,
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
+
+func (e *EmailNotifier) Name() string { return "email" }
+
+func (e *EmailNotifier) Send(ctx context.Context, alert Alert) error {
+	subject := formatAlertTitle(alert)
+	body := formatEmailHTML(alert)
+
+	payload := map[string]interface{}{
+		"from":    e.config.From,
+		"to":      []string{e.config.To},
+		"subject": subject,
+		"html":    body,
+	}
+
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshalling email payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://api.resend.com/emails", bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("creating email request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.config.APIKey)
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("email request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func formatEmailHTML(alert Alert) string {
+	severityColor := "#f59e0b"
+	switch alert.Severity {
+	case SeverityMalicious:
+		severityColor = "#ef4444"
+	case SeveritySuspicious:
+		severityColor = "#f59e0b"
+	case SeverityAlert:
+		severityColor = "#3b82f6"
+	}
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px;background:#f9fafb;">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;border:1px solid #e5e7eb;overflow:hidden;">
+    <div style="padding:16px 24px;background:%s;color:#fff;">
+      <h2 style="margin:0;font-size:16px;font-weight:600;">VaultGuardian LogWatch Alert</h2>
+    </div>
+    <div style="padding:24px;">
+      <table style="width:100%%;border-collapse:collapse;font-size:14px;">
+        <tr>
+          <td style="padding:8px 0;color:#6b7280;width:120px;">Severity</td>
+          <td style="padding:8px 0;font-weight:600;">%s</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;color:#6b7280;">Container</td>
+          <td style="padding:8px 0;">%s <span style="color:#9ca3af;">(%s)</span></td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;color:#6b7280;">Reason</td>
+          <td style="padding:8px 0;">%s</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;color:#6b7280;">Time</td>
+          <td style="padding:8px 0;">%s</td>
+        </tr>
+      </table>
+      <div style="margin-top:16px;padding:12px;background:#f3f4f6;border-radius:6px;font-family:'SF Mono',Monaco,monospace;font-size:13px;word-break:break-all;color:#374151;">
+        %s
+      </div>
+    </div>
+    <div style="padding:12px 24px;background:#f9fafb;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;">
+      Sent by VaultGuardian LogWatch
+    </div>
+  </div>
+</body>
+</html>`,
+		severityColor,
+		alert.Severity,
+		alert.ContainerName, alert.ContainerID[:minInt(12, len(alert.ContainerID))],
+		alert.Reason,
+		alert.Timestamp.Format(time.RFC3339),
+		truncateStr(alert.LogLine, 1000),
+	)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
