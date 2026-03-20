@@ -136,22 +136,48 @@ type liveCollector struct {
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
-	// TODO: Phase 1 implementation
-	//   1. Open gopacket handle on configured interface + ports
-	//   2. Parse plaintext HTTP request/response pairs
-	//   3. Insert CapturedResponse entries into ring buffer
-	//   4. Run in a goroutine, respect ctx cancellation
+	// Auto-detect interface if not configured
+	iface := lc.config.Interface
+	if iface == "" {
+		iface = autoDetectInterface()
+		// Empty is OK — means capture on all interfaces
+	}
 
-	log.Printf("[rec] Response Evidence Capture started on interface=%q ports=%v "+
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes)
+
+	// Open socket SYNCHRONOUSLY — if this fails, Start() returns the error
+	// and running stays false. No false "enabled" state. (code review's catch:
+	// only mark running=true after real capture starts.)
+	fd, err := s.openSocket()
+	if err != nil {
+		return fmt.Errorf("REC capture failed to start: %w", err)
+	}
+
+	// Socket is open and verified — NOW we can mark as running
+	lc.running.Store(true)
+
+	// Launch read loop goroutine (socket already open)
+	go func() {
+		s.readLoop(ctx, fd)
+		lc.running.Store(false) // mark stopped when loop exits
+	}()
+
+	// Launch cleanup goroutine for stale pending requests
+	go s.cleanupLoop(ctx)
+
+	ifaceDesc := iface
+	if ifaceDesc == "" {
+		ifaceDesc = "(all interfaces)"
+	}
+	log.Printf("[rec] Response Evidence Capture started on interface=%s ports=%v "+
 		"buffer=[maxEntries=%d maxBytes=%d maxAge=%s maxBody=%d]",
-		lc.config.Interface,
+		ifaceDesc,
 		lc.config.Ports,
 		lc.config.Buffer.MaxEntries,
 		lc.config.Buffer.MaxTotalBytes,
 		lc.config.Buffer.MaxAge,
 		lc.config.Buffer.MaxBodyBytes,
 	)
-	lc.running.Store(true)
 	return nil
 }
 
@@ -208,7 +234,8 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		StatusCode:      best.StatusCode,
 		ContentType:     best.ContentType,
 		ContentLength:   best.ContentLength,
-		BodyHash:        best.BodyHash,
+		BodyPreviewHash: best.BodyPreviewHash,
+		CaptureMode:     "single_segment_preview",
 		CapturedAt:      best.Timestamp,
 		ResponseLatency: absDuration(best.Timestamp.Sub(req.Timestamp)),
 	}
@@ -360,19 +387,6 @@ func redactHTML(body []byte) string {
 }
 
 // =============================================================================
-// Capability Check
-// =============================================================================
-
-func hasCapNetRaw() bool {
-	// TODO: Phase 1 implementation
-	// Check /proc/self/status for CapEff bitmask, bit 13 = CAP_NET_RAW.
-	// Or: attempt to open a raw socket and check for EPERM.
-	//
-	// Returns false for now — forces NoOp path during development.
-	return false
-}
-
-// =============================================================================
 // Utilities
 // =============================================================================
 
@@ -400,7 +414,8 @@ func FormatEvidence(e *Evidence) string {
 		out += fmt.Sprintf("  Response Code: %d\n", e.Transport.StatusCode)
 		out += fmt.Sprintf("  Content-Type: %s\n", e.Transport.ContentType)
 		out += fmt.Sprintf("  Content-Length: %d\n", e.Transport.ContentLength)
-		out += fmt.Sprintf("  Body Hash: sha256:%s\n", e.Transport.BodyHash)
+		out += fmt.Sprintf("  Body Preview Hash: sha256:%s\n", e.Transport.BodyPreviewHash)
+		out += fmt.Sprintf("  Capture Mode: %s\n", e.Transport.CaptureMode)
 		out += fmt.Sprintf("  Captured: %s\n", e.Transport.CapturedAt.Format(time.RFC3339))
 		if e.Transport.ResponseLatency > 0 {
 			out += fmt.Sprintf("  Response Latency: %s\n", e.Transport.ResponseLatency)
@@ -411,6 +426,15 @@ func FormatEvidence(e *Evidence) string {
 	}
 	if e.SafeBodyPreview != "" {
 		out += fmt.Sprintf("  Body (redacted):\n    %s\n", e.SafeBodyPreview)
+	} else if e.HasEvidence() {
+		// Explain WHY the preview is missing (code review #9)
+		if e.CorrelationConfidence != ConfidenceHigh {
+			out += "  Body Preview: withheld (low correlation confidence)\n"
+		} else if e.Disclosure != nil && e.Disclosure.RedactionConfidence != ConfidenceHigh {
+			out += fmt.Sprintf("  Body Preview: withheld (%s format — redaction not confident)\n", e.Disclosure.Format)
+		} else {
+			out += "  Body Preview: not available\n"
+		}
 	}
 	return out
 }

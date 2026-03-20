@@ -90,7 +90,7 @@ type CapturedResponse struct {
 	ContentType   string
 	ContentLength int64
 	BodyPreview   []byte // truncated to MaxBodyBytes
-	BodyHash      string // SHA-256 of the FULL body (before truncation)
+	BodyPreviewHash string // SHA-256 of captured body PREVIEW (not full body)
 
 	// Source container/service that generated the response (if identifiable)
 	SourceContainer string
@@ -135,7 +135,7 @@ func NewRingBuffer(cfg BufferConfig) *RingBuffer {
 }
 
 // Insert adds a captured response to the buffer.
-// Body is truncated to MaxBodyBytes (BodyHash already covers full body).
+// Body is truncated to MaxBodyBytes (BodyPreviewHash covers the truncated preview).
 // Called by the sniffer goroutine — takes a write lock.
 func (rb *RingBuffer) Insert(resp CapturedResponse) {
 	rb.mu.Lock()

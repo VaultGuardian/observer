@@ -59,7 +59,7 @@ RESPONSE EVIDENCE:
   Response Code: {{ .Evidence.Transport.StatusCode }}
   Content-Type: {{ .Evidence.Transport.ContentType }}
   Content-Length: {{ .Evidence.Transport.ContentLength }}
-  Body Hash: sha256:{{ .Evidence.Transport.BodyHash }}
+  Body Hash: sha256:{{ .Evidence.Transport.BodyPreviewHash }}
   {{ if .Evidence.Disclosure }}
   Disclosure: {{ .Evidence.Disclosure.DisclosureSummary }}
   {{ end }}

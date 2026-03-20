@@ -113,7 +113,7 @@ func formatEmailHTML(alert Alert) string {
             <td style="padding:4px 0;color:#6b7280;">Body Hash</td>
             <td style="padding:4px 0;"><code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-size:11px;">sha256:%.16s</code></td>
           </tr>`,
-				t.StatusCode, t.ContentType, t.ContentLength, t.BodyHash)
+				t.StatusCode, t.ContentType, t.ContentLength, t.BodyPreviewHash)
 		}
 
 		if alert.Evidence.Disclosure != nil {

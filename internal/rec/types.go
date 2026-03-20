@@ -96,10 +96,21 @@ const (
 type TransportEvidence struct {
 	StatusCode      int           `json:"status_code"`
 	ContentType     string        `json:"content_type"`
-	ContentLength   int64         `json:"content_length"`
-	BodyHash        string        `json:"body_hash"`         // SHA-256 of FULL body (pre-truncation)
+	ContentLength   int64         `json:"content_length"`        // from headers (may differ from actual body size)
 	CapturedAt      time.Time     `json:"captured_at"`
 	ResponseLatency time.Duration `json:"response_latency,omitempty"`
+
+	// SHA-256 hash of the captured body PREVIEW, not the full response body.
+	// Phase 1 captures only what fits in a single TCP segment after headers.
+	// Do NOT treat this as a forensic hash of the complete response.
+	// (code review's catch: don't lie in the type.)
+	BodyPreviewHash string `json:"body_preview_hash"`
+
+	// How this evidence was captured. Tells consumers how much to trust it.
+	// Phase 1 is always "single_segment_preview" — headers and partial body
+	// from one TCP segment. Future phases may add "full_stream" etc.
+	// (code review's catch: mark capture as partial so users don't over-read.)
+	CaptureMode string `json:"capture_mode"`
 }
 
 // =============================================================================
@@ -192,10 +203,11 @@ func (e *Evidence) ForJournal() string {
 	}
 	s := fmt.Sprintf("EvidenceStatus=%s Correlation=%s", e.Status, e.CorrelationConfidence)
 	if e.HasEvidence() && e.Transport != nil {
-		s += fmt.Sprintf(" StatusCode=%d ContentLength=%d BodyHash=sha256:%.16s",
+		s += fmt.Sprintf(" StatusCode=%d ContentLength=%d BodyPreviewHash=sha256:%.16s CaptureMode=%s",
 			e.Transport.StatusCode,
 			e.Transport.ContentLength,
-			e.Transport.BodyHash,
+			e.Transport.BodyPreviewHash,
+			e.Transport.CaptureMode,
 		)
 		if e.Disclosure != nil {
 			s += fmt.Sprintf(" Format=%s Disclosure=%q", e.Disclosure.Format, e.Disclosure.DisclosureSummary)
