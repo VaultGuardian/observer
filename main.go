@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/vaultguardian/logwatch/internal/normalizer"
 	"github.com/vaultguardian/logwatch/internal/notifier"
 	"github.com/vaultguardian/logwatch/internal/patternstore"
+	"github.com/vaultguardian/logwatch/internal/rec"
 	"github.com/vaultguardian/logwatch/internal/watcher"
 )
 
@@ -88,6 +91,14 @@ func main() {
 		log.Println("[observer] No notification channels configured — alerts will be logged to stdout only")
 	}
 
+	// ------- Init Response Evidence Capture (opt-in) -------
+	recCfg := rec.DefaultCollectorConfig()
+	recCfg.Enabled = getEnv("REC_ENABLED", "") == "true"
+	if iface := getEnv("REC_INTERFACE", ""); iface != "" {
+		recCfg.Interface = iface
+	}
+	collector := rec.NewCollector(recCfg)
+
 	// ------- Context with graceful shutdown -------
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -100,6 +111,11 @@ func main() {
 		log.Println("[observer] Shutting down...")
 		cancel()
 	}()
+
+	// ------- Start REC capture (non-blocking, non-fatal) -------
+	if err := collector.Start(ctx); err != nil {
+		log.Printf("[observer] REC failed to start: %v (continuing without evidence capture)", err)
+	}
 
 	// ------- Check LLM availability (non-blocking) -------
 	go func() {
@@ -163,7 +179,7 @@ func main() {
 
 		// Build the alert snapshot ONCE from this specific event+result pair.
 		// All fields come from the same goroutine-local variables — no cross-event contamination.
-		buildAlert := func(severity notifier.Severity) notifier.Alert {
+		buildAlert := func(severity notifier.Severity, evidence *rec.Evidence) notifier.Alert {
 			return notifier.Alert{
 				EventID:        evt.ID,
 				Severity:       severity,
@@ -176,7 +192,23 @@ func main() {
 				Classification: result.LLMClassification,
 				Confidence:     result.LLMConfidence,
 				Timestamp:      time.Now(),
+				Evidence:       evidence,
 			}
+		}
+
+		// lookupEvidence performs REC correlation for alert/deny verdicts.
+		// Enrichment-only — never changes the verdict, just attaches evidence.
+		lookupEvidence := func() *rec.Evidence {
+			method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
+			evidence := collector.Lookup(rec.LookupRequest{
+				Method:          method,
+				Path:            path,
+				Host:            host,
+				SourceContainer: evt.SourceName,
+				StatusCode:      statusCode,
+				Timestamp:       evt.Timestamp,
+			})
+			return evidence
 		}
 
 		switch result.Verdict {
@@ -190,18 +222,21 @@ func main() {
 
 		case patternstore.VerdictDeny:
 			// ALERT! Known-bad or LLM-classified malicious
-			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
-				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash, truncate(evt.Line, 200))
+			evidence := lookupEvidence()
+			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
+				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
+				evidence.ForJournal(), truncate(evt.Line, 200))
 
-			dispatch.Dispatch(ctx, buildAlert(notifier.SeverityMalicious))
+			dispatch.Dispatch(ctx, buildAlert(notifier.SeverityMalicious, evidence))
 
 		case patternstore.VerdictAlert:
 			// SUSPICIOUS — LLM flagged as suspicious, or memoized repeat of same.
-			// Lower severity than deny. Exact-hash only, no broad patterns.
-			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
-				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash, truncate(evt.Line, 200))
+			evidence := lookupEvidence()
+			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
+				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
+				evidence.ForJournal(), truncate(evt.Line, 200))
 
-			dispatch.Dispatch(ctx, buildAlert(notifier.SeveritySuspicious))
+			dispatch.Dispatch(ctx, buildAlert(notifier.SeveritySuspicious, evidence))
 
 		case patternstore.VerdictUnknown:
 			// LLM had an error, was dropped by backpressure, or returned
@@ -283,4 +318,23 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// reNormalizedHTTP matches the v0.9 normalized nginx access log format:
+//   HOST METHOD /path?query HTTP/X.X STATUS
+// Example: "api.admin.kovicloud.com GET /?q=UNION+SELECT HTTP/2.0 200"
+var reNormalizedHTTP = regexp.MustCompile(
+	`^(\S+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
+
+// parseNormalizedLine extracts HTTP components from a normalized log line.
+// Returns method, path (raw with query string), host, and status code.
+// For non-HTTP logs (error logs, syslog, etc.), returns zero values — REC
+// will return no_match, which is the correct behavior.
+func parseNormalizedLine(normalized string) (method, path, host string, statusCode int) {
+	m := reNormalizedHTTP.FindStringSubmatch(normalized)
+	if m == nil {
+		return "", "", "", 0
+	}
+	code, _ := strconv.Atoi(m[4])
+	return m[2], m[3], m[1], code
 }
