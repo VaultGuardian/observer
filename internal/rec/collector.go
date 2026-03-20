@@ -136,12 +136,12 @@ type liveCollector struct {
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
-	// Auto-detect interface if not configured
-	iface := lc.config.Interface
-	if iface == "" {
-		iface = autoDetectInterface()
-		// Empty is OK — means capture on all interfaces
-	}
+	// Use configured interface, or capture on ALL interfaces (the safe default).
+	// On Docker Swarm / CapRover, traffic flows through multiple interfaces
+	// (docker_gwbridge, overlay veths, ingress network) — binding to one
+	// specific interface misses traffic on others. Capturing on all interfaces
+	// ensures we see nginx→backend forwarded HTTP regardless of network topology.
+	iface := lc.config.Interface // empty = all interfaces
 
 	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes)
 
