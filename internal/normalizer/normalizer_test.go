@@ -356,3 +356,126 @@ func TestDifferentAttacksShouldNotMatch(t *testing.T) {
 		hashes[evt.Hash] = atk.name
 	}
 }
+
+// TestCapRoverNginxFormat verifies that the normalizer correctly handles
+// CapRover's nginx access log format which includes a hostname field
+// before the request line.
+func TestCapRoverNginxFormat(t *testing.T) {
+	reg := NewRegistry()
+
+	t.Run("hostname field does not eat request line", func(t *testing.T) {
+		evt := &event.Event{
+			SourceType: "docker",
+			SourceName: "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo",
+			Line:       "98.152.173.124 - - [20/Mar/2026:19:05:08 +0000] \"api.admin.kovicloud.com\" \"GET /?q=UNION+SELECT+1,2,3 HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\"",
+		}
+		reg.NormalizeEvent(evt)
+		t.Logf("Normalized: %q", evt.NormalizedLine)
+
+		// The request line must be preserved, not replaced with <VAR>
+		if evt.NormalizedLine == "" {
+			t.Fatal("NormalizedLine is empty")
+		}
+		if !contains(evt.NormalizedLine, "UNION+SELECT") {
+			t.Errorf("Query string was stripped! Normalized: %q", evt.NormalizedLine)
+		}
+		if !contains(evt.NormalizedLine, "GET") {
+			t.Errorf("HTTP method was stripped! Normalized: %q", evt.NormalizedLine)
+		}
+	})
+
+	t.Run("different attacks produce different hashes (the original bug)", func(t *testing.T) {
+		attacks := []struct {
+			name string
+			line string
+		}{
+			{"SQL injection", "98.152.173.124 - - [20/Mar/2026:19:05:08 +0000] \"api.admin.kovicloud.com\" \"GET /?q=UNION+SELECT+1,2,3 HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\""},
+			{"command injection", "98.152.173.124 - - [20/Mar/2026:19:05:09 +0000] \"api.admin.kovicloud.com\" \"GET /?cmd=cat+/etc/passwd HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\""},
+			{"shell injection", "98.152.173.124 - - [20/Mar/2026:19:05:10 +0000] \"api.admin.kovicloud.com\" \"GET /?page=;ls+-la HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\""},
+			{"path traversal", "98.152.173.124 - - [20/Mar/2026:19:05:11 +0000] \"api.admin.kovicloud.com\" \"GET /?file=../../etc/shadow HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\""},
+			{"DROP TABLE", "98.152.173.124 - - [20/Mar/2026:19:05:11 +0000] \"api.admin.kovicloud.com\" \"GET /?id=1;DROP+TABLE+users HTTP/2.0\" 200 34020 \"-\" \"curl/8.5.0\" \"-\""},
+		}
+
+		hashes := make(map[string]string)
+		for _, atk := range attacks {
+			evt := &event.Event{
+				SourceType: "docker",
+				SourceName: "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo",
+				Line:       atk.line,
+			}
+			reg.NormalizeEvent(evt)
+			t.Logf("%s → %q (hash=%s)", atk.name, evt.NormalizedLine, evt.Hash[:16])
+
+			if prevName, exists := hashes[evt.Hash]; exists {
+				t.Errorf("COLLISION: %q and %q produced the same hash! This was the original bug.", atk.name, prevName)
+			}
+			hashes[evt.Hash] = atk.name
+		}
+	})
+
+	t.Run("different 404 paths produce different hashes", func(t *testing.T) {
+		paths := []struct {
+			name string
+			line string
+		}{
+			{"admin", "98.152.173.124 - - [20/Mar/2026:19:05:12 +0000] \"api.admin.kovicloud.com\" \"GET /admin HTTP/2.0\" 404 6603 \"-\" \"curl/8.5.0\" \"-\""},
+			{"login", "98.152.173.124 - - [20/Mar/2026:19:05:12 +0000] \"api.admin.kovicloud.com\" \"GET /login HTTP/2.0\" 404 6603 \"-\" \"curl/8.5.0\" \"-\""},
+			{"phpmyadmin", "98.152.173.124 - - [20/Mar/2026:19:05:12 +0000] \"api.admin.kovicloud.com\" \"GET /phpmyadmin HTTP/2.0\" 404 6603 \"-\" \"curl/8.5.0\" \"-\""},
+			{"wp-admin", "98.152.173.124 - - [20/Mar/2026:19:05:12 +0000] \"api.admin.kovicloud.com\" \"GET /wp-admin/install.php HTTP/2.0\" 404 6603 \"-\" \"curl/8.5.0\" \"-\""},
+			{"env", "98.152.173.124 - - [20/Mar/2026:19:05:12 +0000] \"api.admin.kovicloud.com\" \"GET /.env HTTP/2.0\" 403 146 \"-\" \"curl/8.5.0\" \"-\""},
+		}
+
+		hashes := make(map[string]string)
+		for _, p := range paths {
+			evt := &event.Event{
+				SourceType: "docker",
+				SourceName: "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo",
+				Line:       p.line,
+			}
+			reg.NormalizeEvent(evt)
+			t.Logf("%s → %q (hash=%s)", p.name, evt.NormalizedLine, evt.Hash[:16])
+
+			if prevName, exists := hashes[evt.Hash]; exists {
+				t.Errorf("COLLISION: %q and %q produced the same hash!", p.name, prevName)
+			}
+			hashes[evt.Hash] = p.name
+		}
+	})
+
+	t.Run("same request from different IPs hashes identically", func(t *testing.T) {
+		lines := []string{
+			"98.152.173.124 - - [20/Mar/2026:19:05:06 +0000] \"api.admin.kovicloud.com\" \"GET /.env HTTP/2.0\" 403 146 \"-\" \"curl/8.5.0\" \"-\"",
+			"45.43.70.126 - - [20/Mar/2026:19:10:00 +0000] \"api.admin.kovicloud.com\" \"GET /.env HTTP/2.0\" 403 146 \"-\" \"Mozilla/5.0\" \"-\"",
+		}
+
+		var firstHash string
+		for i, line := range lines {
+			evt := &event.Event{
+				SourceType: "docker",
+				SourceName: "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo",
+				Line:       line,
+			}
+			reg.NormalizeEvent(evt)
+
+			if i == 0 {
+				firstHash = evt.Hash
+			} else if evt.Hash != firstHash {
+				t.Errorf("Same request from different IPs produced different hashes!")
+			}
+		}
+	})
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && stringContains(s, substr)))
+}
+
+func stringContains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

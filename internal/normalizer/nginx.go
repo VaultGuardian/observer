@@ -45,30 +45,19 @@ var (
 	reNginxClient = regexp.MustCompile(`client:\s+\S+,`)
 
 	// Worker/child process numbers in notice logs: "start worker process 31"
-	// These are short numbers (1-2 digits) that the generic normalizer won't catch.
 	reNginxProcessNum = regexp.MustCompile(`process \d+`)
 
-	// Query string in request path
-	reQueryString = regexp.MustCompile(`\?[^"]*`)
+	// All quoted fields in a log line
+	reAllQuotedFields = regexp.MustCompile(`"([^"]*)"`)
 
-	// Numeric path segments: /users/12345 → /users/<ID>
-	reNumericPathSeg = regexp.MustCompile(`/\d+(/|"|$)`)
+	// Matches an HTTP request line: METHOD /path HTTP/version
+	reRequestLine = regexp.MustCompile(`^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT|TRACE)\s+\S+\s+HTTP/\d(?:\.\d)?$`)
 
-	// Access log: status code + byte count after closing quote of request line.
-	// Used on the full line in fallback mode.
-	reAccessStatusBytes = regexp.MustCompile(`" (\d{3}) \d+`)
-
-	// Trailing status + bytes when the line has been split at the request line end.
-	// The trailing part starts with: " 200 896 ..." (space, status, space, bytes)
+	// Trailing status + bytes after request line
 	reTrailingStatusBytes = regexp.MustCompile(`^\s*(\d{3})\s+\d+`)
 
 	// Upstream response time: 0.001, 1.234
 	reUpstreamTime = regexp.MustCompile(`\b\d+\.\d{3}\b`)
-
-	// Any quoted string: "anything here" — used to strip referrer, user-agent,
-	// x-forwarded-for AFTER the request line has been processed.
-	// We apply this only to the trailing portion of access logs.
-	reQuotedField = regexp.MustCompile(`"[^"]*"`)
 )
 
 func (n *NginxNormalizer) Normalize(line string) string {
@@ -95,62 +84,71 @@ func (n *NginxNormalizer) normalizeAccess(line string) string {
 	line = reNginxBracketTS.ReplaceAllString(line, "")
 
 	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
 
-	// At this point the line looks like:
-	// "GET /;ls+-la HTTP/1.1" 404 153 "-" "curl/8.5.0" "-"
+	// Extract all quoted fields from the line.
+	// Standard nginx combined:  "GET /path HTTP/1.1" 200 1234 "-" "curl/8.5.0"
+	// CapRover nginx:           "api.admin.kovicloud.com" "GET /path HTTP/2.0" 200 1234 "-" "curl/8.5.0" "-"
 	//
-	// We need to:
-	// 1. Keep the request line (first quoted string) — that's the classification signal
-	// 2. Keep the status code
-	// 3. Replace everything else (bytes, referrer, user-agent, x-forwarded-for)
+	// The request line is the quoted field that starts with an HTTP method.
+	// If a quoted field appears before it (e.g. hostname), preserve it as HOST.
+	// Everything after the request line (referrer, user-agent, etc.) is stripped.
+	fields := reAllQuotedFields.FindAllStringSubmatch(line, -1)
 
-	// Find the end of the request line (first closing quote after opening)
-	requestEnd := -1
-	if len(line) > 0 && line[0] == '"' {
-		// Find the matching close quote for the request line
-		requestEnd = strings.Index(line[1:], `"`)
-		if requestEnd >= 0 {
-			requestEnd += 2 // adjust for offset + include closing quote
+	var host string
+	var requestLine string
+	var requestFieldIdx int
+
+	for i, f := range fields {
+		val := f[1]
+		if reRequestLine.MatchString(val) {
+			requestLine = val
+			requestFieldIdx = i
+
+			// If the field before this one is not itself a request line,
+			// it's the hostname/vhost (CapRover format).
+			if i > 0 && !reRequestLine.MatchString(fields[i-1][1]) {
+				host = fields[i-1][1]
+			}
+			break
 		}
 	}
 
-	if requestEnd > 0 && requestEnd < len(line) {
-		requestPart := line[:requestEnd]
-		trailingPart := line[requestEnd:]
-
-		// Normalize the request part
-		requestPart = reQueryString.ReplaceAllString(requestPart, "?<QUERY>")
-		requestPart = reNumericPathSeg.ReplaceAllStringFunc(requestPart, func(match string) string {
-			last := match[len(match)-1:]
-			return "/<ID>" + last
-		})
-
-		// Normalize the trailing part: status + bytes + quoted fields
-		// Replace byte count: " 200 896" → " 200 <BYTES>"
-		trailingPart = reTrailingStatusBytes.ReplaceAllString(trailingPart, " $1 <BYTES>")
-
-		// Replace ALL remaining quoted strings (referrer, user-agent, x-forwarded-for)
-		trailingPart = reQuotedField.ReplaceAllString(trailingPart, `"<VAR>"`)
-
-		// Strip upstream response times if present
-		trailingPart = reUpstreamTime.ReplaceAllString(trailingPart, "<TIME>")
-
-		line = requestPart + trailingPart
-	} else {
-		// Couldn't parse request line — fall back to simple replacements
-		line = reQueryString.ReplaceAllString(line, "?<QUERY>")
-		line = reNumericPathSeg.ReplaceAllStringFunc(line, func(match string) string {
-			last := match[len(match)-1:]
-			return "/<ID>" + last
-		})
-		line = reAccessStatusBytes.ReplaceAllString(line, `" $1 <BYTES>`)
-		line = reUpstreamTime.ReplaceAllString(line, "<TIME>")
+	// Couldn't find a request line — return minimally cleaned version
+	if requestLine == "" {
+		return strings.Join(strings.Fields(line), " ")
 	}
 
-	// Collapse whitespace
-	line = strings.Join(strings.Fields(line), " ")
+	// Find status code from the text after the request line's closing quote
+	requestQuoted := `"` + requestLine + `"`
+	idx := strings.Index(line, requestQuoted)
 
-	return line
+	status := "000"
+	if idx >= 0 {
+		suffix := line[idx+len(requestQuoted):]
+		if m := reTrailingStatusBytes.FindStringSubmatch(strings.TrimSpace(suffix)); len(m) > 1 {
+			status = m[1]
+		}
+	}
+
+	// Build the normalized output.
+	// The request line is SACRED — method, path, query string, protocol all preserved.
+	// This ensures different attack payloads produce different hashes.
+	//
+	// We strip: IP, timestamp, byte count, referrer, user-agent, x-forwarded-for.
+	// We keep: host (if present), full request line, status code.
+	_ = requestFieldIdx // used above for host detection
+
+	parts := make([]string, 0, 4)
+	if host != "" {
+		parts = append(parts, host)
+	}
+	parts = append(parts, requestLine)
+	parts = append(parts, status)
+
+	return strings.Join(parts, " ")
 }
 
 func (n *NginxNormalizer) normalizeError(line string) string {
