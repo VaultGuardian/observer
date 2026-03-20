@@ -103,12 +103,19 @@ func formatEmailHTML(alert Alert) string {
           <td style="padding:8px 0;">%s</td>
         </tr>
         <tr>
+          <td style="padding:8px 0;color:#6b7280;">Matched Via</td>
+          <td style="padding:8px 0;"><code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-size:12px;">%s</code></td>
+        </tr>
+        <tr>
           <td style="padding:8px 0;color:#6b7280;">Time</td>
           <td style="padding:8px 0;">%s</td>
         </tr>
       </table>
       <div style="margin-top:16px;padding:12px;background:#f3f4f6;border-radius:6px;font-family:'SF Mono',Monaco,monospace;font-size:13px;word-break:break-all;color:#374151;">
         %s
+      </div>
+      <div style="margin-top:8px;font-family:'SF Mono',Monaco,monospace;font-size:10px;color:#9ca3af;">
+        event=%s hash=%s
       </div>
     </div>
     <div style="padding:12px 24px;background:#f9fafb;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;">
@@ -121,8 +128,10 @@ func formatEmailHTML(alert Alert) string {
 		alert.Severity,
 		alert.ContainerName, alert.ContainerID[:minInt(12, len(alert.ContainerID))],
 		alert.Reason,
+		alert.MatchedVia,
 		alert.Timestamp.Format(time.RFC3339),
 		truncateStr(alert.LogLine, 1000),
+		alert.EventID, truncateStr(alert.NormalizedHash, 16),
 	)
 }
 

@@ -148,6 +148,7 @@ func main() {
 		// (The watcher still uses its own struct; this bridges until
 		// we refactor it to emit Events directly.)
 		evt := &event.Event{
+			ID:         event.NewID(),
 			SourceType: event.SourceDocker,
 			SourceName: line.ContainerName,
 			Line:       line.Line,
@@ -160,6 +161,24 @@ func main() {
 
 		result := a.Analyze(ctx, evt)
 
+		// Build the alert snapshot ONCE from this specific event+result pair.
+		// All fields come from the same goroutine-local variables — no cross-event contamination.
+		buildAlert := func(severity notifier.Severity) notifier.Alert {
+			return notifier.Alert{
+				EventID:        evt.ID,
+				Severity:       severity,
+				ContainerID:    line.ContainerID,
+				ContainerName:  line.ContainerName,
+				LogLine:        evt.Line,
+				NormalizedHash: evt.Hash,
+				Reason:         result.Reason,
+				MatchedVia:     result.Source,
+				Classification: result.LLMClassification,
+				Confidence:     result.LLMConfidence,
+				Timestamp:      time.Now(),
+			}
+		}
+
 		switch result.Verdict {
 		case patternstore.VerdictAllow:
 			// Known-good, skip silently
@@ -171,36 +190,18 @@ func main() {
 
 		case patternstore.VerdictDeny:
 			// ALERT! Known-bad or LLM-classified malicious
-			log.Printf("[ALERT] Source=%s Reason=%s Line=%s",
-				evt.ScopeKey(), result.Reason, truncate(evt.Line, 200))
+			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
+				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash, truncate(evt.Line, 200))
 
-			dispatch.Dispatch(ctx, notifier.Alert{
-				Severity:       notifier.SeverityMalicious,
-				ContainerID:    line.ContainerID,
-				ContainerName:  line.ContainerName,
-				LogLine:        evt.Line,
-				Reason:         result.Reason,
-				Classification: result.LLMClassification,
-				Confidence:     result.LLMConfidence,
-				Timestamp:      time.Now(),
-			})
+			dispatch.Dispatch(ctx, buildAlert(notifier.SeverityMalicious))
 
 		case patternstore.VerdictAlert:
 			// SUSPICIOUS — LLM flagged as suspicious, or memoized repeat of same.
 			// Lower severity than deny. Exact-hash only, no broad patterns.
-			log.Printf("[SUSPICIOUS] Source=%s Reason=%s Line=%s",
-				evt.ScopeKey(), result.Reason, truncate(evt.Line, 200))
+			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
+				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash, truncate(evt.Line, 200))
 
-			dispatch.Dispatch(ctx, notifier.Alert{
-				Severity:       notifier.SeveritySuspicious,
-				ContainerID:    line.ContainerID,
-				ContainerName:  line.ContainerName,
-				LogLine:        evt.Line,
-				Reason:         result.Reason,
-				Classification: result.LLMClassification,
-				Confidence:     result.LLMConfidence,
-				Timestamp:      time.Now(),
-			})
+			dispatch.Dispatch(ctx, buildAlert(notifier.SeveritySuspicious))
 
 		case patternstore.VerdictUnknown:
 			// LLM had an error, was dropped by backpressure, or returned

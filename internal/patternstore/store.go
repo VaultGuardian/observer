@@ -3,6 +3,7 @@ package patternstore
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -374,7 +375,18 @@ func (s *Store) getOrCreateScope(key string) *ScopeEntry {
 
 // SeedDenyPattern adds a seeded (manually curated) deny pattern.
 // Seeded patterns use the "seeded" source tag to distinguish from learned.
+// Skips if a pattern with the same value already exists (prevents duplication on restart).
 func (s *Store) SeedDenyPattern(pattern, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if this exact pattern already exists in global deny contains
+	for _, existing := range s.global.Deny.Contains {
+		if existing.Value == pattern {
+			return // Already seeded, skip
+		}
+	}
+
 	p := LearnedPattern{
 		Type:      PatternContains,
 		Value:     pattern,
@@ -382,11 +394,9 @@ func (s *Store) SeedDenyPattern(pattern, reason string) {
 		Reason:    reason,
 		CreatedAt: time.Now(),
 	}
+
 	// Seeded deny patterns go into the global scope
 	// so they apply to ALL sources.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// For short seeded patterns, bypass the contains minimum length check
 	// since these are manually curated and intentional.
 	s.global.Deny.Contains = append(s.global.Deny.Contains, &p)
@@ -467,6 +477,9 @@ func (s *Store) load() error {
 		initBucket(&s.global.Deny)
 		initBucket(&s.global.Alert)
 		initBucket(&s.global.Suppress)
+		// Deduplicate contains patterns (seeds were duplicated on every restart
+		// in earlier versions). Keep only the first occurrence of each value.
+		s.global.Deny.Contains = deduplicateContains(s.global.Deny.Contains)
 	}
 
 	for key, scope := range persisted.Scopes {
@@ -481,6 +494,24 @@ func (s *Store) load() error {
 	s.recompileAll()
 
 	return nil
+}
+
+// deduplicateContains removes duplicate contains patterns, keeping the first
+// occurrence of each unique Value. Fixes a bug where seeded patterns were
+// appended on every restart without checking for existing entries.
+func deduplicateContains(patterns []*LearnedPattern) []*LearnedPattern {
+	seen := make(map[string]bool)
+	result := make([]*LearnedPattern, 0, len(patterns))
+	for _, p := range patterns {
+		if !seen[p.Value] {
+			seen[p.Value] = true
+			result = append(result, p)
+		}
+	}
+	if len(result) < len(patterns) {
+		log.Printf("[patternstore] Deduplicated global deny contains: %d → %d patterns", len(patterns), len(result))
+	}
+	return result
 }
 
 // recompileAll rebuilds the compiled regex objects after loading from disk.

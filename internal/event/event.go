@@ -1,6 +1,10 @@
 package event
 
-import "time"
+import (
+	"crypto/rand"
+	"fmt"
+	"time"
+)
 
 // SourceType identifies the collector that produced the event.
 const (
@@ -17,6 +21,10 @@ const (
 // it cares about SourceType + SourceName for pattern scoping,
 // and Line for classification.
 type Event struct {
+	// ID is a unique identifier for this event, generated at creation.
+	// Carried through the entire pipeline into alerts for provenance tracking.
+	ID string `json:"id"`
+
 	// SourceType is the collector family: "docker", "systemd", "file", etc.
 	SourceType string `json:"source_type"`
 
@@ -54,4 +62,11 @@ type Event struct {
 // Format: "source_type:source_name" e.g. "docker:nginx", "systemd:sshd"
 func (e *Event) ScopeKey() string {
 	return e.SourceType + ":" + e.SourceName
+}
+
+// NewID generates a short random event ID for provenance tracking.
+func NewID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("evt_%x", b)
 }

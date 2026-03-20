@@ -18,15 +18,20 @@ const (
 )
 
 // Alert is the unified payload sent to all notification channels.
+// Built as an immutable snapshot from a single event — all fields must come
+// from the same event/result pair to prevent cross-event contamination.
 type Alert struct {
-	Severity      Severity  `json:"severity" yaml:"severity"`
-	ContainerID   string    `json:"container_id" yaml:"container_id"`
-	ContainerName string    `json:"container_name" yaml:"container_name"`
-	LogLine       string    `json:"log_line" yaml:"log_line"`
-	Reason        string    `json:"reason" yaml:"reason"`
-	Classification string  `json:"classification,omitempty" yaml:"classification,omitempty"`
-	Confidence    float64   `json:"confidence,omitempty" yaml:"confidence,omitempty"`
-	Timestamp     time.Time `json:"timestamp" yaml:"timestamp"`
+	EventID        string    `json:"event_id" yaml:"event_id"`
+	Severity       Severity  `json:"severity" yaml:"severity"`
+	ContainerID    string    `json:"container_id" yaml:"container_id"`
+	ContainerName  string    `json:"container_name" yaml:"container_name"`
+	LogLine        string    `json:"log_line" yaml:"log_line"`
+	NormalizedHash string    `json:"normalized_hash,omitempty" yaml:"normalized_hash,omitempty"`
+	Reason         string    `json:"reason" yaml:"reason"`
+	MatchedVia     string    `json:"matched_via,omitempty" yaml:"matched_via,omitempty"` // "pattern", "llm", "seeded"
+	Classification string    `json:"classification,omitempty" yaml:"classification,omitempty"`
+	Confidence     float64   `json:"confidence,omitempty" yaml:"confidence,omitempty"`
+	Timestamp      time.Time `json:"timestamp" yaml:"timestamp"`
 }
 
 // Notifier is the interface every notification channel implements.

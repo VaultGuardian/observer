@@ -252,7 +252,45 @@ CRITICAL JSON RULES:
 		verdict.Pattern = ""
 	}
 
+	// Consistency check: if the LLM says classification=safe but action=deny/alert,
+	// or classification=malicious but action=allow, override the action to match
+	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
+	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
+
 	return &verdict, nil
+}
+
+// reconcileClassificationAction ensures the action matches the classification.
+// When they contradict, classification wins because it's the simpler, more
+// constrained field (less room for hallucination).
+func reconcileClassificationAction(classification, action, reason string) string {
+	switch classification {
+	case "safe":
+		if action != "allow" {
+			log.Printf("[llm] Contradiction: classification=%q but action=%q reason=%q — overriding to allow",
+				classification, action, reason)
+			return "allow"
+		}
+	case "noise":
+		if action != "suppress" {
+			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to suppress",
+				classification, action)
+			return "suppress"
+		}
+	case "suspicious":
+		if action != "alert" {
+			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to alert",
+				classification, action)
+			return "alert"
+		}
+	case "malicious":
+		if action != "deny" {
+			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to deny",
+				classification, action)
+			return "deny"
+		}
+	}
+	return action
 }
 
 // HealthCheck verifies the LLM inference server is reachable.
