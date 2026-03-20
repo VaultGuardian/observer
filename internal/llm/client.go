@@ -93,7 +93,7 @@ Your job is to classify log lines and teach the system to recognize similar line
 
 Respond ONLY with a JSON object in this exact format:
 {
-  "classification": "safe" | "suspicious" | "malicious" | "noise",
+  "classification": "safe" | "suspicious" | "malicious" | "noise" | "recon_failed" | "recon_success",
   "confidence": 0.0 to 1.0,
   "reason": "brief explanation",
   "action": "allow" | "deny" | "suppress" | "alert",
@@ -106,17 +106,56 @@ Respond ONLY with a JSON object in this exact format:
 }
 
 CLASSIFICATION + ACTION RULES:
-- "safe" + "allow": Normal operational logs (app startup, health checks, routine requests)
-- "noise" + "suppress": Uninteresting output that should be permanently ignored (debug spam, metric dumps, empty heartbeats, routine status output). NOT the same as "safe" — suppress means "not worth caring about."
-- "suspicious" + "alert": Unusual but not definitively malicious (failed auth attempts, unexpected paths, high error rates). Do NOT learn a pattern for alerts — they need continued scrutiny.
-- "malicious" + "deny": Known attack patterns (shell injection, path traversal, privilege escalation, data exfiltration commands)
+
+INTENT × OUTCOME IS EVERYTHING. The request path tells you what the attacker WANTED. The status code tells you what HAPPENED. You must consider both.
+
+- "safe" + "allow": Normal operational logs (app startup, health checks, routine requests from legitimate clients, crawler/bot traffic with normal responses)
+- "noise" + "suppress": Uninteresting output (debug spam, metric dumps, heartbeats, routine status). NOT the same as "safe" — suppress means "not worth caring about ever."
+
+- "recon_failed" + "suppress": An attacker or scanner probed for something and GOT NOTHING. Examples:
+  * ANY request to a sensitive path (.env, wp-admin, phpunit, /etc/passwd, autodiscover, etc.) that returned 404, 403, 405, or 400
+  * Port scans, path enumeration, CMS probes, vulnerability scanners — all with error responses
+  * TLS handshake failures, malformed requests returning 400
+  * This is the most common type of "attack" on any internet-facing server. It is background noise.
+  * The attacker FAILED. There is nothing to investigate. Suppress it.
+
+- "recon_success" + "alert": An attacker or scanner probed for something sensitive and GOT A REAL RESPONSE. Examples:
+  * Request to /.env, /config.yml, /api/.env, /.git/HEAD, etc. that returned 200 or 301/302 to a content page
+  * Sensitive path that returned actual content instead of an error
+  * This is URGENT — it means something is exposed that should not be.
+
+- "suspicious" + "alert": Unusual activity that is NOT a simple failed probe. Examples:
+  * Successful authentication from an unexpected source
+  * Unusual response sizes or patterns
+  * Legitimate paths but abnormal behavior
+  * Do NOT use "suspicious" for scanner traffic that returned error codes — that is "recon_failed"
+
+- "malicious" + "deny": Confirmed attack payloads in the request itself, regardless of status code. Examples:
+  * Shell injection (;ls, | cat /etc/passwd, etc.) in URL or parameters
+  * SQL injection (UNION SELECT, OR 1=1) in URL or parameters
+  * PHP wrapper attacks (php://input, allow_url_include)
+  * Encoded exploit payloads
+  * The payload IS the evidence — the status code doesn't matter here
+
+CRITICAL RULES FOR HTTP ACCESS LOGS:
+- ALWAYS look at the HTTP status code (200, 301, 302, 400, 403, 404, 405, 500, etc.)
+- Status 404/403/405/400 on a suspicious path = recon_failed = suppress
+- Status 200 on a suspicious path = recon_success = alert (something is exposed!)
+- Status 302 on a suspicious path = check context. Redirect to a login page = recon_failed. Redirect to content = recon_success.
+- A scanner hitting 50 paths and getting 404 on all of them is NOT 50 alerts. It is noise. Suppress it.
+- A single 200 on /.env is worth more than 1000 failed probes. Alert on it.
+
+CRITICAL RULES FOR ERROR LOGS:
+- nginx "open() failed (2: No such file or directory)" = the file does not exist = recon_failed = suppress
+- Application errors from normal operation = safe or noise
+- Errors triggered by malicious input = check the request content for payloads
 
 PATTERN RULES (critical — read carefully):
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
-- PREFER "prefix" when the log line starts with a recognizable fixed string. This is the fastest and safest option. Most logs can be captured this way.
-- Use "regex" only when the line has variable content in the MIDDLE that a prefix can't skip. Always anchor with ^ and use \d+ for numbers, \S+ for non-space tokens, [\w.-]+ for identifiers. Be specific — a regex that is too broad is WORSE than no pattern at all.
-- Use "contains" only as a last resort when the identifying content is in the middle/end of a highly variable line. Minimum 10 characters. This is the most dangerous pattern type — it can silently overmatch.
-- Return empty pattern_type and pattern ("") if you are not confident you can capture the structural signature without overgeneralizing.
+- PREFER "prefix" when the log line starts with a recognizable fixed string. This is the fastest and safest option.
+- Use "regex" only when the line has variable content in the MIDDLE that a prefix can't skip. Always anchor with ^ and use \d+ for numbers, \S+ for non-space tokens. Be specific.
+- Use "contains" only as a last resort. Minimum 10 characters.
+- Return empty pattern_type and pattern ("") if you are not confident.
 
 PATTERN MUST match the normalized version of the log line, not the raw version.
 The normalized line has timestamps replaced with <TS>, IPs with <IP>, durations with <DUR>,
@@ -128,33 +167,33 @@ VARIABLE FIELDS RULES:
 - The "token" must be the EXACT text from the raw line.
 - The "replacement" should be a placeholder like <PID>, <TS>, <IP>, <CONN>, <DUR>, <BYTES>, <PORT>, <UA>, <REQ_ID>
 - Only include fields you are confident about. Empty array is fine if unsure.
-- These hints help the system learn how to normalize logs from unknown services.
 
 EXAMPLES:
+Line: "GET /.env HTTP/1.1 404 0"
+→ classification: "recon_failed", action: "suppress", reason: "Probe for .env file returned 404 — attacker found nothing"
+
+Line: "GET /.env HTTP/1.1 200 1534"
+→ classification: "recon_success", action: "alert", reason: ".env file returned 200 with 1534 bytes — configuration file is exposed"
+
+Line: "GET /wp-admin/install.php HTTP/1.1 404 0"
+→ classification: "recon_failed", action: "suppress", reason: "WordPress install probe returned 404"
+
+Line: "POST /?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input HTTP/1.1 405 150"
+→ classification: "malicious", action: "deny", reason: "PHP wrapper injection attempt in query string"
+
+Line: "open() /usr/share/nginx/default/tool.php failed (2: No such file or directory)"
+→ classification: "recon_failed", action: "suppress", reason: "Nginx file-not-found for probed PHP path"
+
 Line: "Connected to database in 47ms"
 Normalized: "Connected to database in <DUR>"
-→ pattern_type: "prefix", pattern: "Connected to database in"
-→ variable_fields: [{"token": "47ms", "type": "duration", "replacement": "<DUR>"}]
-
-Line: "GET /api/users/12345/profile HTTP/1.1 200"
-Normalized: "GET /api/users/<ID>/profile HTTP/1.1 200"
-→ pattern_type: "regex", pattern: "^GET /api/users/<ID>/profile HTTP/1\\.1 \\d+"
-→ variable_fields: [{"token": "12345", "type": "request_id", "replacement": "<ID>"}]
-
-Line: "2026/03/18 22:32:28 [error] 31#31: *2 open() failed, client: 172.19.0.1"
-→ variable_fields: [{"token": "2026/03/18 22:32:28", "type": "timestamp", "replacement": ""}, {"token": "31#31:", "type": "pid", "replacement": "<PID>:"}, {"token": "*2", "type": "connection_id", "replacement": "*<CONN>"}, {"token": "172.19.0.1", "type": "ip", "replacement": "<CLIENT>"}]
-
-Consider the source context — what's normal for one service may be suspicious for another.
+→ classification: "safe", action: "allow", pattern_type: "prefix", pattern: "Connected to database in"
 
 CRITICAL JSON RULES:
 - Your response MUST be valid JSON. Do NOT use regex-style escapes inside JSON strings.
 - In JSON, the ONLY valid escape sequences are: \" \\ \/ \b \f \n \r \t \uXXXX
 - WRONG: \; \+ \( \) \[ \] \- \. — these are NOT valid JSON escapes and will break parsing.
 - If your pattern contains special regex characters like ; + ( ) [ ] put them as-is WITHOUT a backslash, OR double-escape with \\\\ for literal backslashes.
-- Example: "pattern": "^GET /api/users/\\d+/profile" is correct (\\d is a literal backslash + d in JSON)
-- Example: "pattern": "getrlimit(RLIMIT_NOFILE)" is correct (parentheses don't need escaping in JSON)
-- Example: "pattern": "^start worker process \\d+" is correct
-- When in doubt, use a simpler prefix pattern WITHOUT regex characters. A working simple pattern is better than a broken complex one.`
+- When in doubt, use a simpler prefix pattern WITHOUT regex characters.`
 
 	userPrompt := fmt.Sprintf("Source: %s:%s\nRaw log line: %s\nNormalized line: %s",
 		sourceType, sourceName, logLine, normalizedLine)
@@ -271,13 +310,13 @@ func reconcileClassificationAction(classification, action, reason string) string
 				classification, action, reason)
 			return "allow"
 		}
-	case "noise":
+	case "noise", "recon_failed":
 		if action != "suppress" {
 			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to suppress",
 				classification, action)
 			return "suppress"
 		}
-	case "suspicious":
+	case "recon_success", "suspicious":
 		if action != "alert" {
 			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to alert",
 				classification, action)
