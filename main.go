@@ -466,23 +466,40 @@ func truncate(s string, max int) string {
 	return s[:max] + "..."
 }
 
-// reNormalizedHTTP matches the v0.9 normalized nginx access log format:
+// reNormalizedHTTP matches normalized nginx access log format WITH hostname:
 //   HOST METHOD /path?query HTTP/X.X STATUS
 // Example: "api.admin.kovicloud.com GET /?q=UNION+SELECT HTTP/2.0 200"
 var reNormalizedHTTP = regexp.MustCompile(
 	`^(\S+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
+// reNormalizedHTTPBare matches normalized backend access log format WITHOUT hostname:
+//   METHOD /path?query HTTP/X.X STATUS
+// Example: "GET /?q=UNION+SELECT+1,2,3 HTTP/1.0 200"
+var reNormalizedHTTPBare = regexp.MustCompile(
+	`^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
+
 // parseNormalizedLine extracts HTTP components from a normalized log line.
+// Handles two formats:
+//   1. With hostname (CapRover nginx): "host.com GET /path HTTP/2.0 200"
+//   2. Without hostname (backend apps): "GET /path HTTP/1.0 200"
 // Returns method, path (raw with query string), host, and status code.
-// For non-HTTP logs (error logs, syslog, etc.), returns zero values — REC
-// will return no_match, which is the correct behavior.
+// For non-HTTP logs (error logs, syslog, etc.), returns zero values.
 func parseNormalizedLine(normalized string) (method, path, host string, statusCode int) {
+	// Try hostname-prefixed format first (nginx)
 	m := reNormalizedHTTP.FindStringSubmatch(normalized)
-	if m == nil {
-		return "", "", "", 0
+	if m != nil {
+		code, _ := strconv.Atoi(m[4])
+		return m[2], m[3], m[1], code
 	}
-	code, _ := strconv.Atoi(m[4])
-	return m[2], m[3], m[1], code
+
+	// Try bare format (backend apps without hostname prefix)
+	m = reNormalizedHTTPBare.FindStringSubmatch(normalized)
+	if m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
+	return "", "", "", 0
 }
 
 // =============================================================================
