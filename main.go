@@ -183,6 +183,19 @@ func main() {
 	// No application config changes needed — purely what Observer already knows.
 	dedup := newAlertDedup(2 * time.Second)
 
+	// ------- Re-Classification Cache -------
+	// When REC captures a response and the LLM re-classifies an alert with
+	// evidence, cache the result keyed on the REDACTED BODY HASH.
+	//
+	// Same body = same conclusion. The Laravel welcome page is the same
+	// welcome page whether the attack was SQL injection or path traversal.
+	// Different body = fresh evaluation needed (maybe the app changed and
+	// now returns real data).
+	//
+	// This is the "the design review cache" — prevents burning LLM tokens on the same
+	// re-classification answer over and over.
+	reclassCache := newReclassCache()
+
 	// ------- Log handler: the core pipeline -------
 	handler := func(line watcher.LogLine) {
 		// Skip excluded containers (prevents feedback loops)
@@ -262,6 +275,24 @@ func main() {
 				}
 			}
 
+			// --- CACHE CHECK: same redacted body = same conclusion ---
+			// Key on the REDACTED preview, not the raw body hash. The raw HTML
+			// may contain CSRF tokens, nonces, or timestamps that change every
+			// request. The redacted version strips those (script/style blocks
+			// become [STRIPPED], meta content becomes [REDACTED]), so the same
+			// page produces the same hash every time.
+			bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
+			if cached, ok := reclassCache.get(bodyHash); ok {
+				if cached.downgraded {
+					log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
+						bodyHash[:16], cached.reason)
+				} else {
+					log.Printf("[reclassify] Cache hit (redacted_body=%s): confirmed severity",
+						bodyHash[:16])
+				}
+				return cached.downgraded, cached.reason
+			}
+
 			reclass, err := llmClient.ReclassifyWithEvidence(
 				ctx,
 				classification,
@@ -276,6 +307,9 @@ func main() {
 				log.Printf("[reclassify] Error re-classifying with evidence: %v — using original verdict", err)
 				return false, ""
 			}
+
+			// Cache the result keyed on body hash
+			reclassCache.put(bodyHash, reclass.Downgraded, reclass.Reason)
 
 			if reclass.Downgraded {
 				log.Printf("[DOWNGRADED] EventID=%s Original=%s→%s Reason=%s",
@@ -536,4 +570,71 @@ func buildDedupKey(normalizedLine, reason string) string {
 	}
 	// Non-HTTP log — dedup on reason alone (conservative, may over-dedup)
 	return reason
+}
+
+// =============================================================================
+// Re-Classification Cache
+// =============================================================================
+//
+// When the LLM re-classifies an alert with response evidence, we cache the
+// result keyed on the REDACTED BODY PREVIEW HASH.
+//
+// WHY BODY HASH:
+//   The response body IS the evidence. Same body = same conclusion.
+//   The Laravel welcome page is always the Laravel welcome page, whether
+//   the attack was SQL injection, path traversal, or command injection.
+//   If the body changes (app update, different error page, or the attack
+//   actually succeeded and returned real data), the hash changes and we
+//   call the LLM fresh.
+//
+// COST IMPACT:
+//   Without cache: 100 identical attacks × 2 LLM calls each = 200 calls/day
+//   With cache: 1 LLM classify + 1 LLM re-classify + 198 cache hits = 2 calls/day
+//   At $1.35/500K tokens, this is the difference between pennies and dollars.
+//
+// MEMORY:
+//   Bounded to 1000 entries. In practice, a server has a small number of
+//   distinct response bodies (welcome page, 404 page, API status, etc.)
+//   so this rarely exceeds a dozen entries.
+
+const maxReclassCacheEntries = 1000
+
+type reclassCacheEntry struct {
+	downgraded bool
+	reason     string
+}
+
+type reclassCache struct {
+	mu      sync.RWMutex
+	entries map[string]reclassCacheEntry // bodyPreviewHash → result
+}
+
+func newReclassCache() *reclassCache {
+	return &reclassCache{
+		entries: make(map[string]reclassCacheEntry),
+	}
+}
+
+func (c *reclassCache) get(bodyHash string) (reclassCacheEntry, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[bodyHash]
+	return entry, ok
+}
+
+func (c *reclassCache) put(bodyHash string, downgraded bool, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Bounded: if cache is full, clear it and start fresh.
+	// In practice this almost never happens — distinct response bodies
+	// are a small set (welcome page, 404, API status, etc.)
+	if len(c.entries) >= maxReclassCacheEntries {
+		c.entries = make(map[string]reclassCacheEntry)
+	}
+
+	c.entries[bodyHash] = reclassCacheEntry{
+		downgraded: downgraded,
+		reason:     reason,
+	}
 }
