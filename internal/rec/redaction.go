@@ -1,0 +1,548 @@
+package rec
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"unicode"
+)
+
+// =============================================================================
+// Format Detection
+// =============================================================================
+//
+// Detects the format of a response body preview for redaction routing.
+// Operates on TRUNCATED preview (max 2KB) — format detection confidence
+// accounts for the possibility that we're seeing partial content.
+//
+// Priority:
+//   1. Content-Type header (highest signal)
+//   2. Body pattern sniffing (when Content-Type missing/ambiguous)
+//   3. Unknown → fail closed (no preview)
+
+func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+
+	// Strip parameters (e.g., "text/html; charset=utf-8" → "text/html")
+	if idx := strings.Index(ct, ";"); idx > 0 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+
+	// --- Content-Type header (highest signal) ---
+	switch {
+	case ct == "application/json" || ct == "text/json":
+		return FormatJSON, ConfidenceHigh
+	case ct == "text/html" || ct == "application/xhtml+xml":
+		return FormatHTML, ConfidenceHigh
+	}
+
+	// --- Body pattern sniffing ---
+	if len(body) == 0 {
+		return FormatUnknown, ConfidenceNone
+	}
+
+	// Check for binary content (null bytes in first 64 bytes)
+	checkLen := 64
+	if len(body) < checkLen {
+		checkLen = len(body)
+	}
+	for _, b := range body[:checkLen] {
+		if b == 0 {
+			return FormatBinary, ConfidenceHigh
+		}
+	}
+
+	trimmed := bytes.TrimLeftFunc(body, unicode.IsSpace)
+
+	// Passwd format: lines matching user:x:uid:gid:...
+	if looksLikePasswd(trimmed) {
+		return FormatPasswd, ConfidenceHigh
+	}
+
+	// Dotenv format: lines matching KEY=VALUE
+	if looksLikeDotenv(trimmed) {
+		return FormatDotenv, ConfidenceHigh
+	}
+
+	// JSON: starts with { or [
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		// Validate it's actual JSON by attempting a partial parse
+		var js json.RawMessage
+		if json.Unmarshal(trimmed, &js) == nil {
+			return FormatJSON, ConfidenceHigh
+		}
+		// Might be truncated JSON (we only have 2KB preview)
+		return FormatJSON, ConfidenceLow
+	}
+
+	// HTML: starts with <, <!DOCTYPE, <html
+	if len(trimmed) > 0 && trimmed[0] == '<' {
+		lower := strings.ToLower(string(trimmed[:min(100, len(trimmed))]))
+		if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") {
+			return FormatHTML, ConfidenceHigh
+		}
+		// Some other XML/HTML tag
+		return FormatHTML, ConfidenceLow
+	}
+
+	// text/plain Content-Type — try body sniffing for dotenv/passwd
+	if strings.HasPrefix(ct, "text/plain") {
+		if looksLikePasswd(trimmed) {
+			return FormatPasswd, ConfidenceHigh
+		}
+		if looksLikeDotenv(trimmed) {
+			return FormatDotenv, ConfidenceHigh
+		}
+	}
+
+	return FormatUnknown, ConfidenceNone
+}
+
+// looksLikePasswd checks if the content appears to be a Unix passwd/shadow file.
+// Looks for lines with colon-separated fields where field 3+ are numeric (UID/GID).
+func looksLikePasswd(body []byte) bool {
+	lines := bytes.SplitN(body, []byte("\n"), 4) // check first 3 lines
+	passwdLines := 0
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		fields := bytes.Split(line, []byte(":"))
+		// passwd format: user:pass:uid:gid:gecos:home:shell (7 fields)
+		// shadow format: user:hash:lastchanged:min:max:warn:inactive:expire:reserved (9 fields)
+		if len(fields) >= 7 {
+			// Check that field 3 and 4 look numeric (UID and GID)
+			if isNumericBytes(fields[2]) && isNumericBytes(fields[3]) {
+				passwdLines++
+			}
+		}
+	}
+	return passwdLines >= 1
+}
+
+// looksLikeDotenv checks if the content appears to be a dotenv/config file.
+// Looks for lines matching KEY=VALUE where KEY is uppercase with underscores.
+func looksLikeDotenv(body []byte) bool {
+	lines := bytes.SplitN(body, []byte("\n"), 6) // check first 5 lines
+	kvLines := 0
+	totalLines := 0
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		totalLines++
+		// Match: optional "export ", then KEY= where KEY is [A-Z0-9_]+
+		l := line
+		if bytes.HasPrefix(l, []byte("export ")) {
+			l = l[7:]
+		}
+		eqIdx := bytes.IndexByte(l, '=')
+		if eqIdx > 0 && isEnvKey(l[:eqIdx]) {
+			kvLines++
+		}
+	}
+	return totalLines > 0 && kvLines >= 2
+}
+
+func isNumericBytes(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isEnvKey(b []byte) bool {
+	for _, c := range b {
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return len(b) > 0
+}
+
+// =============================================================================
+// HTML Redaction
+// =============================================================================
+//
+// DESIGN PRINCIPLE: Keep visible text for re-classification.
+//
+// The LLM needs to see "Laravel v11.36.1" and "Documentation" to know
+// a response is a welcome page, not a data dump. We strip SECRETS
+// (script blocks, style blocks, input values, meta content) but keep
+// the visible text that tells the story.
+//
+// This is a simple state-machine parser, not a full HTML parser.
+// It's good enough for 2KB previews of typical web responses.
+// No external dependencies (no golang.org/x/net/html).
+//
+// What we KEEP:
+//   - Tag names and structure (<html>, <body>, <p>, <h1>, etc.)
+//   - Visible text content between tags
+//   - href/src attribute values (they're URLs, not secrets)
+//
+// What we STRIP:
+//   - <script>...</script> blocks entirely → <script>[STRIPPED]</script>
+//   - <style>...</style> blocks entirely → <style>[STRIPPED]</style>
+//   - value="..." on <input>, <textarea> → value="[REDACTED]"
+//   - content="..." on <meta> → content="[REDACTED]"
+//   - Any attribute value matching secret patterns (token, key, session, etc.)
+
+func redactHTML(body []byte) string {
+	s := string(body)
+	var out strings.Builder
+	out.Grow(len(s))
+
+	i := 0
+	for i < len(s) {
+		if s[i] == '<' {
+			// Find end of tag
+			tagEnd := strings.IndexByte(s[i:], '>')
+			if tagEnd < 0 {
+				// Unclosed tag at end of preview — write remainder and stop
+				out.WriteString(s[i:])
+				break
+			}
+			tagEnd += i + 1 // absolute position after '>'
+			tag := s[i:tagEnd]
+			tagLower := strings.ToLower(tag)
+
+			// Check for script/style blocks — strip content entirely
+			if strings.HasPrefix(tagLower, "<script") {
+				out.WriteString("<script>[STRIPPED]</script>")
+				// Skip past closing </script>
+				closeIdx := strings.Index(strings.ToLower(s[tagEnd:]), "</script>")
+				if closeIdx >= 0 {
+					i = tagEnd + closeIdx + len("</script>")
+				} else {
+					i = len(s) // no closing tag, skip rest
+				}
+				continue
+			}
+			if strings.HasPrefix(tagLower, "<style") {
+				out.WriteString("<style>[STRIPPED]</style>")
+				closeIdx := strings.Index(strings.ToLower(s[tagEnd:]), "</style>")
+				if closeIdx >= 0 {
+					i = tagEnd + closeIdx + len("</style>")
+				} else {
+					i = len(s)
+				}
+				continue
+			}
+
+			// Redact sensitive attributes in the tag
+			redactedTag := redactHTMLAttributes(tag)
+			out.WriteString(redactedTag)
+			i = tagEnd
+		} else {
+			// Text content — keep it (visible text helps re-classification)
+			nextTag := strings.IndexByte(s[i:], '<')
+			if nextTag < 0 {
+				out.WriteString(s[i:])
+				break
+			}
+			out.WriteString(s[i : i+nextTag])
+			i += nextTag
+		}
+	}
+
+	result := out.String()
+	// Cap output length
+	if len(result) > 2048 {
+		result = result[:2048] + "...[TRUNCATED]"
+	}
+	return result
+}
+
+// redactHTMLAttributes redacts sensitive attribute values in a single HTML tag.
+// Keeps the tag structure, redacts value="..." on input/textarea,
+// content="..." on meta, and any attribute matching secret patterns.
+func redactHTMLAttributes(tag string) string {
+	tagLower := strings.ToLower(tag)
+
+	// Only process tags that might have sensitive attributes
+	needsRedaction := false
+	for _, prefix := range []string{"<input", "<textarea", "<meta", "<form"} {
+		if strings.HasPrefix(tagLower, prefix) {
+			needsRedaction = true
+			break
+		}
+	}
+	if !needsRedaction {
+		return tag
+	}
+
+	// Simple attribute value redaction:
+	// Replace value="..." and content="..." with redacted versions
+	result := tag
+	for _, attr := range []string{"value", "content"} {
+		result = redactAttribute(result, attr)
+	}
+	return result
+}
+
+// redactAttribute finds attr="..." or attr='...' in a tag string and replaces
+// the value with [REDACTED].
+func redactAttribute(tag, attrName string) string {
+	lower := strings.ToLower(tag)
+	searchLower := attrName + "="
+
+	idx := strings.Index(lower, searchLower)
+	if idx < 0 {
+		return tag
+	}
+
+	// Position after "attr="
+	valStart := idx + len(searchLower)
+	if valStart >= len(tag) {
+		return tag
+	}
+
+	quote := tag[valStart]
+	if quote != '"' && quote != '\'' {
+		// Unquoted attribute — find next space or >
+		valEnd := valStart
+		for valEnd < len(tag) && tag[valEnd] != ' ' && tag[valEnd] != '>' {
+			valEnd++
+		}
+		return tag[:valStart] + "\"[REDACTED]\"" + tag[valEnd:]
+	}
+
+	// Quoted attribute — find closing quote
+	closeQuote := strings.IndexByte(tag[valStart+1:], quote)
+	if closeQuote < 0 {
+		return tag // malformed, leave as-is
+	}
+	valEnd := valStart + 1 + closeQuote + 1 // past the closing quote
+	return tag[:valStart] + "\"[REDACTED]\"" + tag[valEnd:]
+}
+
+// =============================================================================
+// JSON Redaction
+// =============================================================================
+//
+// DESIGN PRINCIPLE: Keep keys and non-sensitive values for re-classification.
+//
+// The LLM needs to see {"status": "ok", "framework": "Laravel"} to know
+// a response is an API status check, not a data dump. We strip values that
+// look like secrets (long strings, base64, emails, values under sensitive keys)
+// but keep short, non-sensitive values.
+//
+// What we KEEP:
+//   - All keys (structure is the signal)
+//   - Numbers, booleans, nulls (rarely secrets)
+//   - Short string values (<50 chars) under non-sensitive keys
+//
+// What we REDACT:
+//   - Values under keys matching: password, secret, token, key, auth,
+//     credential, session, cookie, authorization, api_key, private
+//   - String values >50 characters (likely base64, JWTs, long secrets)
+//   - Strings containing @ (emails)
+//   - Strings that look like base64 (mostly alphanumeric + /+=, >20 chars)
+
+func redactJSON(body []byte) string {
+	var parsed interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "" // malformed JSON → fail closed
+	}
+
+	redacted := redactJSONValue(parsed, "", 0)
+
+	out, err := json.MarshalIndent(redacted, "", "  ")
+	if err != nil {
+		return ""
+	}
+
+	result := string(out)
+	if len(result) > 2048 {
+		result = result[:2048] + "\n...[TRUNCATED]"
+	}
+	return result
+}
+
+func redactJSONValue(v interface{}, parentKey string, depth int) interface{} {
+	if depth > 10 {
+		return "[MAX_DEPTH]"
+	}
+
+	switch val := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, child := range val {
+			out[k] = redactJSONValue(child, k, depth+1)
+		}
+		return out
+
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, child := range val {
+			out[i] = redactJSONValue(child, parentKey, depth+1)
+		}
+		return out
+
+	case string:
+		if isSensitiveKey(parentKey) {
+			return "[REDACTED]"
+		}
+		if len(val) > 50 {
+			return "[REDACTED:long_string]"
+		}
+		if strings.Contains(val, "@") && strings.Contains(val, ".") {
+			return "[REDACTED:email]"
+		}
+		if looksLikeBase64(val) {
+			return "[REDACTED:encoded]"
+		}
+		// Keep short, non-sensitive string values
+		return val
+
+	case float64, bool, nil:
+		// Numbers, booleans, nulls are rarely secrets — keep them
+		return val
+
+	default:
+		return val
+	}
+}
+
+// isSensitiveKey checks if a JSON key name suggests the value is a secret.
+func isSensitiveKey(key string) bool {
+	k := strings.ToLower(key)
+	for _, sensitive := range []string{
+		"password", "passwd", "secret", "token", "key", "auth",
+		"credential", "session", "cookie", "authorization",
+		"api_key", "apikey", "private", "access_token",
+		"refresh_token", "jwt", "bearer", "hash", "salt",
+		"ssn", "credit_card", "card_number",
+	} {
+		if strings.Contains(k, sensitive) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeBase64 checks if a string looks like base64-encoded data.
+func looksLikeBase64(s string) bool {
+	if len(s) < 20 {
+		return false
+	}
+	b64Chars := 0
+	for _, c := range s {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' {
+			b64Chars++
+		}
+	}
+	return float64(b64Chars)/float64(len(s)) > 0.85
+}
+
+// =============================================================================
+// Dotenv Redaction
+// =============================================================================
+//
+// Pure secrets — always redact ALL values. The key names tell the story:
+// "DB_PASSWORD=<REDACTED>" is enough for the LLM to know this is a config leak.
+
+func redactDotenv(body []byte) string {
+	var out strings.Builder
+	lines := strings.Split(string(body), "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Empty lines and comments pass through
+		if trimmed == "" || trimmed[0] == '#' {
+			out.WriteString(line)
+			if i < len(lines)-1 {
+				out.WriteByte('\n')
+			}
+			continue
+		}
+
+		// Handle "export KEY=VALUE"
+		l := trimmed
+		prefix := ""
+		if strings.HasPrefix(l, "export ") {
+			prefix = "export "
+			l = l[7:]
+		}
+
+		eqIdx := strings.IndexByte(l, '=')
+		if eqIdx > 0 {
+			key := l[:eqIdx]
+			out.WriteString(prefix)
+			out.WriteString(key)
+			out.WriteString("=[REDACTED]")
+		} else {
+			// Not a KEY=VALUE line — pass through (could be a comment variant)
+			out.WriteString(line)
+		}
+
+		if i < len(lines)-1 {
+			out.WriteByte('\n')
+		}
+	}
+
+	return out.String()
+}
+
+// =============================================================================
+// Passwd/Shadow Redaction
+// =============================================================================
+//
+// Keep: username (field 0), UID (field 2), GID (field 3), shell (field 6)
+// Redact: password hash (field 1), GECOS (field 4), home dir (field 5)
+//
+// For /etc/shadow: keep username (field 0), redact everything else.
+
+func redactPasswd(body []byte) string {
+	var out strings.Builder
+	lines := strings.Split(string(body), "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if i < len(lines)-1 {
+				out.WriteByte('\n')
+			}
+			continue
+		}
+
+		fields := strings.Split(trimmed, ":")
+		if len(fields) >= 7 {
+			// passwd format: user:pass:uid:gid:gecos:home:shell
+			out.WriteString(fmt.Sprintf("%s:[REDACTED]:%s:%s:[REDACTED]:[REDACTED]:%s",
+				fields[0],  // username — keep
+				fields[2],  // UID — keep
+				fields[3],  // GID — keep
+				fields[6],  // shell — keep
+			))
+		} else if len(fields) >= 2 && strings.Contains(fields[1], "$") {
+			// shadow format: user:$hash$...:... — keep only username
+			out.WriteString(fields[0])
+			for j := 1; j < len(fields); j++ {
+				out.WriteString(":[REDACTED]")
+			}
+		} else {
+			// Unknown format — redact entire line
+			out.WriteString("[REDACTED]")
+		}
+
+		if i < len(lines)-1 {
+			out.WriteByte('\n')
+		}
+	}
+
+	return out.String()
+}
+
+// =============================================================================
+// Helpers — note: min() is built-in as of Go 1.21
+// =============================================================================

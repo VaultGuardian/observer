@@ -352,6 +352,183 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// =============================================================================
+// Evidence-Aware Re-Classification
+// =============================================================================
+//
+// When Observer captures the server's HTTP response via REC, we can ask the
+// LLM to re-evaluate its initial verdict with the actual evidence.
+//
+// The initial classification only sees the log line: "GET /?q=UNION+SELECT 200"
+// The LLM assumes 200 + big body = "attack succeeded."
+//
+// Re-classification sees the log line PLUS the redacted response body:
+// "<!DOCTYPE html>...Laravel v11.36.1..." — clearly a welcome page, not a
+// database dump. The attack was ignored by the app.
+//
+// This is the difference between "someone tried something" and
+// "someone tried something and HERE'S WHAT THEY GOT."
+
+// ReclassifyVerdict is the simplified result of evidence-aware re-classification.
+type ReclassifyVerdict struct {
+	Classification string  `json:"classification"`
+	Confidence     float64 `json:"confidence"`
+	Reason         string  `json:"reason"`
+	Action         string  `json:"action"`
+	Downgraded     bool    `json:"downgraded"` // true if severity was reduced
+}
+
+// ReclassifyWithEvidence asks the LLM to re-evaluate a verdict given captured
+// response evidence. Only called when:
+//   1. Initial verdict was deny/alert (suspicious/malicious)
+//   2. REC captured the response with high correlation confidence
+//   3. Redaction passed (SafeBodyPreview is populated)
+//
+// Returns the updated verdict. If the LLM confirms the original severity,
+// Downgraded=false. If it reduces severity, Downgraded=true.
+func (c *Client) ReclassifyWithEvidence(
+	ctx context.Context,
+	originalClassification string,
+	originalReason string,
+	logLine string,
+	statusCode int,
+	contentType string,
+	contentLength int64,
+	safeBodyPreview string,
+) (*ReclassifyVerdict, error) {
+
+	systemPrompt := `You are a security response analyzer. You previously classified a log line as suspicious or malicious. Now you have the server's actual HTTP response.
+
+Your job: determine if the attack actually SUCCEEDED (server returned sensitive data) or FAILED (server returned its normal response and ignored the attack payload).
+
+Respond ONLY with a JSON object:
+{
+  "classification": "safe" | "suspicious" | "malicious" | "recon_failed" | "recon_success",
+  "confidence": 0.0 to 1.0,
+  "reason": "brief explanation of what the response evidence shows",
+  "action": "allow" | "deny" | "suppress" | "alert"
+}
+
+RULES:
+- If the response body is a standard framework page (Laravel, Rails, Django, Express, etc.), error page, login page, or API status — the attack FAILED. The application ignored the malicious input. Classify as "recon_failed" + "suppress" with a reason explaining it's a normal response.
+- If the response body contains database records, user data, configuration values, system files, or any data that should not be exposed — the attack SUCCEEDED. Keep or upgrade the severity.
+- If the response body is an API error message revealing stack traces, database errors, or internal paths — classify as "recon_success" + "alert" (information disclosure even if not the intended exploit).
+- The attack payload in the REQUEST still happened. You are judging the OUTCOME based on the RESPONSE.
+- A 200 status code does NOT mean the attack succeeded. Many apps return 200 for their default page regardless of query parameters.
+- A 403/404 with a large body could be a custom error page — check the content.
+
+CRITICAL: Look at the actual body content, not just the status code. The body tells the truth.`
+
+	userPrompt := fmt.Sprintf(`ORIGINAL CLASSIFICATION: %s
+ORIGINAL REASON: %s
+
+LOG LINE: %s
+
+SERVER RESPONSE:
+  Status Code: %d
+  Content-Type: %s
+  Content-Length: %d
+
+RESPONSE BODY (redacted preview):
+%s
+
+Based on this response evidence, did the attack succeed or did the server ignore it?`,
+		originalClassification,
+		originalReason,
+		logLine,
+		statusCode,
+		contentType,
+		contentLength,
+		safeBodyPreview,
+	)
+
+	reqBody := map[string]interface{}{
+		"model": c.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"max_completion_tokens": 4096,
+		"reasoning_effort":     "medium",
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling reclassify request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.baseURL+"/v1/chat/completions", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("creating reclassify request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reclassify request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("reclassify returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	rawBody, _ := io.ReadAll(resp.Body)
+
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(rawBody, &chatResp); err != nil {
+		return nil, fmt.Errorf("decoding reclassify response: %w", err)
+	}
+
+	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
+		return nil, fmt.Errorf("reclassify returned empty content")
+	}
+
+	content := chatResp.Choices[0].Message.Content
+	content = stripCodeBlock(content)
+
+	var result ReclassifyVerdict
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		sanitized := sanitizeJSON(content)
+		if err := json.Unmarshal([]byte(sanitized), &result); err != nil {
+			return nil, fmt.Errorf("parsing reclassify verdict: %w (content: %s)", err, truncateStr(content, 200))
+		}
+	}
+
+	// Reconcile classification and action
+	result.Action = reconcileClassificationAction(result.Classification, result.Action, result.Reason)
+
+	// Determine if this is a downgrade
+	result.Downgraded = isDowngrade(originalClassification, result.Classification)
+
+	return &result, nil
+}
+
+// isDowngrade returns true if the new classification is less severe than the original.
+func isDowngrade(original, updated string) bool {
+	severity := map[string]int{
+		"safe":          0,
+		"noise":         0,
+		"recon_failed":  1,
+		"recon_success": 3,
+		"suspicious":    4,
+		"malicious":     5,
+	}
+	return severity[updated] < severity[original]
+}
+
 func stripCodeBlock(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "```json") {

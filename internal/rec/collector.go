@@ -421,59 +421,10 @@ func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 }
 
 // =============================================================================
-// Format Detection (Phase 1: simple heuristics, operates on truncated preview)
+// Format Detection + Redaction — see redaction.go
 // =============================================================================
-
-func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) {
-	// TODO: implement real heuristics. Sketch:
-	//
-	// 1. Check Content-Type header first (high signal)
-	//    "application/json" → FormatJSON, ConfidenceHigh
-	//    "text/html"        → FormatHTML, ConfidenceHigh
-	//
-	// 2. Check body content patterns:
-	//    Lines matching KEY=VALUE        → FormatDotenv
-	//    Lines matching user:x:uid:gid   → FormatPasswd
-	//    Starts with '{' or '['          → FormatJSON
-	//    Starts with '<'                 → FormatHTML or FormatXML
-	//    Contains null bytes             → FormatBinary
-	//
-	// 3. If nothing matches → FormatUnknown, ConfidenceNone
-	//
-	// NOTE: This runs on the truncated preview (max 2KB).
-	// A file with a 2KB HTML header followed by JSON body would
-	// be classified as HTML. Acceptable for Phase 1.
-
-	return FormatUnknown, ConfidenceNone // placeholder
-}
-
-// =============================================================================
-// Redaction Stubs (Phase 1: to be implemented)
-// =============================================================================
-
-func redactDotenv(body []byte) string {
-	// TODO: parse KEY=VALUE lines, replace values
-	// "DB_PASSWORD=hunter2" → "DB_PASSWORD=<REDACTED>"
-	return ""
-}
-
-func redactPasswd(body []byte) string {
-	// TODO: parse colon-delimited fields, redact sensitive fields
-	// "root:x:0:0:root:/root:/bin/bash" → "root:x:0:0:<REDACTED>:<REDACTED>:<REDACTED>"
-	return ""
-}
-
-func redactJSON(body []byte) string {
-	// TODO: parse JSON, keep keys, replace string/number values
-	// {"password":"hunter2"} → {"password":"<REDACTED>"}
-	return ""
-}
-
-func redactHTML(body []byte) string {
-	// TODO: keep tag structure, strip text content
-	// <p>Secret data here</p> → <p><REDACTED></p>
-	return ""
-}
+// detectFormat(), redactHTML(), redactJSON(), redactDotenv(), redactPasswd()
+// are implemented in redaction.go. They were stubs here until v0.12.2.
 
 // =============================================================================
 // Utilities

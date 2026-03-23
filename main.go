@@ -241,6 +241,53 @@ func main() {
 			return evidence
 		}
 
+		// reclassifyWithEvidence checks if REC captured a response body and,
+		// if so, asks the LLM to re-evaluate its verdict with the actual evidence.
+		// Returns true + updated reason if the severity was downgraded.
+		// Returns false if no evidence, no body preview, or LLM confirms original severity.
+		reclassifyWithEvidence := func(evidence *rec.Evidence, classification, reason string) (downgraded bool, newReason string) {
+			if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
+				return false, ""
+			}
+
+			// Pattern hits (seeded/cached) don't set LLMClassification — default based on verdict
+			if classification == "" {
+				switch result.Verdict {
+				case patternstore.VerdictDeny:
+					classification = "malicious"
+				case patternstore.VerdictAlert:
+					classification = "suspicious"
+				default:
+					classification = "unknown"
+				}
+			}
+
+			reclass, err := llmClient.ReclassifyWithEvidence(
+				ctx,
+				classification,
+				reason,
+				evt.Line,
+				evidence.Transport.StatusCode,
+				evidence.Transport.ContentType,
+				evidence.Transport.ContentLength,
+				evidence.SafeBodyPreview,
+			)
+			if err != nil {
+				log.Printf("[reclassify] Error re-classifying with evidence: %v — using original verdict", err)
+				return false, ""
+			}
+
+			if reclass.Downgraded {
+				log.Printf("[DOWNGRADED] EventID=%s Original=%s→%s Reason=%s",
+					evt.ID, classification, reclass.Classification, reclass.Reason)
+				return true, reclass.Reason
+			}
+
+			log.Printf("[reclassify] Evidence confirmed original severity: %s (reason: %s)",
+				reclass.Classification, reclass.Reason)
+			return false, ""
+		}
+
 		switch result.Verdict {
 		case patternstore.VerdictAllow:
 			// Known-good, skip silently
@@ -259,8 +306,19 @@ func main() {
 				return
 			}
 
-			// ALERT! Known-bad or LLM-classified malicious
 			evidence := lookupEvidence()
+
+			// Re-classify with evidence if body preview available
+			if downgraded, newReason := reclassifyWithEvidence(evidence, result.LLMClassification, result.Reason); downgraded {
+				// Attack payload was present but server ignored it — downgrade to info log
+				log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s Hash=%s %s Line=%s",
+					evt.ID, evt.ScopeKey(), result.Reason, newReason, evt.Hash,
+					evidence.ForJournal(), truncate(evt.Line, 200))
+				// Don't dispatch — the attack didn't succeed
+				return
+			}
+
+			// ALERT! Known-bad or LLM-classified malicious (confirmed by evidence or no evidence available)
 			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
 				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 				evidence.ForJournal(), truncate(evt.Line, 200))
@@ -276,8 +334,17 @@ func main() {
 				return
 			}
 
-			// SUSPICIOUS — LLM flagged as suspicious, or memoized repeat of same.
 			evidence := lookupEvidence()
+
+			// Re-classify with evidence if body preview available
+			if downgraded, newReason := reclassifyWithEvidence(evidence, result.LLMClassification, result.Reason); downgraded {
+				log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s Hash=%s %s Line=%s",
+					evt.ID, evt.ScopeKey(), result.Reason, newReason, evt.Hash,
+					evidence.ForJournal(), truncate(evt.Line, 200))
+				return
+			}
+
+			// SUSPICIOUS — LLM flagged as suspicious, or confirmed by evidence
 			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
 				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 				evidence.ForJournal(), truncate(evt.Line, 200))
@@ -453,18 +520,19 @@ func (d *alertDedup) isDuplicate(key string) bool {
 	return false
 }
 
-// buildDedupKey creates a dedup key from the normalized line and alert reason.
-// The key intentionally EXCLUDES the container name — that's the whole point.
-// Nginx and backend containers produce different log lines for the same request,
-// but the alert reason (from the LLM or seed pattern) and the HTTP request
-// identity (method + path + status, embedded in the normalized line) match.
+// buildDedupKey creates a dedup key from the normalized line.
+// The key intentionally EXCLUDES:
+//   - Container name (nginx + backend = same request from different containers)
+//   - Alert reason (seeded patterns and LLM produce different reason strings
+//     for the same attack — "SQL injection payload detected" vs
+//     "SQL injection payload present in query string; confirmed...")
 //
-// Key format: "reason|method|path|status"
-// Falls back to just "reason" if the line isn't HTTP (error logs, etc.)
+// Key format: "method|path|status" — the request identity.
+// Falls back to "reason" only for non-HTTP logs (error logs, etc.)
 func buildDedupKey(normalizedLine, reason string) string {
 	method, path, _, statusCode := parseNormalizedLine(normalizedLine)
 	if method != "" {
-		return fmt.Sprintf("%s|%s|%s|%d", reason, method, path, statusCode)
+		return fmt.Sprintf("%s|%s|%d", method, path, statusCode)
 	}
 	// Non-HTTP log — dedup on reason alone (conservative, may over-dedup)
 	return reason
