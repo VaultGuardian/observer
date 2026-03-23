@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vaultguardian/logwatch/internal/analyzer"
+	"github.com/vaultguardian/logwatch/internal/coordinator"
 	"github.com/vaultguardian/logwatch/internal/event"
 	"github.com/vaultguardian/logwatch/internal/llm"
 	"github.com/vaultguardian/logwatch/internal/normalizer"
@@ -173,28 +174,119 @@ func main() {
 		}
 	}()
 
-	// ------- Cross-Container Alert Dedup -------
-	// On Docker Swarm/CapRover, a single HTTP request generates log lines from
-	// BOTH the nginx container AND the backend container. Without dedup, every
-	// attack produces two alert emails for one actual event.
-	//
-	// Host-level heuristic: same HTTP method + path + status code within a
-	// 2-second window = same request, different container. Suppress the second.
-	// No application config changes needed — purely what Observer already knows.
-	dedup := newAlertDedup(2 * time.Second)
-
 	// ------- Re-Classification Cache -------
-	// When REC captures a response and the LLM re-classifies an alert with
-	// evidence, cache the result keyed on the REDACTED BODY HASH.
-	//
-	// Same body = same conclusion. The Laravel welcome page is the same
-	// welcome page whether the attack was SQL injection or path traversal.
-	// Different body = fresh evaluation needed (maybe the app changed and
-	// now returns real data).
-	//
-	// This is the "the design review cache" — prevents burning LLM tokens on the same
-	// re-classification answer over and over.
 	reclassCache := newReclassCache()
+
+	// ------- Alert Coordinator ("Forensic Huddle") -------
+	// Instead of dispatching alerts immediately, evidence-eligible HTTP alerts
+	// go into a short holding period. Sibling logs from other containers join
+	// the same investigation. REC captures the response. Re-classification
+	// cache or LLM determines if the attack actually succeeded.
+	//
+	// Non-HTTP alerts (SSH, sudo, kernel) bypass the coordinator entirely.
+	alertCoordinator := coordinator.New(
+		ctx,
+		coordinator.DefaultConfig(),
+
+		// Dispatch callback — called when an investigation concludes
+		func(alert coordinator.FinalAlert) {
+			if alert.Downgraded {
+				log.Printf("[DOWNGRADED] EventID=%s key=%s events=%d Original→recon_failed Reason=%s",
+					alert.EventID, alert.ScopeKey, alert.EventCount, alert.DowngradeReason)
+				log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s %s Line=%s",
+					alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
+					alert.EvidenceJournal, truncate(alert.Line, 200))
+				// No email — attack was ignored by the server
+				return
+			}
+
+			// Not downgraded — dispatch the alert
+			if alert.BuildAlert != nil {
+				builtAlert, ok := alert.BuildAlert().(notifier.Alert)
+				if ok {
+					severity := "ALERT"
+					if alert.Severity == "suspicious" {
+						severity = "SUSPICIOUS"
+					}
+					log.Printf("[%s] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
+						severity, alert.EventID, alert.ScopeKey, alert.Reason,
+						alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
+					dispatch.Dispatch(ctx, builtAlert)
+				}
+			}
+		},
+
+		// Evidence check callback — called periodically by the coordinator
+		// to see if REC evidence + re-classification can downgrade the alert
+		func(pending *coordinator.PendingAlert) (bool, string) {
+			method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
+			if method == "" {
+				return false, "" // non-HTTP, can't check evidence
+			}
+
+			evidence := collector.Lookup(rec.LookupRequest{
+				Method:          method,
+				Path:            path,
+				Host:            host,
+				SourceContainer: pending.SourceName,
+				StatusCode:      statusCode,
+				Timestamp:       pending.Timestamp,
+				Window:          5 * time.Second, // wider window for coordinator's retry pattern
+			})
+
+			if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
+				return false, ""
+			}
+
+			// Update pending with evidence info for logging
+			pending.EvidenceResult = evidence
+			pending.EvidenceJournal = evidence.ForJournal()
+
+			// Determine classification for re-classification
+			classification := pending.Classification
+			if classification == "" {
+				if pending.Verdict == "deny" {
+					classification = "malicious"
+				} else {
+					classification = "suspicious"
+				}
+			}
+
+			// Check re-classification cache first
+			bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
+			if cached, ok := reclassCache.get(bodyHash); ok {
+				if cached.downgraded {
+					log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
+						bodyHash[:16], cached.reason)
+				}
+				return cached.downgraded, cached.reason
+			}
+
+			// Cache miss — call LLM for re-classification
+			reclass, err := llmClient.ReclassifyWithEvidence(
+				ctx,
+				classification,
+				pending.Reason,
+				pending.Line,
+				evidence.Transport.StatusCode,
+				evidence.Transport.ContentType,
+				evidence.Transport.ContentLength,
+				evidence.SafeBodyPreview,
+			)
+			if err != nil {
+				log.Printf("[reclassify] Error: %v — not downgrading", err)
+				return false, ""
+			}
+
+			reclassCache.put(bodyHash, reclass.Downgraded, reclass.Reason)
+
+			if reclass.Downgraded {
+				log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
+					classification, reclass.Classification, reclass.Reason)
+			}
+			return reclass.Downgraded, reclass.Reason
+		},
+	)
 
 	// ------- Log handler: the core pipeline -------
 	handler := func(line watcher.LogLine) {
@@ -204,8 +296,6 @@ func main() {
 		}
 
 		// Convert watcher.LogLine → event.Event
-		// (The watcher still uses its own struct; this bridges until
-		// we refactor it to emit Events directly.)
 		evt := &event.Event{
 			ID:         event.NewID(),
 			SourceType: event.SourceDocker,
@@ -221,7 +311,6 @@ func main() {
 		result := a.Analyze(ctx, evt)
 
 		// Build the alert snapshot ONCE from this specific event+result pair.
-		// All fields come from the same goroutine-local variables — no cross-event contamination.
 		buildAlert := func(severity notifier.Severity, evidence *rec.Evidence) notifier.Alert {
 			return notifier.Alert{
 				EventID:        evt.ID,
@@ -239,159 +328,69 @@ func main() {
 			}
 		}
 
-		// lookupEvidence performs REC correlation for alert/deny verdicts.
-		// Enrichment-only — never changes the verdict, just attaches evidence.
-		lookupEvidence := func() *rec.Evidence {
-			method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
-			evidence := collector.Lookup(rec.LookupRequest{
-				Method:          method,
-				Path:            path,
-				Host:            host,
-				SourceContainer: evt.SourceName,
-				StatusCode:      statusCode,
-				Timestamp:       evt.Timestamp,
-			})
-			return evidence
-		}
-
-		// reclassifyWithEvidence checks if REC captured a response body and,
-		// if so, asks the LLM to re-evaluate its verdict with the actual evidence.
-		// Returns true + updated reason if the severity was downgraded.
-		// Returns false if no evidence, no body preview, or LLM confirms original severity.
-		reclassifyWithEvidence := func(evidence *rec.Evidence, classification, reason string) (downgraded bool, newReason string) {
-			if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
-				return false, ""
-			}
-
-			// Pattern hits (seeded/cached) don't set LLMClassification — default based on verdict
-			if classification == "" {
-				switch result.Verdict {
-				case patternstore.VerdictDeny:
-					classification = "malicious"
-				case patternstore.VerdictAlert:
-					classification = "suspicious"
-				default:
-					classification = "unknown"
-				}
-			}
-
-			// --- CACHE CHECK: same redacted body = same conclusion ---
-			// Key on the REDACTED preview, not the raw body hash. The raw HTML
-			// may contain CSRF tokens, nonces, or timestamps that change every
-			// request. The redacted version strips those (script/style blocks
-			// become [STRIPPED], meta content becomes [REDACTED]), so the same
-			// page produces the same hash every time.
-			bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
-			if cached, ok := reclassCache.get(bodyHash); ok {
-				if cached.downgraded {
-					log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
-						bodyHash[:16], cached.reason)
-				} else {
-					log.Printf("[reclassify] Cache hit (redacted_body=%s): confirmed severity",
-						bodyHash[:16])
-				}
-				return cached.downgraded, cached.reason
-			}
-
-			reclass, err := llmClient.ReclassifyWithEvidence(
-				ctx,
-				classification,
-				reason,
-				evt.Line,
-				evidence.Transport.StatusCode,
-				evidence.Transport.ContentType,
-				evidence.Transport.ContentLength,
-				evidence.SafeBodyPreview,
-			)
-			if err != nil {
-				log.Printf("[reclassify] Error re-classifying with evidence: %v — using original verdict", err)
-				return false, ""
-			}
-
-			// Cache the result keyed on body hash
-			reclassCache.put(bodyHash, reclass.Downgraded, reclass.Reason)
-
-			if reclass.Downgraded {
-				log.Printf("[DOWNGRADED] EventID=%s Original=%s→%s Reason=%s",
-					evt.ID, classification, reclass.Classification, reclass.Reason)
-				return true, reclass.Reason
-			}
-
-			log.Printf("[reclassify] Evidence confirmed original severity: %s (reason: %s)",
-				reclass.Classification, reclass.Reason)
-			return false, ""
-		}
-
 		switch result.Verdict {
 		case patternstore.VerdictAllow:
-			// Known-good, skip silently
 			return
 
 		case patternstore.VerdictSuppress:
-			// Known-noise, skip silently
 			return
 
-		case patternstore.VerdictDeny:
-			// Cross-container dedup: same attack from different containers = one email
-			dedupKey := buildDedupKey(evt.NormalizedLine, result.Reason)
-			if dedup.isDuplicate(dedupKey) {
-				log.Printf("[DEDUP] Suppressed duplicate alert: Source=%s Reason=%s Hash=%s",
-					evt.ScopeKey(), result.Reason, evt.Hash)
-				return
+		case patternstore.VerdictDeny, patternstore.VerdictAlert:
+			// Determine if this is an evidence-eligible HTTP alert
+			method, path, _, statusCode := parseNormalizedLine(evt.NormalizedLine)
+			isHTTP := method != ""
+
+			severity := "malicious"
+			notifSeverity := notifier.SeverityMalicious
+			if result.Verdict == patternstore.VerdictAlert {
+				severity = "suspicious"
+				notifSeverity = notifier.SeveritySuspicious
 			}
 
-			evidence := lookupEvidence()
+			if isHTTP && collector.Enabled() {
+				// Route through coordinator — hold for evidence
+				correlationKey := fmt.Sprintf("%s|%s|%d", method, path, statusCode)
 
-			// Re-classify with evidence if body preview available
-			if downgraded, newReason := reclassifyWithEvidence(evidence, result.LLMClassification, result.Reason); downgraded {
-				// Attack payload was present but server ignored it — downgrade to info log
-				log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s Hash=%s %s Line=%s",
-					evt.ID, evt.ScopeKey(), result.Reason, newReason, evt.Hash,
-					evidence.ForJournal(), truncate(evt.Line, 200))
-				// Don't dispatch — the attack didn't succeed
-				return
+				alertBuilder := func() interface{} {
+					// This closure captures the current evt/result — safe because
+					// buildAlert already snapshots everything
+					evidence := collector.Lookup(rec.LookupRequest{
+						Method:          method,
+						Path:            path,
+						SourceContainer: evt.SourceName,
+						StatusCode:      statusCode,
+						Timestamp:       evt.Timestamp,
+						Window:          5 * time.Second,
+					})
+					return buildAlert(notifSeverity, evidence)
+				}
+
+				alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
+					EventID:        evt.ID,
+					ScopeKey:       evt.ScopeKey(),
+					Reason:         result.Reason,
+					MatchedVia:     result.Source,
+					Hash:           evt.Hash,
+					Line:           evt.Line,
+					Verdict:        string(result.Verdict),
+					Severity:       severity,
+					Classification: result.LLMClassification,
+					NormalizedLine: evt.NormalizedLine,
+					SourceName:     evt.SourceName,
+					Timestamp:      evt.Timestamp,
+					BuildAlert:     alertBuilder,
+				})
+			} else {
+				// Non-HTTP or REC disabled — dispatch immediately, no evidence possible
+				log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
+					evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
+					truncate(evt.Line, 200))
+				dispatch.Dispatch(ctx, buildAlert(notifSeverity, nil))
 			}
-
-			// ALERT! Known-bad or LLM-classified malicious (confirmed by evidence or no evidence available)
-			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
-				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
-				evidence.ForJournal(), truncate(evt.Line, 200))
-
-			dispatch.Dispatch(ctx, buildAlert(notifier.SeverityMalicious, evidence))
-
-		case patternstore.VerdictAlert:
-			// Cross-container dedup
-			dedupKey := buildDedupKey(evt.NormalizedLine, result.Reason)
-			if dedup.isDuplicate(dedupKey) {
-				log.Printf("[DEDUP] Suppressed duplicate suspicious alert: Source=%s Reason=%s Hash=%s",
-					evt.ScopeKey(), result.Reason, evt.Hash)
-				return
-			}
-
-			evidence := lookupEvidence()
-
-			// Re-classify with evidence if body preview available
-			if downgraded, newReason := reclassifyWithEvidence(evidence, result.LLMClassification, result.Reason); downgraded {
-				log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s Hash=%s %s Line=%s",
-					evt.ID, evt.ScopeKey(), result.Reason, newReason, evt.Hash,
-					evidence.ForJournal(), truncate(evt.Line, 200))
-				return
-			}
-
-			// SUSPICIOUS — LLM flagged as suspicious, or confirmed by evidence
-			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
-				evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
-				evidence.ForJournal(), truncate(evt.Line, 200))
-
-			dispatch.Dispatch(ctx, buildAlert(notifier.SeveritySuspicious, evidence))
 
 		case patternstore.VerdictUnknown:
-			// LLM had an error, was dropped by backpressure, or returned
-			// an unrecognized action. Log for debugging but don't alert.
 			if result.Source == "error" {
 				log.Printf("[LLM_ERROR] Source=%s Line=%s", evt.ScopeKey(), truncate(evt.Line, 100))
-			} else if result.Source == "backpressure" {
-				// Semaphore was full — line was dropped. Already counted in LLMDropped stat.
 			}
 		}
 	}
@@ -484,92 +483,6 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 	}
 	code, _ := strconv.Atoi(m[4])
 	return m[2], m[3], m[1], code
-}
-
-// =============================================================================
-// Cross-Container Alert Deduplication
-// =============================================================================
-//
-// On Docker Swarm/CapRover, a single HTTP request generates log lines from
-// BOTH the nginx container AND the backend app container. Both get classified,
-// both trigger alerts, the user gets TWO emails for ONE attack.
-//
-// Host-level heuristic: same alert reason + similar normalized content within
-// a short time window = same underlying request from different containers.
-// The FIRST alert fires normally. The SECOND (and any further duplicates
-// within the window) is suppressed with a [DEDUP] log line.
-//
-// This uses data Observer already has from the log lines it already parsed.
-// No application config changes needed. No X-Request-ID injection.
-// If someone later adds request IDs, this dedup still works as a safety net.
-
-type alertDedup struct {
-	mu     sync.Mutex
-	window time.Duration
-	recent map[string]time.Time // dedupKey → first seen
-}
-
-func newAlertDedup(window time.Duration) *alertDedup {
-	d := &alertDedup{
-		window: window,
-		recent: make(map[string]time.Time),
-	}
-	// Periodically clean stale entries to prevent unbounded growth
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			d.mu.Lock()
-			cutoff := time.Now().Add(-d.window)
-			for key, ts := range d.recent {
-				if ts.Before(cutoff) {
-					delete(d.recent, key)
-				}
-			}
-			d.mu.Unlock()
-		}
-	}()
-	return d
-}
-
-// isDuplicate returns true if an alert with this key was already dispatched
-// within the dedup window. If false, records the key for future checks.
-func (d *alertDedup) isDuplicate(key string) bool {
-	if key == "" {
-		return false // can't dedup without a key
-	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	now := time.Now()
-	if firstSeen, exists := d.recent[key]; exists {
-		if now.Sub(firstSeen) < d.window {
-			return true // duplicate within window
-		}
-	}
-
-	// Not a duplicate — record this as the first occurrence
-	d.recent[key] = now
-	return false
-}
-
-// buildDedupKey creates a dedup key from the normalized line.
-// The key intentionally EXCLUDES:
-//   - Container name (nginx + backend = same request from different containers)
-//   - Alert reason (seeded patterns and LLM produce different reason strings
-//     for the same attack — "SQL injection payload detected" vs
-//     "SQL injection payload present in query string; confirmed...")
-//
-// Key format: "method|path|status" — the request identity.
-// Falls back to "reason" only for non-HTTP logs (error logs, etc.)
-func buildDedupKey(normalizedLine, reason string) string {
-	method, path, _, statusCode := parseNormalizedLine(normalizedLine)
-	if method != "" {
-		return fmt.Sprintf("%s|%s|%d", method, path, statusCode)
-	}
-	// Non-HTTP log — dedup on reason alone (conservative, may over-dedup)
-	return reason
 }
 
 // =============================================================================
