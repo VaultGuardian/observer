@@ -70,6 +70,18 @@ type CollectorConfig struct {
 	// Docker socket path for Swarm detection at startup.
 	// Defaults to /var/run/docker.sock if empty.
 	DockerSocket string
+
+	// NSContainer is a container name pattern for namespace capture mode.
+	// If set and a matching running container is found, REC opens its
+	// AF_PACKET socket inside that container's network namespace instead
+	// of the host's. This is required for single-node Docker Swarm where
+	// overlay traffic never touches the host network stack.
+	//
+	// Typical value: "captain-nginx" (CapRover), "nginx", "traefik", etc.
+	// Substring match, case-insensitive.
+	//
+	// Empty = host namespace capture (existing behavior).
+	NSContainer string
 }
 
 // DefaultCollectorConfig returns the design team-agreed defaults.
@@ -81,6 +93,7 @@ func DefaultCollectorConfig() CollectorConfig {
 		Buffer:       DefaultBufferConfig(),
 		VXLANPort:    0, // 0 = auto-detect from Docker API
 		DockerSocket: "/var/run/docker.sock",
+		NSContainer:  "", // empty = host namespace
 	}
 }
 
@@ -156,8 +169,6 @@ type liveCollector struct {
 
 func (lc *liveCollector) Start(ctx context.Context) error {
 	// --- Swarm detection + VXLAN port resolution ---
-	// Query Docker daemon to detect Swarm mode and data-path port.
-	// If VXLANPort is explicitly configured, skip auto-detection.
 	vxlanPort := lc.config.VXLANPort
 	if vxlanPort == 0 {
 		swarm := detectSwarm(lc.config.DockerSocket)
@@ -172,20 +183,42 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 		log.Printf("[rec] VXLAN port explicitly configured: %d", vxlanPort)
 	}
 
-	// Use configured interface, or capture on ALL interfaces (the safe default).
-	// On Docker Swarm / CapRover, traffic flows through multiple interfaces
-	// (docker_gwbridge, overlay veths, ingress network) — binding to one
-	// specific interface misses traffic on others. Capturing on all interfaces
-	// ensures we see nginx→backend forwarded HTTP regardless of network topology.
-	iface := lc.config.Interface // empty = all interfaces
+	iface := lc.config.Interface
 
 	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort)
-	lc.sniffer = s // store for stats access
+	lc.sniffer = s
 
-	// Open socket SYNCHRONOUSLY — if this fails, Start() returns the error
-	// and running stays false. No false "enabled" state. (code review's catch:
-	// only mark running=true after real capture starts.)
-	fd, err := s.openSocket()
+	// --- Decide capture mode: namespace or host ---
+	var fd int
+	var err error
+	captureMode := "host"
+
+	if lc.config.NSContainer != "" {
+		// Namespace capture mode: find container PID, open socket in its namespace.
+		// This is required for single-node Swarm where overlay traffic stays
+		// inside Docker's network namespaces and never touches the host.
+		info, findErr := findContainerPID(lc.config.DockerSocket, lc.config.NSContainer)
+		if findErr != nil {
+			log.Printf("[rec] Namespace capture requested for %q but container not found: %v — falling back to host capture",
+				lc.config.NSContainer, findErr)
+			// Fall back to host capture
+			fd, err = s.openSocket()
+		} else {
+			log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
+				info.Name, info.PID)
+			fd, err = openSocketInNamespace(info.PID)
+			if err != nil {
+				log.Printf("[rec] Namespace socket failed: %v — falling back to host capture", err)
+				fd, err = s.openSocket()
+			} else {
+				captureMode = fmt.Sprintf("namespace:%s(pid=%d)", info.Name, info.PID)
+			}
+		}
+	} else {
+		// Host capture mode (default)
+		fd, err = s.openSocket()
+	}
+
 	if err != nil {
 		return fmt.Errorf("REC capture failed to start: %w", err)
 	}
@@ -196,7 +229,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// Launch read loop goroutine (socket already open)
 	go func() {
 		s.readLoop(ctx, fd)
-		lc.running.Store(false) // mark stopped when loop exits
+		lc.running.Store(false)
 	}()
 
 	// Launch cleanup goroutine for stale pending requests
@@ -206,8 +239,9 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	if ifaceDesc == "" {
 		ifaceDesc = "(all interfaces)"
 	}
-	log.Printf("[rec] Response Evidence Capture started on interface=%s ports=%v vxlanPort=%d "+
+	log.Printf("[rec] Response Evidence Capture started — capture=%s interface=%s ports=%v vxlanPort=%d "+
 		"buffer=[maxEntries=%d maxBytes=%d maxAge=%s maxBody=%d]",
+		captureMode,
 		ifaceDesc,
 		lc.config.Ports,
 		vxlanPort,

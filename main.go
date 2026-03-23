@@ -107,6 +107,9 @@ func main() {
 			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q — using auto-detect", vxlanPortStr)
 		}
 	}
+	if nsContainer := getEnv("REC_NS_CONTAINER", ""); nsContainer != "" {
+		recCfg.NSContainer = nsContainer
+	}
 	collector := rec.NewCollector(recCfg)
 
 	// ------- Context with graceful shutdown -------
