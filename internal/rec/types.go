@@ -228,3 +228,21 @@ func HashBody(body []byte) string {
 	h := sha256.Sum256(body)
 	return fmt.Sprintf("%x", h[:])
 }
+
+// =============================================================================
+// REC Stats — Telemetry for Periodic Logging
+// =============================================================================
+
+// RECStats holds sniffer + buffer counters for the periodic stats log line.
+// Snapshot-safe: all values are copied, no pointers to live data.
+type RECStats struct {
+	PacketsSeen   int64 // total packets read from socket
+	HTTPRequests  int64 // HTTP requests successfully parsed
+	HTTPResponses int64 // HTTP responses successfully parsed
+	PairMisses    int64 // responses without matching request
+	VXLANUnwrapped int64 // VXLAN packets successfully decapsulated
+	VXLANHTTPReq  int64 // HTTP requests found inside VXLAN tunnels
+	VXLANHTTPResp int64 // HTTP responses found inside VXLAN tunnels
+	BufferEntries int   // current ring buffer occupancy
+	BufferBytes   int64 // current ring buffer memory usage
+}

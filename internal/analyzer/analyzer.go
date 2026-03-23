@@ -217,17 +217,20 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 		return false
 	}
 
-	// Source hint cross-check (fuzzy): if the LLM thinks this is from a
-	// completely unrelated service, don't trust the pattern.
-	// Docker Swarm names look like "captain-nginx.1.hjfscqq05nqt..." — we extract
-	// the short service name (before first ".") for comparison.
-	// LLM hints are verbose like "nginx access logs in docker container" — we check
-	// if any significant word from the hint appears in the source name, or vice versa.
-	if verdict.SourceHint != "" && !sourceHintMatches(evt.SourceName, verdict.SourceHint) {
-		log.Printf("[analyzer] Source hint mismatch: LLM says %q, actual is %q — skipping pattern",
-			verdict.SourceHint, evt.SourceName)
-		return false
-	}
+	// SOURCE HINT CHECK — REMOVED (v0.12)
+	//
+	// Previously, we asked the LLM to tell us what service the log came from,
+	// then verified its guess against the actual source. This was backwards:
+	// we ALREADY KNOW the source from the Event struct (SourceName, ScopeKey).
+	// The pattern is already scoped to evt.ScopeKey(). The LLM's verbose hints
+	// ("nginx access logs in docker container") didn't match CapRover's Swarm
+	// names ("srv-captain--website.1.abc123"), causing learned=0 on production.
+	//
+	// The fix: stop asking the LLM what we already know. Scope patterns to the
+	// known source directly. The sourceHintMatches() function is preserved below
+	// for reference but no longer gates pattern learning.
+	//
+	// If source_hint is still in the LLM prompt, it's harmless — we just ignore it.
 
 	// Confidence gate: only learn patterns from high-confidence verdicts
 	if verdict.Confidence < 0.85 {

@@ -55,17 +55,23 @@ type pendingRequest struct {
 //   Suitable for low-traffic servers (e.g. CapRover boxes) where most HTTP
 //   transactions fit in a single TCP segment.
 //
+//   Supports VXLAN-encapsulated traffic (Docker Swarm, Kubernetes Flannel,
+//   etc.) — automatically detects and unwraps VXLAN tunnels to reach the
+//   inner plaintext HTTP. No configuration needed on standard setups.
+//
 // WHAT THIS IS NOT:
 //   Reliable transaction reconstruction. Not forensic-grade. Not suitable
 //   for high-throughput environments or compliance evidence without caveats.
 //
 // HOW IT WORKS:
 //   1. Opens an AF_PACKET raw socket (requires CAP_NET_RAW)
-//   2. Reads ethernet frames, parses IPv4 + TCP headers manually
-//   3. Filters for TCP traffic on configured ports (userspace filter)
-//   4. Uses stdlib net/http to parse HTTP request/response from TCP payload
-//   5. Tracks request→response pairing via FIFO queue per TCP stream
-//   6. Inserts completed transactions into the ring buffer
+//   2. Reads ethernet frames, parses IPv4 headers manually
+//   3. For TCP: filters by configured ports, parses HTTP request/response
+//   4. For UDP: detects VXLAN (dst port 4789), unwraps inner Ethernet frame,
+//      and recurses back to step 2 with a depth guard (max 2 levels)
+//   5. Uses stdlib net/http to parse HTTP request/response from TCP payload
+//   6. Tracks request→response pairing via FIFO queue per TCP stream
+//   7. Inserts completed transactions into the ring buffer
 //
 // KNOWN LIMITATIONS (be honest about these):
 //
@@ -91,15 +97,22 @@ type pendingRequest struct {
 //      Phase 1. The SourceContainer field on CapturedResponse is left
 //      empty by the sniffer.
 //
-//   6. CPU COST: Every IPv4 TCP packet hits userspace parsing. No BPF
+//   6. CPU COST: Every IPv4 packet hits userspace parsing. No BPF
 //      filter yet. Acceptable on low-traffic boxes, problematic at scale.
 //      BPF port filtering is a Phase 2 optimization.
+//
+//   7. ENCRYPTED OVERLAYS: If Docker Swarm overlay networks are created
+//      with --opt encrypted, IPsec encrypts the VXLAN payload. VXLAN
+//      unwrapping still works mechanically, but the inner frame is
+//      ciphertext — no HTTP will be parsed. REC honestly reports zero
+//      HTTP in this case.
 
 type sniffer struct {
-	buffer  *RingBuffer
-	iface   string // empty = capture on all interfaces
-	ports   map[int]bool
-	maxBody int
+	buffer    *RingBuffer
+	iface     string // empty = capture on all interfaces
+	ports     map[int]bool
+	maxBody   int
+	vxlanPort uint16 // VXLAN destination port (default 4789, from Docker API or config)
 
 	// FIFO queue of pending requests per TCP stream direction.
 	// Nginx uses HTTP keep-alive on upstream connections, so multiple
@@ -116,19 +129,26 @@ type sniffer struct {
 	httpReqCount  int64
 	httpRespCount int64
 	pairMissCount int64 // responses where request was never seen
+	vxlanCount    int64 // VXLAN packets successfully unwrapped
+	vxlanHTTPReq  int64 // HTTP requests found inside VXLAN tunnels
+	vxlanHTTPResp int64 // HTTP responses found inside VXLAN tunnels
 }
 
-func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int) *sniffer {
+func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16) *sniffer {
 	portSet := make(map[int]bool, len(ports))
 	for _, p := range ports {
 		portSet[p] = true
 	}
+	if vxlanPort == 0 {
+		vxlanPort = DefaultVXLANPort
+	}
 	return &sniffer{
-		buffer:  buffer,
-		iface:   iface,
-		ports:   portSet,
-		pending: make(map[streamKey][]*pendingRequest),
-		maxBody: maxBody,
+		buffer:    buffer,
+		iface:     iface,
+		ports:     portSet,
+		pending:   make(map[streamKey][]*pendingRequest),
+		maxBody:   maxBody,
+		vxlanPort: vxlanPort,
 	}
 }
 
@@ -171,8 +191,9 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[rec] Sniffer stopping (packets=%d httpReq=%d httpResp=%d pairMisses=%d)",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount)
+			log.Printf("[rec] Sniffer stopping (packets=%d httpReq=%d httpResp=%d pairMisses=%d vxlan=%d vxlanReq=%d vxlanResp=%d)",
+				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount,
+				s.vxlanCount, s.vxlanHTTPReq, s.vxlanHTTPResp)
 			return
 		default:
 		}
@@ -191,18 +212,41 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 		}
 
 		s.packetCount++
-		s.processFrame(buf[:n])
+		s.processFrame(buf[:n], 0)
 
 		if !debugLogged && s.packetCount >= 10 {
-			log.Printf("[rec] Sniffer active: %d packets seen, %d HTTP requests, %d HTTP responses, %d pair misses",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount)
+			log.Printf("[rec] Sniffer active: %d packets, %d HTTP req, %d HTTP resp, %d pair misses, %d VXLAN unwrapped",
+				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount, s.vxlanCount)
 			debugLogged = true
 		}
 	}
 }
 
 // processFrame parses an ethernet frame and routes HTTP traffic to handlers.
-func (s *sniffer) processFrame(frame []byte) {
+// The depth parameter guards against VXLAN-in-VXLAN recursion (max 2 levels).
+//
+// VXLAN detection is always-on, no-op when absent:
+//   1. Try VXLAN decap first. If it succeeds, recurse with inner frame.
+//   2. If not VXLAN, proceed with normal Ethernet → IPv4 → TCP → HTTP.
+//
+// This handles both Swarm (VXLAN-encapsulated HTTP) and plain docker-compose
+// (direct TCP HTTP) transparently, with zero configuration.
+func (s *sniffer) processFrame(frame []byte, depth int) {
+	if depth > maxDecapDepth {
+		return // guard against pathological tunnel-in-tunnel
+	}
+
+	// --- Try VXLAN decapsulation first (always-on, no-op when absent) ---
+	// decapVXLAN returns errNotVXLAN in constant time for non-VXLAN packets.
+	// On Swarm: unwraps the inner Ethernet frame and recurses.
+	// On docker-compose: fails fast, falls through to normal TCP parsing.
+	if result, err := decapVXLAN(frame, s.vxlanPort); err == nil {
+		s.vxlanCount++
+		s.processFrame(result.InnerFrame, depth+1)
+		return
+	}
+
+	// --- Normal Ethernet → IPv4 → TCP → HTTP ---
 	if len(frame) < 14 {
 		return
 	}
@@ -222,9 +266,10 @@ func (s *sniffer) processFrame(frame []byte) {
 	if len(ipData) < ihl {
 		return
 	}
-	if ipData[9] != 6 { // TCP only
+	if ipData[9] != 6 { // TCP only (UDP is handled by VXLAN path above)
 		return
 	}
+
 	var srcIP, dstIP [4]byte
 	copy(srcIP[:], ipData[12:16])
 	copy(dstIP[:], ipData[16:20])
@@ -249,10 +294,16 @@ func (s *sniffer) processFrame(frame []byte) {
 
 	if s.ports[int(dstPort)] {
 		s.handleRequest(key, payload)
+		if depth > 0 {
+			s.vxlanHTTPReq++
+		}
 		return
 	}
 	if s.ports[int(srcPort)] {
 		s.handleResponse(key, payload)
+		if depth > 0 {
+			s.vxlanHTTPResp++
+		}
 		return
 	}
 }

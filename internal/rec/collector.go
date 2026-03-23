@@ -31,6 +31,10 @@ type EvidenceCollector interface {
 
 	// Enabled returns true if the collector is actively capturing.
 	Enabled() bool
+
+	// Stats returns a snapshot of REC telemetry counters.
+	// Safe to call from any goroutine. Returns zero stats if disabled.
+	Stats() RECStats
 }
 
 // DefaultCorrelationWindow is the agreed-upon L7 heuristic window.
@@ -47,7 +51,7 @@ type CollectorConfig struct {
 	Enabled bool
 
 	// Network interface to capture on (e.g., "docker0", "br-xxxxx")
-	// Empty = auto-detect
+	// Empty = capture on all interfaces
 	Interface string
 
 	// Ports to capture plaintext HTTP traffic on.
@@ -56,15 +60,27 @@ type CollectorConfig struct {
 
 	// Ring buffer configuration
 	Buffer BufferConfig
+
+	// VXLAN destination port for overlay network decapsulation.
+	// 0 = auto-detect from Docker Swarm (or default 4789).
+	// Docker Swarm defaults to 4789 but it's configurable via
+	// `docker swarm init --data-path-port`.
+	VXLANPort uint16
+
+	// Docker socket path for Swarm detection at startup.
+	// Defaults to /var/run/docker.sock if empty.
+	DockerSocket string
 }
 
 // DefaultCollectorConfig returns the design team-agreed defaults.
 func DefaultCollectorConfig() CollectorConfig {
 	return CollectorConfig{
-		Enabled:   false, // opt-in, not surprise packet capture
-		Interface: "",
-		Ports:     []int{80, 8080},
-		Buffer:    DefaultBufferConfig(),
+		Enabled:      false, // opt-in, not surprise packet capture
+		Interface:    "",
+		Ports:        []int{80, 8080},
+		Buffer:       DefaultBufferConfig(),
+		VXLANPort:    0, // 0 = auto-detect from Docker API
+		DockerSocket: "/var/run/docker.sock",
 	}
 }
 
@@ -110,6 +126,8 @@ func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 
 func (n *noOpCollector) Enabled() bool { return false }
 
+func (n *noOpCollector) Stats() RECStats { return RECStats{} }
+
 // =============================================================================
 // Live Collector
 // =============================================================================
@@ -132,10 +150,28 @@ func (n *noOpCollector) Enabled() bool { return false }
 type liveCollector struct {
 	config  CollectorConfig
 	buffer  *RingBuffer
-	running atomic.Bool // atomic — Start() and Lookup() can race (code review's fix)
+	sniffer *sniffer      // stored for stats access
+	running atomic.Bool   // atomic — Start() and Lookup() can race (code review's fix)
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
+	// --- Swarm detection + VXLAN port resolution ---
+	// Query Docker daemon to detect Swarm mode and data-path port.
+	// If VXLANPort is explicitly configured, skip auto-detection.
+	vxlanPort := lc.config.VXLANPort
+	if vxlanPort == 0 {
+		swarm := detectSwarm(lc.config.DockerSocket)
+		if swarm.Active {
+			vxlanPort = swarm.DataPathPort
+			log.Printf("[rec] Docker Swarm detected — VXLAN decapsulation active on UDP port %d", vxlanPort)
+		} else {
+			vxlanPort = DefaultVXLANPort
+			log.Printf("[rec] Docker Swarm not detected — VXLAN decapsulation still active (always-on, no-op when absent)")
+		}
+	} else {
+		log.Printf("[rec] VXLAN port explicitly configured: %d", vxlanPort)
+	}
+
 	// Use configured interface, or capture on ALL interfaces (the safe default).
 	// On Docker Swarm / CapRover, traffic flows through multiple interfaces
 	// (docker_gwbridge, overlay veths, ingress network) — binding to one
@@ -143,7 +179,8 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// ensures we see nginx→backend forwarded HTTP regardless of network topology.
 	iface := lc.config.Interface // empty = all interfaces
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes)
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort)
+	lc.sniffer = s // store for stats access
 
 	// Open socket SYNCHRONOUSLY — if this fails, Start() returns the error
 	// and running stays false. No false "enabled" state. (code review's catch:
@@ -169,10 +206,11 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	if ifaceDesc == "" {
 		ifaceDesc = "(all interfaces)"
 	}
-	log.Printf("[rec] Response Evidence Capture started on interface=%s ports=%v "+
+	log.Printf("[rec] Response Evidence Capture started on interface=%s ports=%v vxlanPort=%d "+
 		"buffer=[maxEntries=%d maxBytes=%d maxAge=%s maxBody=%d]",
 		ifaceDesc,
 		lc.config.Ports,
+		vxlanPort,
 		lc.config.Buffer.MaxEntries,
 		lc.config.Buffer.MaxTotalBytes,
 		lc.config.Buffer.MaxAge,
@@ -273,6 +311,23 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 
 func (lc *liveCollector) Enabled() bool {
 	return lc.running.Load()
+}
+
+func (lc *liveCollector) Stats() RECStats {
+	stats := RECStats{}
+	if lc.sniffer != nil {
+		stats.PacketsSeen = lc.sniffer.packetCount
+		stats.HTTPRequests = lc.sniffer.httpReqCount
+		stats.HTTPResponses = lc.sniffer.httpRespCount
+		stats.PairMisses = lc.sniffer.pairMissCount
+		stats.VXLANUnwrapped = lc.sniffer.vxlanCount
+		stats.VXLANHTTPReq = lc.sniffer.vxlanHTTPReq
+		stats.VXLANHTTPResp = lc.sniffer.vxlanHTTPResp
+	}
+	if lc.buffer != nil {
+		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()
+	}
+	return stats
 }
 
 // =============================================================================

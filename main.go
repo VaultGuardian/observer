@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -94,8 +96,16 @@ func main() {
 	// ------- Init Response Evidence Capture (opt-in) -------
 	recCfg := rec.DefaultCollectorConfig()
 	recCfg.Enabled = getEnv("REC_ENABLED", "") == "true"
+	recCfg.DockerSocket = dockerSocket
 	if iface := getEnv("REC_INTERFACE", ""); iface != "" {
 		recCfg.Interface = iface
+	}
+	if vxlanPortStr := getEnv("REC_VXLAN_PORT", ""); vxlanPortStr != "" {
+		if port, err := strconv.Atoi(vxlanPortStr); err == nil && port > 0 && port < 65536 {
+			recCfg.VXLANPort = uint16(port)
+		} else {
+			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q — using auto-detect", vxlanPortStr)
+		}
 	}
 	collector := rec.NewCollector(recCfg)
 
@@ -149,9 +159,26 @@ func main() {
 				log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
 					pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 					pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
+				if collector.Enabled() {
+					rStats := collector.Stats()
+					log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d",
+						rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
+						rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
+						rStats.BufferEntries, rStats.BufferBytes)
+				}
 			}
 		}
 	}()
+
+	// ------- Cross-Container Alert Dedup -------
+	// On Docker Swarm/CapRover, a single HTTP request generates log lines from
+	// BOTH the nginx container AND the backend container. Without dedup, every
+	// attack produces two alert emails for one actual event.
+	//
+	// Host-level heuristic: same HTTP method + path + status code within a
+	// 2-second window = same request, different container. Suppress the second.
+	// No application config changes needed — purely what Observer already knows.
+	dedup := newAlertDedup(2 * time.Second)
 
 	// ------- Log handler: the core pipeline -------
 	handler := func(line watcher.LogLine) {
@@ -221,6 +248,14 @@ func main() {
 			return
 
 		case patternstore.VerdictDeny:
+			// Cross-container dedup: same attack from different containers = one email
+			dedupKey := buildDedupKey(evt.NormalizedLine, result.Reason)
+			if dedup.isDuplicate(dedupKey) {
+				log.Printf("[DEDUP] Suppressed duplicate alert: Source=%s Reason=%s Hash=%s",
+					evt.ScopeKey(), result.Reason, evt.Hash)
+				return
+			}
+
 			// ALERT! Known-bad or LLM-classified malicious
 			evidence := lookupEvidence()
 			log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
@@ -230,6 +265,14 @@ func main() {
 			dispatch.Dispatch(ctx, buildAlert(notifier.SeverityMalicious, evidence))
 
 		case patternstore.VerdictAlert:
+			// Cross-container dedup
+			dedupKey := buildDedupKey(evt.NormalizedLine, result.Reason)
+			if dedup.isDuplicate(dedupKey) {
+				log.Printf("[DEDUP] Suppressed duplicate suspicious alert: Source=%s Reason=%s Hash=%s",
+					evt.ScopeKey(), result.Reason, evt.Hash)
+				return
+			}
+
 			// SUSPICIOUS — LLM flagged as suspicious, or memoized repeat of same.
 			evidence := lookupEvidence()
 			log.Printf("[SUSPICIOUS] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
@@ -337,4 +380,89 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 	}
 	code, _ := strconv.Atoi(m[4])
 	return m[2], m[3], m[1], code
+}
+
+// =============================================================================
+// Cross-Container Alert Deduplication
+// =============================================================================
+//
+// On Docker Swarm/CapRover, a single HTTP request generates log lines from
+// BOTH the nginx container AND the backend app container. Both get classified,
+// both trigger alerts, the user gets TWO emails for ONE attack.
+//
+// Host-level heuristic: same alert reason + similar normalized content within
+// a short time window = same underlying request from different containers.
+// The FIRST alert fires normally. The SECOND (and any further duplicates
+// within the window) is suppressed with a [DEDUP] log line.
+//
+// This uses data Observer already has from the log lines it already parsed.
+// No application config changes needed. No X-Request-ID injection.
+// If someone later adds request IDs, this dedup still works as a safety net.
+
+type alertDedup struct {
+	mu     sync.Mutex
+	window time.Duration
+	recent map[string]time.Time // dedupKey → first seen
+}
+
+func newAlertDedup(window time.Duration) *alertDedup {
+	d := &alertDedup{
+		window: window,
+		recent: make(map[string]time.Time),
+	}
+	// Periodically clean stale entries to prevent unbounded growth
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			d.mu.Lock()
+			cutoff := time.Now().Add(-d.window)
+			for key, ts := range d.recent {
+				if ts.Before(cutoff) {
+					delete(d.recent, key)
+				}
+			}
+			d.mu.Unlock()
+		}
+	}()
+	return d
+}
+
+// isDuplicate returns true if an alert with this key was already dispatched
+// within the dedup window. If false, records the key for future checks.
+func (d *alertDedup) isDuplicate(key string) bool {
+	if key == "" {
+		return false // can't dedup without a key
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	if firstSeen, exists := d.recent[key]; exists {
+		if now.Sub(firstSeen) < d.window {
+			return true // duplicate within window
+		}
+	}
+
+	// Not a duplicate — record this as the first occurrence
+	d.recent[key] = now
+	return false
+}
+
+// buildDedupKey creates a dedup key from the normalized line and alert reason.
+// The key intentionally EXCLUDES the container name — that's the whole point.
+// Nginx and backend containers produce different log lines for the same request,
+// but the alert reason (from the LLM or seed pattern) and the HTTP request
+// identity (method + path + status, embedded in the normalized line) match.
+//
+// Key format: "reason|method|path|status"
+// Falls back to just "reason" if the line isn't HTTP (error logs, etc.)
+func buildDedupKey(normalizedLine, reason string) string {
+	method, path, _, statusCode := parseNormalizedLine(normalizedLine)
+	if method != "" {
+		return fmt.Sprintf("%s|%s|%s|%d", reason, method, path, statusCode)
+	}
+	// Non-HTTP log — dedup on reason alone (conservative, may over-dedup)
+	return reason
 }
