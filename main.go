@@ -466,33 +466,47 @@ func truncate(s string, max int) string {
 	return s[:max] + "..."
 }
 
-// reNormalizedHTTP matches normalized nginx access log format WITH hostname:
+// reNormalizedHTTPHosted matches normalized nginx access log format WITH hostname prefix:
 //   HOST METHOD /path?query HTTP/X.X STATUS
 // Example: "api.admin.kovicloud.com GET /?q=UNION+SELECT HTTP/2.0 200"
-var reNormalizedHTTP = regexp.MustCompile(
+var reNormalizedHTTPHosted = regexp.MustCompile(
 	`^(\S+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// reNormalizedHTTPBare matches normalized backend access log format WITHOUT hostname:
-//   METHOD /path?query HTTP/X.X STATUS
+// reNormalizedHTTPQuoted finds an HTTP request line inside quotes anywhere in the line.
+// Matches the request inside "METHOD /path HTTP/X.X" and a status code after.
+// Handles both generic-normalized lines (where the method is buried mid-line inside quotes)
+// and bare lines where the method is at the start.
+// Example: `<IP> - - [<TS>] "GET /?q=UNION+SELECT HTTP/1.0" 200 <NUM>`
+var reNormalizedHTTPQuoted = regexp.MustCompile(
+	`"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+"\s+(\d{3})`)
+
+// reNormalizedHTTPBare matches when the method is at the start of the line (no hostname, no quotes).
 // Example: "GET /?q=UNION+SELECT+1,2,3 HTTP/1.0 200"
 var reNormalizedHTTPBare = regexp.MustCompile(
 	`^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
 // parseNormalizedLine extracts HTTP components from a normalized log line.
-// Handles two formats:
-//   1. With hostname (CapRover nginx): "host.com GET /path HTTP/2.0 200"
-//   2. Without hostname (backend apps): "GET /path HTTP/1.0 200"
-// Returns method, path (raw with query string), host, and status code.
-// For non-HTTP logs (error logs, syslog, etc.), returns zero values.
+// Handles three formats (tried in order):
+//   1. Hostname-prefixed (CapRover nginx): "host.com GET /path HTTP/2.0 200"
+//   2. Quoted request line (generic normalizer): `<IP> ... "GET /path HTTP/1.0" 200`
+//   3. Bare (no hostname, no quotes): "GET /path HTTP/1.0 200"
+// Returns method, path, host, statusCode. Zero values for non-HTTP logs.
 func parseNormalizedLine(normalized string) (method, path, host string, statusCode int) {
-	// Try hostname-prefixed format first (nginx)
-	m := reNormalizedHTTP.FindStringSubmatch(normalized)
+	// Try hostname-prefixed format first (CapRover nginx normalizer)
+	m := reNormalizedHTTPHosted.FindStringSubmatch(normalized)
 	if m != nil {
 		code, _ := strconv.Atoi(m[4])
 		return m[2], m[3], m[1], code
 	}
 
-	// Try bare format (backend apps without hostname prefix)
+	// Try quoted request line (generic normalizer wraps request in quotes)
+	m = reNormalizedHTTPQuoted.FindStringSubmatch(normalized)
+	if m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
+	// Try bare format (no hostname, no quotes)
 	m = reNormalizedHTTPBare.FindStringSubmatch(normalized)
 	if m != nil {
 		code, _ := strconv.Atoi(m[3])
