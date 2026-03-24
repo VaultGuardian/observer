@@ -224,3 +224,76 @@ REC_NS_CONTAINER=captain-nginx
 | `internal/analyzer/analyzer.go` | v0.12 | Source hint gate removed |
 | `internal/llm/client.go` | v0.12.2 | ReclassifyWithEvidence method |
 | `main.go` | v0.12-v0.13.2 | Coordinator, reclass cache, 3 parse regexes, env vars |
+
+---
+
+## 10. Refactoring Audit (Late Session)
+
+Seven issues identified and fixed. Zero behavior changes — same logic, better organized.
+
+### What Was Refactored
+
+**1. main.go God function → 5 files**
+- `config.go` — Config struct, LoadConfig(), getEnv(), truncate()
+- `seeds.go` — denySeeds data table + seedDenyPatterns()
+- `httpparse.go` — Three normalized line regexes + parseNormalizedLine()
+- `reclasscache.go` — reclassCache struct + get/put methods
+- `main.go` — Now just wiring. Callbacks extracted to named functions: makeDispatchCallback(), makeEvidenceCheckCallback(), makeLogHandler(), runPeriodicStats()
+
+**2. Dead code removed**
+- `sourceHintMatches()` + `isFillerWord()` from analyzer.go (70 lines, unused since v0.12 source hint removal)
+- `autoDetectInterface()` from sniffer.go (18 lines, unused since v0.11.1)
+- Unused `strings` and `net` imports cleaned from both files
+
+**3. classifyAndRedact moved** from collector.go to redaction.go (where the redactors it calls live)
+
+**4. Dockerfile updated** — binary `logwatch` → `observer`, comments updated
+
+**5. docker-compose.yml updated** — service `logwatch` → `observer`, container `vg-logwatch` → `vg-observer`, volume `logwatch-data` → `observer-data`
+
+**NOT done (next session):** Module rename `logwatch` → `observer` in go.mod + all imports. Biggest change, should be tested in isolation.
+
+---
+
+## 11. Design Principles Queued for Next Session
+
+### Tier 3 LLM Verification
+Before sending "confirmed intrusion" alert, run a third LLM call with higher reasoning effort. Feed it EVERYTHING: original line, normalized line, response body, status/headers, recent alerts from same source, pattern store history, other container logs from same timestamp. LLM produces a short human-readable summary for the 3am email. Only fires on Tier 2 confirmed positives (extremely rare). Cost: one extra call vs. cost of false alarm destroying trust.
+
+### Ephemeral Raw, Persistent Clean
+Raw log lines and response bodies are transient — they exist in memory briefly, never written to disk, zeroed after use. What persists (pattern store, reclass cache, coordinator state) contains only hashes, verdicts, and summaries. Never raw content.
+
+Attack surfaces to harden:
+- REC buffer holds raw bodies for 10s (required for HTTP parsing)
+- PendingAlert holds raw Line field (required for LLM re-classification)
+- Both bounded lifetime, memory-only, zeroed on eviction
+
+### Normalized Out, Raw Stays Local
+Currently raw log lines are transmitted to OpenAI (LLM calls) and Resend (email alerts). Fix: send normalized lines to LLM (IPs/timestamps already stripped). Send only reason + summary in emails, not raw lines. Tier 3 is the exception — gets raw data for maximum accuracy, but that's one call per confirmed breach.
+
+### Data Transparency
+- First-run consent before any external transmission
+- `--data-policy` flag shows exactly what goes where
+- `--local-only` mode with Ollama (zero external transmission)
+- Debug mode logs exactly what was sent to external APIs
+- Open core = anyone can audit the claims
+
+Rule: Security tools that spy on their users are the exact thing Observer is built to catch. We can't be the thing we're fighting.
+
+---
+
+## 12. Pending Bug (Coordinator Evidence Check)
+
+The coordinator groups alerts correctly but evidence check returns false for 5 seconds, then times out. Three suspects ranked by all AIs:
+
+1. Evidence found but SafeBodyPreview empty (dual-gate blocking)
+2. Path mismatch between normalizer and sniffer
+3. Buffer expiry (least likely)
+
+**Debug line to add next session:**
+```go
+log.Printf("[coordinator] Evidence check: key=%s status=%v candidates=%d transport=%v preview_len=%d format=%v",
+    pending.Key, evidence.Status, evidence.CandidateCount,
+    evidence.Transport != nil, len(evidence.SafeBodyPreview),
+    func() any { if evidence.Disclosure != nil { return evidence.Disclosure.Format }; return nil }())
+```

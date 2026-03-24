@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o logwatch .
+RUN CGO_ENABLED=0 GOOS=linux go build -o observer .
 
 # Runtime stage — tiny image
 FROM alpine:3.19
@@ -14,10 +14,10 @@ FROM alpine:3.19
 RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
-COPY --from=builder /build/logwatch .
+COPY --from=builder /build/observer .
 
-# Data directory for whitelist/blacklist persistence
+# Data directory for pattern store persistence
 RUN mkdir -p /data
 VOLUME /data
 
-ENTRYPOINT ["/app/logwatch"]
+ENTRYPOINT ["/app/observer"]

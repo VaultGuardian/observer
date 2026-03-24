@@ -365,68 +365,6 @@ func (lc *liveCollector) Stats() RECStats {
 }
 
 // =============================================================================
-// Format Classifier + Structural Redaction
-// =============================================================================
-//
-// IMPORTANT: classifyAndRedact operates on the TRUNCATED body preview
-// (max 2KB), not the full response body. Format detection and redaction
-// confidence are based on partial content. This is acceptable for Phase 1
-// but should be documented in any API that exposes these fields.
-//
-// FAIL-CLOSED RULE ('s law):
-//   If format is unknown, no body preview at all. Only transport metadata.
-//   Content-Length: 45032 on a 404 path IS the evidence.
-
-func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalysis {
-	if len(bodyPreview) == 0 {
-		return &DisclosureAnalysis{
-			Format:              FormatUnknown,
-			RedactionConfidence: ConfidenceNone,
-			DisclosureSummary:   "NO RESPONSE BODY CAPTURED",
-		}
-	}
-
-	format, confidence := detectFormat(bodyPreview, contentType)
-
-	analysis := &DisclosureAnalysis{
-		Format:              format,
-		RedactionConfidence: confidence,
-	}
-
-	switch format {
-	case FormatDotenv:
-		analysis.redactedPreview = redactDotenv(bodyPreview)
-		analysis.DisclosureSummary = "DOTENV/CONFIG STRUCTURE DETECTED"
-	case FormatPasswd:
-		analysis.redactedPreview = redactPasswd(bodyPreview)
-		analysis.DisclosureSummary = "PASSWD FILE STRUCTURE DETECTED"
-	case FormatJSON:
-		analysis.redactedPreview = redactJSON(bodyPreview)
-		analysis.DisclosureSummary = "JSON STRUCTURE DETECTED"
-	case FormatHTML:
-		analysis.redactedPreview = redactHTML(bodyPreview)
-		analysis.DisclosureSummary = "HTML CONTENT DETECTED"
-	case FormatBinary:
-		analysis.redactedPreview = ""
-		analysis.RedactionConfidence = ConfidenceNone
-		analysis.DisclosureSummary = "BINARY CONTENT DETECTED — METADATA ONLY"
-	default:
-		// FAIL-CLOSED: unknown format = no body preview.
-		analysis.redactedPreview = ""
-		analysis.RedactionConfidence = ConfidenceNone
-		analysis.DisclosureSummary = "UNKNOWN FORMAT — METADATA ONLY"
-	}
-
-	return analysis
-}
-
-// =============================================================================
-// Format Detection + Redaction — see redaction.go
-// =============================================================================
-// detectFormat(), redactHTML(), redactJSON(), redactDotenv(), redactPasswd()
-// are implemented in redaction.go. They were stubs here until v0.12.2.
-
-// =============================================================================
 // Utilities
 // =============================================================================
 

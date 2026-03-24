@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -438,29 +436,6 @@ func (s *sniffer) cleanupLoop(ctx context.Context) {
 			s.mu.Unlock()
 		}
 	}
-}
-
-// =============================================================================
-// Interface Auto-Detection
-// =============================================================================
-
-func autoDetectInterface() string {
-	for _, name := range []string{"docker_gwbridge", "docker0"} {
-		if _, err := net.InterfaceByName(name); err == nil {
-			return name
-		}
-	}
-
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			if strings.HasPrefix(iface.Name, "br-") && iface.Flags&net.FlagUp != 0 {
-				return iface.Name
-			}
-		}
-	}
-
-	return "" // capture on all interfaces
 }
 
 // =============================================================================

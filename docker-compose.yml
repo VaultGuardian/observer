@@ -1,10 +1,10 @@
 services:
-  # ---- VaultGuardian LogWatch ----
-  # Reads logs from all other containers, filters through hash-based
-  # whitelist/blacklist, and forwards unknowns to the LLM for classification.
-  logwatch:
+  # ---- VaultGuardian Observer ----
+  # Watches container logs, classifies threats via LLM, captures HTTP
+  # response evidence, and alerts on confirmed malicious activity.
+  observer:
     build: .
-    container_name: vg-logwatch
+    container_name: vg-observer
     restart: unless-stopped
     environment:
       # ── Core ──
@@ -12,7 +12,7 @@ services:
       - DATA_DIR=/data
       - LLM_URL=http://llm:11434   # Ollama's default port
       - LLM_MODEL=qwen2.5:7b       # Small, fast, good at structured output
-      - EXCLUDE_CONTAINERS=vg-logwatch,vg-llm
+      - EXCLUDE_CONTAINERS=vg-observer,vg-llm
       - RESEND_API_KEY=${RESEND_API_KEY:-}
       - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-}
       - ALERT_EMAIL_FROM=VaultGuardian <alerts@vaultdec.com>
@@ -49,7 +49,7 @@ services:
       # - FCM_DEVICE_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Read-only Docker socket
-      - logwatch-data:/data                            # Persist whitelist/blacklist + notification config
+      - observer-data:/data                            # Persist pattern store + notification config
       # Mount secrets for push notifications (if using APNs/FCM):
       # - ./secrets:/secrets:ro
     depends_on:
@@ -89,7 +89,7 @@ services:
       - vg-internal
 
 volumes:
-  logwatch-data:
+  observer-data:
   ollama-models:
 
 networks:
