@@ -301,13 +301,22 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		corrConf = ConfidenceLow
 	}
 
+	// Detect orphan match (response had no paired request — common on
+	// namespace capture where the inbound request is TLS-encrypted and
+	// the outbound proxy request is an outgoing packet AF_PACKET misses).
+	isOrphan := best.Method == ""
+
 	// Build transport evidence (Layer 1 — always included)
+	captureMode := "single_segment_preview"
+	if isOrphan {
+		captureMode = "single_segment_preview_orphan"
+	}
 	transport := &TransportEvidence{
 		StatusCode:      best.StatusCode,
 		ContentType:     best.ContentType,
 		ContentLength:   best.ContentLength,
 		BodyPreviewHash: best.BodyPreviewHash,
-		CaptureMode:     "single_segment_preview",
+		CaptureMode:     captureMode,
 		CapturedAt:      best.Timestamp,
 		ResponseLatency: absDuration(best.Timestamp.Sub(req.Timestamp)),
 	}
