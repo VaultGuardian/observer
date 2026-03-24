@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -113,6 +114,26 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 			Event:   evt,
 			Verdict: patternstore.VerdictSuppress,
 			Reason:  "Deterministic: application stack trace or framework noise",
+			Source:  "noise_filter",
+		}
+	}
+
+	// --- Step 1.6: Deterministic failed-probe suppression ---
+	// If the normalized line shows a 404/403/405/400 HTTP response AND the
+	// request path has no attack payload, this is recon_failed. Period.
+	// The LLM gets this right ~90% of the time but occasionally hedges and
+	// says "alert" for a clean 404 probe. One bad call, cached forever, 70 emails.
+	// Same lesson as stack traces: don't let the LLM vote on structural facts.
+	//
+	// SAFETY: If the path or query string contains attack indicators (encoded
+	// payloads, SQL injection, path traversal), we let the LLM classify it.
+	// The payload is evidence regardless of status code.
+	if reason, ok := isFailedProbe(evt.NormalizedLine); ok {
+		a.stats.NoiseSuppressed.Add(1)
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictSuppress,
+			Reason:  reason,
 			Source:  "noise_filter",
 		}
 	}
@@ -397,4 +418,89 @@ func isOperationalNoise(line string) bool {
 	}
 
 	return false
+}
+
+// =============================================================================
+// Deterministic Failed-Probe Detection
+// =============================================================================
+//
+// HTTP probes that returned 404/403/405/400 with no attack payload in the
+// request are recon_failed. The attacker found nothing. The LLM gets this
+// right ~90% of the time but occasionally says "alert" for a clean 404.
+// One bad call → cached forever → emails every time that hash repeats.
+//
+// This runs on the NORMALIZED line (not raw) because the normalizer preserves
+// the HTTP status code. Checks all three normalized formats.
+//
+// SAFETY: Requests with attack indicators in the path or query string are
+// NOT suppressed here. Those go to the LLM because the payload is evidence
+// regardless of status code.
+
+// Regex patterns for extracting status codes from normalized lines.
+// These mirror the formats in httpparse.go but extract just what we need.
+var (
+	reStatusHosted = regexp.MustCompile(`HTTP/\S+\s+(\d{3})`)
+	reStatusQuoted = regexp.MustCompile(`HTTP/\S+"\s+(\d{3})`)
+)
+
+// failedStatusCodes are HTTP status codes that indicate a probe found nothing.
+// NOTE: 401 (Unauthorized) is deliberately excluded. A 401 means "this endpoint
+// exists and requires auth" — that's surface discovery, not pure nothing.
+// code review's catch: /admin returning 401 is a meaningful finding.
+var failedStatusCodes = map[string]bool{
+	"400": true, // Bad request
+	"403": true, // Forbidden
+	"404": true, // Not found
+	"405": true, // Method not allowed
+	"410": true, // Gone
+}
+
+// attackIndicators are substrings that suggest the request itself contains
+// an attack payload. If any of these appear in the path/query, we let the
+// LLM classify it even if the status code is 404.
+var attackIndicators = []string{
+	"UNION", "SELECT", "DROP", "INSERT", "UPDATE", "DELETE",  // SQL
+	"../", "..\\",                                              // path traversal
+	"%00", "%0a", "%0d", "%27", "%22",                         // null/injection encoding
+	"<script", "javascript:",                                   // XSS
+	";ls", ";cat", ";rm", ";wget", ";curl",                    // command injection (specific)
+	"|", "`", "$(", "${",                                       // command injection (operators)
+	"php://", "data://", "file://",                             // PHP wrappers
+	"eval(", "exec(", "system(",                                // code execution
+}
+
+func isFailedProbe(normalizedLine string) (string, bool) {
+	if normalizedLine == "" {
+		return "", false
+	}
+
+	// Extract status code from normalized line
+	var statusCode string
+	var requestPart string
+
+	if m := reStatusHosted.FindStringSubmatch(normalizedLine); m != nil {
+		statusCode = m[1]
+		requestPart = normalizedLine
+	} else if m := reStatusQuoted.FindStringSubmatch(normalizedLine); m != nil {
+		statusCode = m[1]
+		requestPart = normalizedLine
+	} else {
+		return "", false // not an HTTP access log line
+	}
+
+	// Is this a failed status code?
+	if !failedStatusCodes[statusCode] {
+		return "", false
+	}
+
+	// Check for attack payloads in the request — if present, let the LLM decide
+	upper := strings.ToUpper(requestPart)
+	for _, indicator := range attackIndicators {
+		if strings.Contains(upper, strings.ToUpper(indicator)) {
+			return "", false // has payload, LLM should classify
+		}
+	}
+
+	reason := fmt.Sprintf("Deterministic: HTTP %s response — probe found nothing, no attack payload in request", statusCode)
+	return reason, true
 }
