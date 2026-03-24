@@ -182,6 +182,8 @@ func makeEvidenceCheckCallback(
 	return func(pending *coordinator.PendingAlert) (bool, string) {
 		method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
 		if method == "" {
+			log.Printf("[coordinator] Evidence check SKIP: no HTTP in normalized line key=%s normalized=%s",
+				pending.Key, truncate(pending.NormalizedLine, 120))
 			return false, ""
 		}
 
@@ -195,7 +197,25 @@ func makeEvidenceCheckCallback(
 			Window:          5 * time.Second,
 		})
 
+		// --- Diagnostic: reveal WHY evidence check fails ---
 		if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
+			// Build diagnostic without panic on nil fields
+			evStatus := "nil"
+			evCandidates := 0
+			hasTransport := false
+			previewLen := 0
+			evFormat := "n/a"
+			if evidence != nil {
+				evStatus = string(evidence.Status)
+				evCandidates = evidence.CandidateCount
+				hasTransport = evidence.Transport != nil
+				previewLen = len(evidence.SafeBodyPreview)
+				if evidence.Disclosure != nil {
+					evFormat = string(evidence.Disclosure.Format)
+				}
+			}
+			log.Printf("[coordinator] Evidence check MISS: key=%s lookup=%s/%s?status=%d candidates=%d transport=%v preview_len=%d format=%s status=%s",
+				pending.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
 			return false, ""
 		}
 
