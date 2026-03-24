@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vaultguardian/logwatch/internal/analyzer"
-	"github.com/vaultguardian/logwatch/internal/coordinator"
-	"github.com/vaultguardian/logwatch/internal/event"
-	"github.com/vaultguardian/logwatch/internal/llm"
-	"github.com/vaultguardian/logwatch/internal/normalizer"
-	"github.com/vaultguardian/logwatch/internal/notifier"
-	"github.com/vaultguardian/logwatch/internal/patternstore"
-	"github.com/vaultguardian/logwatch/internal/rec"
-	"github.com/vaultguardian/logwatch/internal/watcher"
+	"github.com/vaultguardian/observer/internal/analyzer"
+	"github.com/vaultguardian/observer/internal/coordinator"
+	"github.com/vaultguardian/observer/internal/event"
+	"github.com/vaultguardian/observer/internal/llm"
+	"github.com/vaultguardian/observer/internal/normalizer"
+	"github.com/vaultguardian/observer/internal/notifier"
+	"github.com/vaultguardian/observer/internal/patternstore"
+	"github.com/vaultguardian/observer/internal/rec"
+	"github.com/vaultguardian/observer/internal/watcher"
 )
 
 func main() {

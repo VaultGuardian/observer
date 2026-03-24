@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vaultguardian/logwatch/internal/rec"
+	"github.com/vaultguardian/observer/internal/rec"
 )
 
 // Severity levels for alert routing.

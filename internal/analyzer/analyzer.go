@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vaultguardian/logwatch/internal/event"
-	"github.com/vaultguardian/logwatch/internal/llm"
-	"github.com/vaultguardian/logwatch/internal/normalizer"
-	"github.com/vaultguardian/logwatch/internal/patternstore"
+	"github.com/vaultguardian/observer/internal/event"
+	"github.com/vaultguardian/observer/internal/llm"
+	"github.com/vaultguardian/observer/internal/normalizer"
+	"github.com/vaultguardian/observer/internal/patternstore"
 )
 
 // AnalysisResult is the output of the full analysis pipeline.
@@ -377,7 +377,6 @@ func isOperationalNoise(line string) bool {
 			trimmed = trimmed[idx+1:]
 		}
 	}
-	trimmed = strings.TrimSpace(trimmed)
 
 	if len(trimmed) == 0 {
 		return false
@@ -386,8 +385,21 @@ func isOperationalNoise(line string) bool {
 	// --- Node.js / JavaScript stack frames ---
 	// "    at handleDocumentRequest (/app/node_modules/@remix-run/server-runtime/dist/server.js:275:35)"
 	// "    at async Object.requestHandler (/app/node_modules/...)"
-	if len(trimmed) > 4 && trimmed[0] == ' ' && strings.HasPrefix(strings.TrimLeft(trimmed, " \t"), "at ") {
-		return true
+	// CHECK BEFORE TrimSpace — the leading whitespace IS the signal.
+	// TrimSpace would eat the indentation that distinguishes a stack frame
+	// from a normal log line starting with "at".
+	if len(trimmed) > 4 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+		inner := strings.TrimLeft(trimmed, " \t")
+		if strings.HasPrefix(inner, "at ") {
+			return true
+		}
+	}
+
+	// Now TrimSpace for the remaining checks
+	trimmed = strings.TrimSpace(trimmed)
+
+	if len(trimmed) == 0 {
+		return false
 	}
 
 	// --- Python tracebacks ---

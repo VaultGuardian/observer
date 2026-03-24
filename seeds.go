@@ -1,6 +1,6 @@
 package main
 
-import "github.com/vaultguardian/logwatch/internal/patternstore"
+import "github.com/vaultguardian/observer/internal/patternstore"
 
 // denySeeds defines curated attack indicators seeded into the global deny list.
 // These are manually chosen, not learned — they apply to all sources.

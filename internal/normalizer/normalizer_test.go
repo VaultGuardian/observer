@@ -3,7 +3,7 @@ package normalizer
 import (
 	"testing"
 
-	"github.com/vaultguardian/logwatch/internal/event"
+	"github.com/vaultguardian/observer/internal/event"
 )
 
 // TestDockerFramingStrip verifies that Docker framing is stripped upstream

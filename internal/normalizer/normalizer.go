@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/vaultguardian/logwatch/internal/event"
+	"github.com/vaultguardian/observer/internal/event"
 )
 
 // Normalizer transforms a raw log line into a stable, hashable form

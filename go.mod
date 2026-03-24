@@ -1,4 +1,4 @@
-module github.com/vaultguardian/logwatch
+module github.com/vaultguardian/observer
 
 go 1.23
 
