@@ -331,6 +331,11 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte) {
 	})
 	s.mu.Unlock()
 
+	log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
+		key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
+		key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
+		req.Method, req.RequestURI)
+
 	s.httpReqCount++
 }
 
@@ -400,8 +405,19 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte) {
 		captured.Path = pending.path
 		captured.Host = pending.host
 		captured.UserAgent = pending.userAgent
+		log.Printf("[rec] RESP paired: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d method=%s path=%s",
+			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
+			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
+			resp.StatusCode, pending.method, pending.path)
 	} else {
 		s.pairMissCount++
+		log.Printf("[rec] RESP pair miss: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d reverseKey=%d.%d.%d.%d:%d→%d.%d.%d.%d:%d pendingStreams=%d",
+			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
+			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
+			resp.StatusCode,
+			reverseKey.srcIP[0], reverseKey.srcIP[1], reverseKey.srcIP[2], reverseKey.srcIP[3], reverseKey.srcPort,
+			reverseKey.dstIP[0], reverseKey.dstIP[1], reverseKey.dstIP[2], reverseKey.dstIP[3], reverseKey.dstPort,
+			len(s.pending))
 	}
 
 	s.buffer.Insert(captured)
