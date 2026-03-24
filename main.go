@@ -1,481 +1,411 @@
-package rec
+package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"sync"
+	"os"
+	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/vaultguardian/logwatch/internal/analyzer"
+	"github.com/vaultguardian/logwatch/internal/coordinator"
+	"github.com/vaultguardian/logwatch/internal/event"
+	"github.com/vaultguardian/logwatch/internal/llm"
+	"github.com/vaultguardian/logwatch/internal/normalizer"
+	"github.com/vaultguardian/logwatch/internal/notifier"
+	"github.com/vaultguardian/logwatch/internal/patternstore"
+	"github.com/vaultguardian/logwatch/internal/rec"
+	"github.com/vaultguardian/logwatch/internal/watcher"
 )
 
-// =============================================================================
-// Stream Tracking — Pair HTTP requests with responses
-// =============================================================================
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	log.Println("[observer] VaultGuardian Observer starting...")
 
-// streamKey identifies one direction of a TCP connection.
-type streamKey struct {
-	srcIP   [4]byte
-	srcPort uint16
-	dstIP   [4]byte
-	dstPort uint16
-}
+	cfg := LoadConfig()
 
-// reverse returns the opposite direction of this stream.
-func (sk streamKey) reverse() streamKey {
-	return streamKey{
-		srcIP: sk.dstIP, srcPort: sk.dstPort,
-		dstIP: sk.srcIP, dstPort: sk.srcPort,
+	// ------- Ensure data dir exists -------
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		log.Fatalf("[observer] Failed to create data dir: %v", err)
 	}
-}
 
-// pendingRequest is a request we saw on the wire, waiting for its response.
-type pendingRequest struct {
-	method    string
-	path      string // raw path including query string — SACRED
-	host      string
-	userAgent string
-	timestamp time.Time
-}
+	// ------- Init components -------
+	normReg := normalizer.NewRegistry()
+	log.Println("[observer] Normalizer registry initialized")
 
-// =============================================================================
-// Sniffer — Raw socket packet capture + HTTP parsing
-// =============================================================================
-//
-// WHAT THIS IS:
-//   Best-effort, single-segment HTTP sniffing on plaintext traffic behind
-//   a reverse proxy. Pure Go stdlib, zero external dependencies, no CGO.
-//   Suitable for low-traffic servers (e.g. CapRover boxes) where most HTTP
-//   transactions fit in a single TCP segment.
-//
-//   Supports VXLAN-encapsulated traffic (Docker Swarm, Kubernetes Flannel,
-//   etc.) — automatically detects and unwraps VXLAN tunnels to reach the
-//   inner plaintext HTTP. No configuration needed on standard setups.
-//
-// WHAT THIS IS NOT:
-//   Reliable transaction reconstruction. Not forensic-grade. Not suitable
-//   for high-throughput environments or compliance evidence without caveats.
-//
-// HOW IT WORKS:
-//   1. Opens an AF_PACKET raw socket (requires CAP_NET_RAW)
-//   2. Reads ethernet frames, parses IPv4 headers manually
-//   3. For TCP: filters by configured ports, parses HTTP request/response
-//   4. For UDP: detects VXLAN (dst port 4789), unwraps inner Ethernet frame,
-//      and recurses back to step 2 with a depth guard (max 2 levels)
-//   5. Uses stdlib net/http to parse HTTP request/response from TCP payload
-//   6. Tracks request→response pairing via FIFO queue per TCP stream
-//   7. Inserts completed transactions into the ring buffer
-//
-// KNOWN LIMITATIONS (be honest about these):
-//
-//   1. SINGLE-SEGMENT PARSING: If HTTP headers span multiple TCP segments,
-//      the request or response is silently skipped. In practice, headers
-//      almost always fit in one segment (MSS ~1460, headers usually <500).
-//
-//   2. BODY PREVIEW ONLY: Body capture is limited to what fits in the TCP
-//      segment after headers. BodyPreviewHash covers only this partial
-//      content, NOT the full response body. Don't treat it as forensic.
-//
-//   3. REQUEST CAPTURE FAILURES: If the request packet is missed (dropped,
-//      partial, or arrived before sniffer started), the response is inserted
-//      WITHOUT method/path/host/user-agent. This makes it unmatchable by
-//      the correlator. EXPECT A SIGNIFICANT MISS RATE in real traffic,
-//      especially right after startup or during traffic bursts.
-//
-//   4. IPv4 ONLY: No IPv6 support (EtherType 0x0800 filter). Fine for
-//      Docker bridge networks which are typically IPv4.
-//
-//   5. NO SOURCE CONTAINER RESOLUTION: We see IP addresses on the wire,
-//      not container names. IP→container mapping is not implemented in
-//      Phase 1. The SourceContainer field on CapturedResponse is left
-//      empty by the sniffer.
-//
-//   6. CPU COST: Every IPv4 packet hits userspace parsing. No BPF
-//      filter yet. Acceptable on low-traffic boxes, problematic at scale.
-//      BPF port filtering is a Phase 2 optimization.
-//
-//   7. ENCRYPTED OVERLAYS: If Docker Swarm overlay networks are created
-//      with --opt encrypted, IPsec encrypts the VXLAN payload. VXLAN
-//      unwrapping still works mechanically, but the inner frame is
-//      ciphertext — no HTTP will be parsed. REC honestly reports zero
-//      HTTP in this case.
-
-type sniffer struct {
-	buffer    *RingBuffer
-	iface     string // empty = capture on all interfaces
-	ports     map[int]bool
-	maxBody   int
-	vxlanPort uint16 // VXLAN destination port (default 4789, from Docker API or config)
-
-	// FIFO queue of pending requests per TCP stream direction.
-	// Nginx uses HTTP keep-alive on upstream connections, so multiple
-	// requests can be in-flight on the same TCP connection simultaneously.
-	// A single-pointer map would cause Request B to overwrite Request A
-	// when both are on the same connection. FIFO ordering is correct
-	// for HTTP/1.1 without multiplexing (strictly sequential).
-	// ('s keep-alive bug catch.)
-	pending map[streamKey][]*pendingRequest
-	mu      sync.Mutex
-
-	// Debug counters for startup logging
-	packetCount   int64
-	httpReqCount  int64
-	httpRespCount int64
-	pairMissCount int64 // responses where request was never seen
-	vxlanCount    int64 // VXLAN packets successfully unwrapped
-	vxlanHTTPReq  int64 // HTTP requests found inside VXLAN tunnels
-	vxlanHTTPResp int64 // HTTP responses found inside VXLAN tunnels
-}
-
-func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16) *sniffer {
-	portSet := make(map[int]bool, len(ports))
-	for _, p := range ports {
-		portSet[p] = true
-	}
-	if vxlanPort == 0 {
-		vxlanPort = DefaultVXLANPort
-	}
-	return &sniffer{
-		buffer:    buffer,
-		iface:     iface,
-		ports:     portSet,
-		pending:   make(map[streamKey][]*pendingRequest),
-		maxBody:   maxBody,
-		vxlanPort: vxlanPort,
-	}
-}
-
-// openSocket opens the AF_PACKET raw socket and binds to the interface.
-// Runs SYNCHRONOUSLY in Start() — if it fails, Start() returns the error
-// and running stays false.
-func (s *sniffer) openSocket() (int, error) {
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_IP)))
+	patterns, err := patternstore.NewStore(cfg.DataDir)
 	if err != nil {
-		return -1, fmt.Errorf("opening raw socket: %w (do you have CAP_NET_RAW?)", err)
+		log.Fatalf("[observer] Failed to init pattern store: %v", err)
+	}
+	seedDenyPatterns(patterns)
+	log.Printf("[observer] Pattern store initialized (%d scopes)", patterns.ScopeCount())
+
+	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey)
+	a := analyzer.New(normReg, patterns, llmClient, cfg.MaxConcurrentLLM)
+	log.Println("[observer] Analyzer pipeline ready")
+
+	notifCfg, err := notifier.LoadConfig(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("[observer] Failed to load notification config: %v", err)
+	}
+	dispatch, err := notifier.NewDispatcher(notifCfg)
+	if err != nil {
+		log.Fatalf("[observer] Failed to init notifications: %v", err)
+	}
+	dispatch.PrintStatus()
+	if dispatch.ChannelCount() == 0 {
+		log.Println("[observer] No notification channels configured — alerts will be logged to stdout only")
 	}
 
-	if s.iface != "" {
-		if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, s.iface); err != nil {
-			syscall.Close(fd)
-			return -1, fmt.Errorf("binding to interface %s: %w", s.iface, err)
-		}
-		log.Printf("[rec] Sniffer bound to interface %s", s.iface)
-	} else {
-		log.Printf("[rec] Sniffer capturing on all interfaces (no REC_INTERFACE set)")
+	// ------- Init Response Evidence Capture (opt-in) -------
+	recCfg := rec.DefaultCollectorConfig()
+	recCfg.Enabled = cfg.RECEnabled
+	recCfg.DockerSocket = cfg.DockerSocket
+	recCfg.Interface = cfg.RECInterface
+	recCfg.VXLANPort = cfg.RECVXLANPort
+	recCfg.NSContainer = cfg.RECNSContainer
+	collector := rec.NewCollector(recCfg)
+
+	// ------- Context with graceful shutdown -------
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("[observer] Shutting down...")
+		cancel()
+	}()
+
+	// ------- Start REC capture -------
+	if err := collector.Start(ctx); err != nil {
+		log.Printf("[observer] REC failed to start: %v (continuing without evidence capture)", err)
 	}
 
-	tv := syscall.Timeval{Sec: 1, Usec: 0}
-	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
-		syscall.Close(fd)
-		return -1, fmt.Errorf("setting socket timeout: %w", err)
-	}
-
-	return fd, nil
-}
-
-// readLoop processes packets until ctx is cancelled.
-// Runs in a goroutine — the socket is already open and verified.
-func (s *sniffer) readLoop(ctx context.Context, fd int) {
-	defer syscall.Close(fd)
-
-	buf := make([]byte, 65536)
-	debugLogged := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[rec] Sniffer stopping (packets=%d httpReq=%d httpResp=%d pairMisses=%d vxlan=%d vxlanReq=%d vxlanResp=%d)",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount,
-				s.vxlanCount, s.vxlanHTTPReq, s.vxlanHTTPResp)
-			return
-		default:
-		}
-
-		n, _, err := syscall.Recvfrom(fd, buf, 0)
-		if err != nil {
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK || err == syscall.EINTR {
+	// ------- LLM health check (non-blocking) -------
+	go func() {
+		for {
+			if err := llmClient.HealthCheck(ctx); err != nil {
+				log.Printf("[observer] LLM not ready: %v (will retry)", err)
+				time.Sleep(10 * time.Second)
 				continue
 			}
-			log.Printf("[rec] Socket read error: %v", err)
-			continue
+			log.Println("[observer] LLM inference server connected")
+			return
+		}
+	}()
+
+	// ------- Periodic persistence + stats -------
+	go runPeriodicStats(ctx, a, patterns, collector)
+
+	// ------- Re-Classification Cache -------
+	reclassCache := newReclassCache()
+
+	// ------- Alert Coordinator -------
+	alertCoordinator := coordinator.New(
+		ctx,
+		coordinator.DefaultConfig(),
+		makeDispatchCallback(dispatch),
+		makeEvidenceCheckCallback(collector, llmClient, reclassCache, ctx),
+	)
+
+	// ------- Log handler -------
+	handler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch)
+
+	// ------- Start watching -------
+	w := watcher.New(cfg.DockerSocket, handler)
+	w.SetSelfID(cfg.SelfID)
+
+	log.Println("[observer] Starting container log watcher...")
+	if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+		log.Fatalf("[observer] Watcher error: %v", err)
+	}
+
+	// ------- Shutdown -------
+	if err := a.Persist(); err != nil {
+		log.Printf("[observer] Failed final persist: %v", err)
+	}
+	aStats := a.GetStats()
+	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d llm_calls=%d learned=%d",
+		aStats.TotalProcessed, aStats.PatternHits, aStats.LLMCalls, aStats.PatternsLearned)
+	log.Println("[observer] Shutdown complete")
+}
+
+// =============================================================================
+// Coordinator Callbacks
+// =============================================================================
+
+// makeDispatchCallback creates the function called when a coordinator
+// investigation concludes — either dispatching or suppressing the alert.
+func makeDispatchCallback(dispatch *notifier.Dispatcher) coordinator.DispatchFunc {
+	return func(alert coordinator.FinalAlert) {
+		if alert.Downgraded {
+			log.Printf("[DOWNGRADED] EventID=%s key=%s events=%d Original→recon_failed Reason=%s",
+				alert.EventID, alert.ScopeKey, alert.EventCount, alert.DowngradeReason)
+			log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s %s Line=%s",
+				alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
+				alert.EvidenceJournal, truncate(alert.Line, 200))
+			return
 		}
 
-		if n < 14 {
-			continue
+		if alert.BuildAlert == nil {
+			return
+		}
+		builtAlert, ok := alert.BuildAlert().(notifier.Alert)
+		if !ok {
+			return
 		}
 
-		s.packetCount++
-		s.processFrame(buf[:n], 0)
+		severity := "ALERT"
+		if alert.Severity == "suspicious" {
+			severity = "SUSPICIOUS"
+		}
+		log.Printf("[%s] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
+			severity, alert.EventID, alert.ScopeKey, alert.Reason,
+			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
-		if !debugLogged && s.packetCount >= 10 {
-			log.Printf("[rec] Sniffer active: %d packets, %d HTTP req, %d HTTP resp, %d pair misses, %d VXLAN unwrapped",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount, s.vxlanCount)
-			debugLogged = true
+		dispatch.Dispatch(context.Background(), builtAlert)
+	}
+}
+
+// makeEvidenceCheckCallback creates the function called periodically by the
+// coordinator to check if REC evidence can downgrade a pending alert.
+func makeEvidenceCheckCallback(
+	collector rec.EvidenceCollector,
+	llmClient *llm.Client,
+	cache *reclassCache,
+	ctx context.Context,
+) coordinator.EvidenceCheckFunc {
+	return func(pending *coordinator.PendingAlert) (bool, string) {
+		method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
+		if method == "" {
+			log.Printf("[coordinator] Evidence check SKIP: no HTTP in normalized line key=%s normalized=%s",
+				pending.Key, truncate(pending.NormalizedLine, 120))
+			return false, ""
+		}
+
+		evidence := collector.Lookup(rec.LookupRequest{
+			Method:          method,
+			Path:            path,
+			Host:            host,
+			SourceContainer: pending.SourceName,
+			StatusCode:      statusCode,
+			Timestamp:       pending.Timestamp,
+			Window:          5 * time.Second,
+		})
+
+		// --- Diagnostic: reveal WHY evidence check fails ---
+		if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
+			// Build diagnostic without panic on nil fields
+			evStatus := "nil"
+			evCandidates := 0
+			hasTransport := false
+			previewLen := 0
+			evFormat := "n/a"
+			if evidence != nil {
+				evStatus = string(evidence.Status)
+				evCandidates = evidence.CandidateCount
+				hasTransport = evidence.Transport != nil
+				previewLen = len(evidence.SafeBodyPreview)
+				if evidence.Disclosure != nil {
+					evFormat = string(evidence.Disclosure.Format)
+				}
+			}
+			log.Printf("[coordinator] Evidence check MISS: key=%s lookup=%s/%s?status=%d candidates=%d transport=%v preview_len=%d format=%s status=%s",
+				pending.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
+			return false, ""
+		}
+
+		// Update pending with evidence info for logging
+		pending.EvidenceResult = evidence
+		pending.EvidenceJournal = evidence.ForJournal()
+
+		// Determine classification
+		classification := pending.Classification
+		if classification == "" {
+			if pending.Verdict == "deny" {
+				classification = "malicious"
+			} else {
+				classification = "suspicious"
+			}
+		}
+
+		// Check re-classification cache
+		bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
+		if cached, ok := cache.get(bodyHash); ok {
+			if cached.downgraded {
+				log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
+					bodyHash[:16], cached.reason)
+			}
+			return cached.downgraded, cached.reason
+		}
+
+		// Cache miss — call LLM
+		reclass, err := llmClient.ReclassifyWithEvidence(
+			ctx,
+			classification,
+			pending.Reason,
+			pending.Line,
+			evidence.Transport.StatusCode,
+			evidence.Transport.ContentType,
+			evidence.Transport.ContentLength,
+			evidence.SafeBodyPreview,
+		)
+		if err != nil {
+			log.Printf("[reclassify] Error: %v — not downgrading", err)
+			return false, ""
+		}
+
+		cache.put(bodyHash, reclass.Downgraded, reclass.Reason)
+
+		if reclass.Downgraded {
+			log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
+				classification, reclass.Classification, reclass.Reason)
+		}
+		return reclass.Downgraded, reclass.Reason
+	}
+}
+
+// =============================================================================
+// Log Handler
+// =============================================================================
+
+// makeLogHandler creates the core pipeline handler that processes each log line.
+func makeLogHandler(
+	cfg Config,
+	a *analyzer.Analyzer,
+	collector rec.EvidenceCollector,
+	alertCoordinator *coordinator.Coordinator,
+	dispatch *notifier.Dispatcher,
+) watcher.LogHandler {
+	return func(line watcher.LogLine) {
+		if cfg.ExcludeContainers[line.ContainerName] {
+			return
+		}
+
+		evt := &event.Event{
+			ID:         event.NewID(),
+			SourceType: event.SourceDocker,
+			SourceName: line.ContainerName,
+			Line:       line.Line,
+			Stream:     line.Stream,
+			Timestamp:  line.Timestamp,
+			Metadata: map[string]string{
+				"container_id": line.ContainerID,
+			},
+		}
+
+		result := a.Analyze(context.Background(), evt)
+
+		buildAlert := func(severity notifier.Severity, evidence *rec.Evidence) notifier.Alert {
+			return notifier.Alert{
+				EventID:        evt.ID,
+				Severity:       severity,
+				ContainerID:    line.ContainerID,
+				ContainerName:  line.ContainerName,
+				LogLine:        evt.Line,
+				NormalizedHash: evt.Hash,
+				Reason:         result.Reason,
+				MatchedVia:     result.Source,
+				Classification: result.LLMClassification,
+				Confidence:     result.LLMConfidence,
+				Timestamp:      time.Now(),
+				Evidence:       evidence,
+			}
+		}
+
+		switch result.Verdict {
+		case patternstore.VerdictAllow, patternstore.VerdictSuppress:
+			return
+
+		case patternstore.VerdictDeny, patternstore.VerdictAlert:
+			method, path, _, statusCode := parseNormalizedLine(evt.NormalizedLine)
+			isHTTP := method != ""
+
+			severity := "malicious"
+			notifSeverity := notifier.SeverityMalicious
+			if result.Verdict == patternstore.VerdictAlert {
+				severity = "suspicious"
+				notifSeverity = notifier.SeveritySuspicious
+			}
+
+			if isHTTP && collector.Enabled() {
+				correlationKey := fmt.Sprintf("%s|%s|%d", method, path, statusCode)
+
+				alertBuilder := func() interface{} {
+					evidence := collector.Lookup(rec.LookupRequest{
+						Method:          method,
+						Path:            path,
+						SourceContainer: evt.SourceName,
+						StatusCode:      statusCode,
+						Timestamp:       evt.Timestamp,
+						Window:          5 * time.Second,
+					})
+					return buildAlert(notifSeverity, evidence)
+				}
+
+				alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
+					EventID:        evt.ID,
+					ScopeKey:       evt.ScopeKey(),
+					Reason:         result.Reason,
+					MatchedVia:     result.Source,
+					Hash:           evt.Hash,
+					Line:           evt.Line,
+					Verdict:        string(result.Verdict),
+					Severity:       severity,
+					Classification: result.LLMClassification,
+					NormalizedLine: evt.NormalizedLine,
+					SourceName:     evt.SourceName,
+					Timestamp:      evt.Timestamp,
+					BuildAlert:     alertBuilder,
+				})
+			} else {
+				log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
+					evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
+					truncate(evt.Line, 200))
+				dispatch.Dispatch(context.Background(), buildAlert(notifSeverity, nil))
+			}
+
+		case patternstore.VerdictUnknown:
+			if result.Source == "error" {
+				log.Printf("[LLM_ERROR] Source=%s Line=%s", evt.ScopeKey(), truncate(evt.Line, 100))
+			}
 		}
 	}
 }
 
-// processFrame parses an ethernet frame and routes HTTP traffic to handlers.
-// The depth parameter guards against VXLAN-in-VXLAN recursion (max 2 levels).
-//
-// VXLAN detection is always-on, no-op when absent:
-//   1. Try VXLAN decap first. If it succeeds, recurse with inner frame.
-//   2. If not VXLAN, proceed with normal Ethernet → IPv4 → TCP → HTTP.
-//
-// This handles both Swarm (VXLAN-encapsulated HTTP) and plain docker-compose
-// (direct TCP HTTP) transparently, with zero configuration.
-func (s *sniffer) processFrame(frame []byte, depth int) {
-	if depth > maxDecapDepth {
-		return // guard against pathological tunnel-in-tunnel
-	}
+// =============================================================================
+// Periodic Stats
+// =============================================================================
 
-	// --- Try VXLAN decapsulation first (always-on, no-op when absent) ---
-	// decapVXLAN returns errNotVXLAN in constant time for non-VXLAN packets.
-	// On Swarm: unwraps the inner Ethernet frame and recurses.
-	// On docker-compose: fails fast, falls through to normal TCP parsing.
-	if result, err := decapVXLAN(frame, s.vxlanPort); err == nil {
-		s.vxlanCount++
-		s.processFrame(result.InnerFrame, depth+1)
-		return
-	}
-
-	// --- Normal Ethernet → IPv4 → TCP → HTTP ---
-	if len(frame) < 14 {
-		return
-	}
-	etherType := binary.BigEndian.Uint16(frame[12:14])
-	if etherType != 0x0800 { // IPv4 only (no IPv6 in Phase 1)
-		return
-	}
-	ipData := frame[14:]
-
-	if len(ipData) < 20 {
-		return
-	}
-	if ipData[0]>>4 != 4 {
-		return
-	}
-	ihl := int(ipData[0]&0x0f) * 4
-	if len(ipData) < ihl {
-		return
-	}
-	if ipData[9] != 6 { // TCP only (UDP is handled by VXLAN path above)
-		return
-	}
-
-	var srcIP, dstIP [4]byte
-	copy(srcIP[:], ipData[12:16])
-	copy(dstIP[:], ipData[16:20])
-	tcpData := ipData[ihl:]
-
-	if len(tcpData) < 20 {
-		return
-	}
-	srcPort := binary.BigEndian.Uint16(tcpData[0:2])
-	dstPort := binary.BigEndian.Uint16(tcpData[2:4])
-	dataOffset := int(tcpData[12]>>4) * 4
-	if len(tcpData) < dataOffset {
-		return
-	}
-	payload := tcpData[dataOffset:]
-
-	if len(payload) == 0 {
-		return
-	}
-
-	key := streamKey{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
-
-	if s.ports[int(dstPort)] {
-		s.handleRequest(key, payload)
-		if depth > 0 {
-			s.vxlanHTTPReq++
-		}
-		return
-	}
-	if s.ports[int(srcPort)] {
-		s.handleResponse(key, payload)
-		if depth > 0 {
-			s.vxlanHTTPResp++
-		}
-		return
-	}
-}
-
-// handleRequest tries to parse an HTTP request from a single TCP segment.
-func (s *sniffer) handleRequest(key streamKey, payload []byte) {
-	if !looksLikeHTTPRequest(payload) {
-		return
-	}
-
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(payload)))
-	if err != nil {
-		return // partial headers, TLS, or garbage — skip
-	}
-	defer req.Body.Close()
-
-	s.mu.Lock()
-	// FIFO append — HTTP/1.1 keep-alive means multiple requests on same
-	// TCP connection. We queue them in order and pop from front when the
-	// response arrives. ('s keep-alive bug catch.)
-	s.pending[key] = append(s.pending[key], &pendingRequest{
-		method:    req.Method,
-		path:      req.RequestURI, // raw path with query string — SACRED
-		host:      req.Host,
-		userAgent: req.UserAgent(),
-		timestamp: time.Now(),
-	})
-	s.mu.Unlock()
-
-	log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
-		key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-		key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-		req.Method, req.RequestURI)
-
-	s.httpReqCount++
-}
-
-// handleResponse tries to parse an HTTP response from a single TCP segment.
-func (s *sniffer) handleResponse(key streamKey, payload []byte) {
-	if !bytes.HasPrefix(payload, []byte("HTTP/")) {
-		return
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	// Pop the oldest pending request on the reverse stream (FIFO).
-	// HTTP/1.1 without multiplexing is strictly sequential, so the first
-	// queued request matches the first response. ('s fix.)
-	reverseKey := key.reverse()
-
-	s.mu.Lock()
-	var pending *pendingRequest
-	queue := s.pending[reverseKey]
-	if len(queue) > 0 {
-		pending = queue[0]
-		s.pending[reverseKey] = queue[1:]
-		if len(s.pending[reverseKey]) == 0 {
-			delete(s.pending, reverseKey) // clean up empty slices
-		}
-	}
-	s.mu.Unlock()
-
-	// Read body preview — whatever fits in this single TCP segment after headers.
-	// This is PARTIAL content, not the full body.
-	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
-
-	// Hash the PREVIEW, not the full body.
-	// This is explicitly a preview hash — see BodyPreviewHash on TransportEvidence.
-	bodyPreviewHash := HashBody(bodyPreview)
-
-	contentLength := resp.ContentLength
-	if contentLength < 0 && len(bodyPreview) > 0 {
-		contentLength = int64(len(bodyPreview))
-	}
-
-	captured := CapturedResponse{
-		Timestamp:     time.Now(),
-		StatusCode:    resp.StatusCode,
-		ContentType:   resp.Header.Get("Content-Type"),
-		ContentLength: contentLength,
-		BodyPreview:   bodyPreview,
-		BodyPreviewHash: bodyPreviewHash,
-		// NOTE: SourceContainer is NOT populated by the sniffer.
-		// We see IP addresses on the wire, not container names.
-		// IP→container resolution is not implemented in Phase 1.
-		// SourceContainer is left empty — the ring buffer's Lookup()
-		// skips the container filter when empty on either side.
-	}
-
-	// Attach request fields if we saw the matching request.
-	// If request capture failed (missed packet, partial headers, sniffer
-	// started after request was sent), these stay empty and the response
-	// becomes unmatchable by the correlator. This is expected — see
-	// "REQUEST CAPTURE FAILURES" in the sniffer doc comment.
-	if pending != nil {
-		captured.Method = pending.method
-		captured.Path = pending.path
-		captured.Host = pending.host
-		captured.UserAgent = pending.userAgent
-		log.Printf("[rec] RESP paired: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d method=%s path=%s",
-			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-			resp.StatusCode, pending.method, pending.path)
-	} else {
-		s.pairMissCount++
-		log.Printf("[rec] RESP pair miss: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d reverseKey=%d.%d.%d.%d:%d→%d.%d.%d.%d:%d pendingStreams=%d",
-			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-			resp.StatusCode,
-			reverseKey.srcIP[0], reverseKey.srcIP[1], reverseKey.srcIP[2], reverseKey.srcIP[3], reverseKey.srcPort,
-			reverseKey.dstIP[0], reverseKey.dstIP[1], reverseKey.dstIP[2], reverseKey.dstIP[3], reverseKey.dstPort,
-			len(s.pending))
-	}
-
-	s.buffer.Insert(captured)
-	s.httpRespCount++
-}
-
-// cleanupLoop removes stale pending requests every 30 seconds.
-// Iterates through FIFO queues and removes entries older than 30s.
-func (s *sniffer) cleanupLoop(ctx context.Context) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			cutoff := time.Now().Add(-30 * time.Second)
-			for key, queue := range s.pending {
-				// Remove stale entries from front of queue (oldest first)
-				i := 0
-				for i < len(queue) && queue[i].timestamp.Before(cutoff) {
-					i++
-				}
-				if i == len(queue) {
-					delete(s.pending, key) // entire queue is stale
-				} else if i > 0 {
-					s.pending[key] = queue[i:] // trim stale prefix
-				}
+			if err := a.Persist(); err != nil {
+				log.Printf("[observer] Failed to persist state: %v", err)
 			}
-			s.mu.Unlock()
+			aStats := a.GetStats()
+			pStats := patterns.GetStats()
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d llm_calls=%d llm_errors=%d learned=%d",
+				aStats.TotalProcessed, aStats.PatternHits, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned)
+			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
+				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
+				pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
+			if collector.Enabled() {
+				rStats := collector.Stats()
+				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d",
+					rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
+					rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
+					rStats.BufferEntries, rStats.BufferBytes)
+			}
 		}
 	}
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-func htons(i uint16) uint16 {
-	return (i << 8) | (i >> 8)
-}
-
-func looksLikeHTTPRequest(payload []byte) bool {
-	if len(payload) < 4 {
-		return false
-	}
-	switch {
-	case bytes.HasPrefix(payload, []byte("GET ")),
-		bytes.HasPrefix(payload, []byte("POST ")),
-		bytes.HasPrefix(payload, []byte("PUT ")),
-		bytes.HasPrefix(payload, []byte("DELETE ")),
-		bytes.HasPrefix(payload, []byte("PATCH ")),
-		bytes.HasPrefix(payload, []byte("HEAD ")),
-		bytes.HasPrefix(payload, []byte("OPTIONS ")),
-		bytes.HasPrefix(payload, []byte("CONNECT ")):
-		return true
-	}
-	return false
 }
