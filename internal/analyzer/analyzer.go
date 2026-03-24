@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,7 @@ type Analyzer struct {
 type Stats struct {
 	TotalProcessed  atomic.Int64 `json:"total_processed"`
 	PatternHits     atomic.Int64 `json:"pattern_hits"`
+	NoiseSuppressed atomic.Int64 `json:"noise_suppressed"` // deterministic stack trace / framework noise
 	LLMCalls        atomic.Int64 `json:"llm_calls"`
 	LLMErrors       atomic.Int64 `json:"llm_errors"`
 	LLMDropped      atomic.Int64 `json:"llm_dropped"` // dropped due to semaphore full
@@ -58,6 +60,7 @@ type Stats struct {
 type StatsSnapshot struct {
 	TotalProcessed  int64 `json:"total_processed"`
 	PatternHits     int64 `json:"pattern_hits"`
+	NoiseSuppressed int64 `json:"noise_suppressed"`
 	LLMCalls        int64 `json:"llm_calls"`
 	LLMErrors       int64 `json:"llm_errors"`
 	LLMDropped      int64 `json:"llm_dropped"`
@@ -94,6 +97,25 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 
 	// --- Step 1: Normalize ---
 	a.normalizers.NormalizeEvent(evt)
+
+	// --- Step 1.5: Deterministic noise suppression ---
+	// Cheap regex-free detection of obvious application noise.
+	// These patterns are structural (not content-dependent) and should
+	// NEVER hit the LLM or pattern store. Zero cost, zero ambiguity.
+	//
+	// DESIGN DECISION (v0.15, 2026-03-24): Deterministic suppression
+	// for stack traces agreed by the team, code review, , .
+	// The LLM already proved it can cache the WRONG answer for these
+	// (Remix stack trace classified as "alert" → 25 emails overnight).
+	if isOperationalNoise(evt.Line) {
+		a.stats.NoiseSuppressed.Add(1)
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictSuppress,
+			Reason:  "Deterministic: application stack trace or framework noise",
+			Source:  "noise_filter",
+		}
+	}
 
 	// --- Step 2: Pattern store check ---
 	result := a.patterns.Match(evt.ScopeKey(), evt.Hash, evt.NormalizedLine)
@@ -291,6 +313,7 @@ func (a *Analyzer) GetStats() StatsSnapshot {
 	return StatsSnapshot{
 		TotalProcessed:  a.stats.TotalProcessed.Load(),
 		PatternHits:     a.stats.PatternHits.Load(),
+		NoiseSuppressed: a.stats.NoiseSuppressed.Load(),
 		LLMCalls:        a.stats.LLMCalls.Load(),
 		LLMErrors:       a.stats.LLMErrors.Load(),
 		LLMDropped:      a.stats.LLMDropped.Load(),
@@ -301,4 +324,77 @@ func (a *Analyzer) GetStats() StatsSnapshot {
 // Persist saves the pattern store to disk.
 func (a *Analyzer) Persist() error {
 	return a.patterns.Persist()
+}
+
+// =============================================================================
+// Deterministic Noise Detection
+// =============================================================================
+//
+// Cheap, regex-free detection of application noise that should never reach
+// the LLM or pattern store. These are structural patterns — the shape of
+// the line tells you it's noise, not the content.
+//
+// WHY THIS EXISTS:
+//   The LLM classified a Remix stack trace as "suspicious/alert" on first
+//   encounter. The hash got cached. Every identical stack trace fired the
+//   cached alert verdict: 25+ emails overnight from application errors.
+//   Deterministic suppression prevents the LLM from ever making this
+//   mistake in the first place.
+//
+// SAFETY RULE (code review's catch):
+//   These checks run on the RAW line, not the normalized line. They look
+//   for structural patterns (indentation + "at", "Traceback", etc.) that
+//   are unambiguous. If a stack trace also contains an exploit payload,
+//   the LLM prompt improvements will catch it when the non-stack-trace
+//   log line (the request line) comes through separately.
+
+func isOperationalNoise(line string) bool {
+	// Strip Docker timestamp prefix for pattern matching
+	trimmed := line
+	if len(trimmed) > 30 && trimmed[4] == '-' && trimmed[7] == '-' && trimmed[10] == 'T' {
+		if idx := strings.IndexByte(trimmed, ' '); idx > 0 && idx < 40 {
+			trimmed = trimmed[idx+1:]
+		}
+	}
+	trimmed = strings.TrimSpace(trimmed)
+
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	// --- Node.js / JavaScript stack frames ---
+	// "    at handleDocumentRequest (/app/node_modules/@remix-run/server-runtime/dist/server.js:275:35)"
+	// "    at async Object.requestHandler (/app/node_modules/...)"
+	if len(trimmed) > 4 && trimmed[0] == ' ' && strings.HasPrefix(strings.TrimLeft(trimmed, " \t"), "at ") {
+		return true
+	}
+
+	// --- Python tracebacks ---
+	// "Traceback (most recent call last):"
+	// "  File "/app/main.py", line 42, in handle"
+	if strings.HasPrefix(trimmed, "Traceback (most recent call last)") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "File \"") && strings.Contains(trimmed, ", line ") {
+		return true
+	}
+
+	// --- Go panics (the stack dump lines, not the panic message itself) ---
+	// "goroutine 1 [running]:"
+	// "/usr/local/go/src/runtime/panic.go:1234 +0x1a0"
+	if strings.HasPrefix(trimmed, "goroutine ") && strings.Contains(trimmed, " [") {
+		return true
+	}
+
+	// --- Java/JVM stack frames ---
+	// "	at com.example.MyClass.method(MyClass.java:42)"
+	// "Caused by: java.lang.NullPointerException"
+	if strings.HasPrefix(trimmed, "at ") && strings.Contains(trimmed, "(") && strings.Contains(trimmed, ".java:") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "Caused by: ") {
+		return true
+	}
+
+	return false
 }

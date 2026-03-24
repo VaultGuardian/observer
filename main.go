@@ -129,8 +129,8 @@ func main() {
 		log.Printf("[observer] Failed final persist: %v", err)
 	}
 	aStats := a.GetStats()
-	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d llm_calls=%d learned=%d",
-		aStats.TotalProcessed, aStats.PatternHits, aStats.LLMCalls, aStats.PatternsLearned)
+	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d learned=%d",
+		aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.PatternsLearned)
 	log.Println("[observer] Shutdown complete")
 }
 
@@ -394,8 +394,8 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			}
 			aStats := a.GetStats()
 			pStats := patterns.GetStats()
-			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d llm_calls=%d llm_errors=%d learned=%d",
-				aStats.TotalProcessed, aStats.PatternHits, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned)
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d",
+				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned)
 			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 				pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)

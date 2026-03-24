@@ -150,6 +150,30 @@ CRITICAL RULES FOR ERROR LOGS:
 - Application errors from normal operation = safe or noise
 - Errors triggered by malicious input = check the request content for payloads
 
+APPLICATION NOISE RULES (critical — read carefully):
+Treat routine application/framework errors as noise, not security incidents, unless the log line itself contains explicit exploit behavior, attacker-controlled payloads, sensitive data disclosure, or command execution.
+
+The following are NOISE → suppress:
+- Node.js stack frames: lines starting with whitespace + "at " (e.g. "    at handleDocumentRequest (/app/node_modules/...)")
+- Python tracebacks: "Traceback (most recent call last):" and subsequent "  File ..." lines
+- Java/JVM exceptions: "Exception in thread", "at com.example.Class.method(File.java:123)"
+- Go panics: "panic:" followed by "goroutine N [running]:" (without attacker-controlled input)
+- Route not found / missing handler errors (e.g. "no route", "no loader for route", "Cannot GET /path")
+- Framework startup/shutdown messages (e.g. "Listening on port", "Server started", "Graceful shutdown")
+- Health check failures, readiness probe failures, liveness probe failures
+- Connection pool events: "connection recycled", "pool exhausted", "connection timeout"
+- Database connection routine events: "connected", "disconnected", "reconnecting"
+
+A stack trace ALONE is not an attack. Do NOT classify stack traces as "suspicious" or "alert" unless they contain:
+- SQL injection payloads in the error message
+- Path traversal sequences in file paths
+- Deserialization gadget class names
+- Command injection strings
+- Template injection markers
+- Sensitive data in the error output
+
+When in doubt: a framework error that says "no route for /denyProSubmission" is an application bug, not an attack. Suppress it.
+
 PATTERN RULES (critical — read carefully):
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
 - PREFER "prefix" when the log line starts with a recognizable fixed string. This is the fastest and safest option.
