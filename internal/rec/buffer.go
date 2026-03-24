@@ -221,10 +221,23 @@ func (rb *RingBuffer) Lookup(req LookupRequest) []CapturedResponse {
 
 		// --- Hard filters (all must match) ---
 
-		// Method + Path are the core identity
-		if entry.Method != req.Method || entry.Path != req.Path {
-			continue
+		// Method + Path are the core identity — BUT only when the stored
+		// entry has request info. On namespace capture (single-node Swarm),
+		// the sniffer sees incoming responses from the backend but NOT the
+		// outgoing proxy request (TLS terminates at nginx, so the inbound
+		// request is encrypted on port 443, and the outbound proxy request
+		// is an outgoing packet that AF_PACKET doesn't capture).
+		// These "orphan" responses have empty Method/Path but valid
+		// StatusCode, ContentType, and Body. Matching on StatusCode +
+		// timestamp is sufficient for low-traffic servers.
+		if entry.Method != "" {
+			// Entry has request info — match exactly
+			if entry.Method != req.Method || entry.Path != req.Path {
+				continue
+			}
 		}
+		// else: orphan response (pair miss) — skip Method/Path check,
+		// rely on StatusCode + timestamp + Host filters below
 
 		// Status code is a HARD filter, not a soft downgrade.
 		// If the log says 404 and the wire says 200, these are definitively
