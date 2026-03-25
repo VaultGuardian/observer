@@ -12,7 +12,7 @@ import (
 // Constraints (whichever hits first wins):
 //   - MaxEntries:       1000 (default)
 //   - MaxTotalBytes:    16MB (default)
-//   - MaxAge:           10s  (default) — bridges LLM latency gap per 's timing trap
+//   - MaxAge:           30s  (default) — must exceed worst-case LLM latency for first-encounter evidence
 //   - MaxBodyPreview:   2KB  (default) — per-entry body cap
 //
 // Thread safety: sync.RWMutex
@@ -27,7 +27,7 @@ import (
 const (
 	DefaultMaxEntries    = 1000
 	DefaultMaxTotalBytes = 16 * 1024 * 1024 // 16MB
-	DefaultMaxAge        = 10 * time.Second
+	DefaultMaxAge        = 30 * time.Second
 	DefaultMaxBodyBytes  = 2 * 1024 // 2KB per entry body preview
 )
 

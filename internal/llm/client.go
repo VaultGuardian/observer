@@ -247,9 +247,11 @@ CRITICAL JSON RULES:
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
+	llmStart := time.Now()
 	resp, err := c.httpClient.Do(req)
+	llmLatency := time.Since(llmStart)
 	if err != nil {
-		return nil, fmt.Errorf("LLM request failed: %w", err)
+		return nil, fmt.Errorf("LLM request failed (after %s): %w", llmLatency.Round(time.Millisecond), err)
 	}
 	defer resp.Body.Close()
 
@@ -319,6 +321,9 @@ CRITICAL JSON RULES:
 	// or classification=malicious but action=allow, override the action to match
 	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
 	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
+
+	log.Printf("[llm] AnalyzeLog completed in %s: classification=%s action=%s",
+		llmLatency.Round(time.Millisecond), verdict.Classification, verdict.Action)
 
 	return &verdict, nil
 }
@@ -491,9 +496,11 @@ Based on this response evidence, did the attack succeed or did the server ignore
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
+	reclassStart := time.Now()
 	resp, err := c.httpClient.Do(req)
+	reclassLatency := time.Since(reclassStart)
 	if err != nil {
-		return nil, fmt.Errorf("reclassify request failed: %w", err)
+		return nil, fmt.Errorf("reclassify request failed (after %s): %w", reclassLatency.Round(time.Millisecond), err)
 	}
 	defer resp.Body.Close()
 
@@ -536,6 +543,9 @@ Based on this response evidence, did the attack succeed or did the server ignore
 
 	// Determine if this is a downgrade
 	result.Downgraded = isDowngrade(originalClassification, result.Classification)
+
+	log.Printf("[llm] ReclassifyWithEvidence completed in %s: classification=%s downgraded=%v",
+		reclassLatency.Round(time.Millisecond), result.Classification, result.Downgraded)
 
 	return &result, nil
 }
