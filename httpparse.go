@@ -63,3 +63,30 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 
 	return "", "", "", 0
 }
+
+// extractResponseBytes extracts the response byte count from a RAW log line.
+// The normalized line strips byte counts, but the raw line preserves them.
+//
+// Used as a ranking signal for orphan response disambiguation (Option D,
+// design consensus 2026-03-25). When multiple orphan responses match
+// the same status code + time window, the one whose ContentLength is closest
+// to the logged byte count is most likely the correct match.
+//
+// Raw nginx:   `... "GET /path HTTP/2.0" 200 34020 "-" "curl/8.5.0" "-"`
+// Raw backend: `... "GET /path HTTP/1.0" 200 34020 "-" "curl/8.5.0" "x.x.x.x"`
+//
+// NOTE: nginx logs "bytes sent to client" which includes headers and may
+// reflect compression. This won't exactly match the Content-Length header.
+// Use as a ranking signal with tolerance, not an exact match.
+// Returns 0 if no bytes found.
+var reResponseBytes = regexp.MustCompile(`HTTP/\S+"\s+\d{3}\s+(\d+)`)
+
+func extractResponseBytes(rawLine string) int64 {
+	if m := reResponseBytes.FindStringSubmatch(rawLine); m != nil {
+		bytes, err := strconv.ParseInt(m[1], 10, 64)
+		if err == nil {
+			return bytes
+		}
+	}
+	return 0
+}

@@ -227,6 +227,7 @@ func makeEvidenceCheckCallback(
 			StatusCode:      statusCode,
 			Timestamp:       pending.Timestamp,
 			Window:          5 * time.Second,
+			ExpectedBytes:   extractResponseBytes(pending.Line),
 		})
 
 		// --- Path 1: Transport-only downgrade ---
@@ -406,6 +407,7 @@ func makeLogHandler(
 						StatusCode:      statusCode,
 						Timestamp:       evt.Timestamp,
 						Window:          5 * time.Second,
+						ExpectedBytes:   extractResponseBytes(evt.Line),
 					})
 					return buildAlert(notifSeverity, evidence)
 				}

@@ -182,6 +182,7 @@ type LookupRequest struct {
 	StatusCode      int    // status code from log line — HARD FILTER (+code review)
 	Timestamp       time.Time
 	Window          time.Duration // correlation window (default 500ms)
+	ExpectedBytes   int64         // response bytes from access log — ranking signal for orphan disambiguation
 }
 
 // Lookup performs L7 heuristic correlation.

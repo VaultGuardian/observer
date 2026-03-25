@@ -277,28 +277,70 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
-	// Pick the best candidate: closest in time, with UserAgent as tie-breaker
-	best := candidates[0]
-	minDelta := absDuration(best.Timestamp.Sub(req.Timestamp))
-	for _, c := range candidates[1:] {
-		delta := absDuration(c.Timestamp.Sub(req.Timestamp))
+	// Pick the best candidate using a tiered approach:
+	//
+	// 1. Byte-count tiebreaker (Option D, design consensus):
+	//    If the caller provided ExpectedBytes from the access log, prefer the
+	//    candidate whose ContentLength is closest. This disambiguates orphans
+	//    when hashes differ (e.g., API response vs HTML page at the same time).
+	//    Uses tolerance, not exact match — nginx bytes include headers + compression.
+	//
+	// 2. Timestamp proximity (existing behavior):
+	//    Among remaining ties, prefer the closest timestamp.
+	//
+	// 3. UserAgent tie-breaker (code review's improvement):
+	//    Final tie-breaker when timestamp is equal.
 
-		// Prefer closer timestamp
-		if delta < minDelta {
+	best := candidates[0]
+	bestScore := candidateScore(best, req)
+	for _, c := range candidates[1:] {
+		score := candidateScore(c, req)
+		if score < bestScore {
 			best = c
-			minDelta = delta
-		} else if delta == minDelta && req.UserAgent != "" {
-			// Tie-breaker: prefer matching UserAgent (code review's improvement)
+			bestScore = score
+		} else if score == bestScore && req.UserAgent != "" {
 			if c.UserAgent == req.UserAgent && best.UserAgent != req.UserAgent {
 				best = c
 			}
 		}
 	}
 
-	// Determine correlation confidence
+	// === CLONE CHECK (Option A, design consensus) ===
+	// If ALL candidates share the same BodyPreviewHash + ContentLength + ContentType,
+	// they are structurally identical responses. It doesn't matter which one we
+	// matched — the evidence is the same. Promote to HIGH confidence.
+	//
+	// This is NOT "lowering standards" — it's recognizing that 4 identical answers
+	// is as good as 1 answer. The dual-gate stays strict; this earns HIGH honestly.
+	//
+	// code review refinement: check ContentLength + ContentType too, not just hash.
+	// Since BodyPreviewHash is computed from a truncated preview (2KB), two
+	// responses could share the same preview prefix but differ later. Adding
+	// ContentLength confirms full-body equivalence.
+	//
+	// AI DESIGN DECISION (2026-03-25): the team, code review, and /
+	// independently agreed on A+D. the design review originated the clone check concept.
 	corrConf := ConfidenceHigh
 	if len(candidates) > 1 {
-		corrConf = ConfidenceLow
+		allClones := true
+		refHash := candidates[0].BodyPreviewHash
+		refLen := candidates[0].ContentLength
+		refType := candidates[0].ContentType
+		for _, c := range candidates[1:] {
+			if c.BodyPreviewHash != refHash || c.ContentLength != refLen || c.ContentType != refType {
+				allClones = false
+				break
+			}
+		}
+
+		if allClones && refHash != "" {
+			// All candidates are structurally identical — HIGH confidence earned
+			corrConf = ConfidenceHigh
+			log.Printf("[rec] Clone check: %d identical candidates (hash=%.16s len=%d type=%s) → HIGH confidence",
+				len(candidates), refHash, refLen, refType)
+		} else {
+			corrConf = ConfidenceLow
+		}
 	}
 
 	// Detect orphan match (response had no paired request — common on
@@ -382,6 +424,42 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+// candidateScore computes a ranking score for an orphan candidate.
+// Lower score = better match. Combines byte-count proximity and timestamp proximity.
+//
+// If ExpectedBytes is provided (from the access log), byte-count proximity
+// dominates: a candidate matching the expected response size is strongly
+// preferred over one that doesn't. This disambiguates orphans when multiple
+// responses have different sizes (e.g., 34KB Laravel page vs 500-byte JSON error).
+//
+// Byte-count matching uses a tolerance of 20% or 2KB (whichever is larger)
+// because nginx logs "bytes sent" (includes headers, may reflect compression)
+// while ContentLength is from the response header. They won't match exactly.
+func candidateScore(c CapturedResponse, req LookupRequest) time.Duration {
+	timeDelta := absDuration(c.Timestamp.Sub(req.Timestamp))
+
+	if req.ExpectedBytes > 0 && c.ContentLength > 0 {
+		bytesDiff := req.ExpectedBytes - c.ContentLength
+		if bytesDiff < 0 {
+			bytesDiff = -bytesDiff
+		}
+
+		// Tolerance: 20% of expected, minimum 2KB
+		tolerance := req.ExpectedBytes / 5
+		if tolerance < 2048 {
+			tolerance = 2048
+		}
+
+		if bytesDiff > tolerance {
+			// Way off — penalize by adding 1 hour to make timestamp irrelevant
+			timeDelta += time.Hour
+		}
+		// Within tolerance — just use timestamp as tiebreaker
+	}
+
+	return timeDelta
 }
 
 // FormatEvidence produces a human-readable multi-line evidence block
