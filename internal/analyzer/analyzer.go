@@ -436,23 +436,40 @@ func isOperationalNoise(line string) bool {
 // Deterministic Failed-Probe Detection
 // =============================================================================
 //
-// HTTP probes that returned 404/403/405/400 with no attack payload in the
-// request are recon_failed. The attacker found nothing. The LLM gets this
-// right ~90% of the time but occasionally says "alert" for a clean 404.
-// One bad call → cached forever → emails every time that hash repeats.
+// Two detection paths:
 //
-// This runs on the NORMALIZED line (not raw) because the normalizer preserves
-// the HTTP status code. Checks all three normalized formats.
+// Path 1 — HTTP access logs with failed status codes (404/403/405/400/410).
+//   The normalizer preserves the status code. If the request has no attack
+//   payload and isn't targeting a sensitive path, suppress it.
 //
-// SAFETY: Requests with attack indicators in the path or query string are
-// NOT suppressed here. Those go to the LLM because the payload is evidence
-// regardless of status code.
+// Path 2 — Nginx error logs with "No such file or directory" (v0.16).
+//   Structurally equivalent to a 404. The file doesn't exist on disk.
+//   Same safety checks apply: attack indicators and sensitive paths
+//   bypass suppression.
+//
+// SAFETY GATES (all three must pass for suppression):
+//   1. No attack indicators in the request (SQL, traversal, XSS, etc.)
+//   2. Not targeting a sensitive path (/.env, /.git, /actuator, etc.)
+//   3. Status code or error message confirms "nothing found"
+//
+// WHY THIS EXISTS:
+//   The LLM gets 404s right ~90% of the time but occasionally hedges and
+//   classifies a clean probe as "alert." One bad call, cached forever,
+//   produced 70 alert patterns and 20+ emails from a single phpunit scan.
 
-// Regex patterns for extracting status codes from normalized lines.
-// These mirror the formats in httpparse.go but extract just what we need.
+// Regex patterns for extracting status codes from normalized access log lines.
 var (
 	reStatusHosted = regexp.MustCompile(`HTTP/\S+\s+(\d{3})`)
 	reStatusQuoted = regexp.MustCompile(`HTTP/\S+"\s+(\d{3})`)
+)
+
+// Nginx error log patterns for structural 404 detection.
+var (
+	// "open() "/path/file" failed (2: No such file or directory)" = file doesn't exist = 404
+	reNginxFileNotFound = regexp.MustCompile(`open\(\)\s+"[^"]*"\s+failed\s+\(2:\s*No such file or directory\)`)
+
+	// Extract the HTTP request embedded in nginx error logs: request: "GET /path HTTP/1.1"
+	reNginxErrorRequest = regexp.MustCompile(`request:\s+"([^"]*)"`)
 )
 
 // failedStatusCodes are HTTP status codes that indicate a probe found nothing.
@@ -471,14 +488,68 @@ var failedStatusCodes = map[string]bool{
 // an attack payload. If any of these appear in the path/query, we let the
 // LLM classify it even if the status code is 404.
 var attackIndicators = []string{
-	"UNION", "SELECT", "DROP", "INSERT", "UPDATE", "DELETE",  // SQL
-	"../", "..\\",                                              // path traversal
-	"%00", "%0a", "%0d", "%27", "%22",                         // null/injection encoding
-	"<script", "javascript:",                                   // XSS
-	";ls", ";cat", ";rm", ";wget", ";curl",                    // command injection (specific)
-	"|", "`", "$(", "${",                                       // command injection (operators)
-	"php://", "data://", "file://",                             // PHP wrappers
-	"eval(", "exec(", "system(",                                // code execution
+	"UNION", "SELECT", "DROP", "INSERT", "UPDATE", "DELETE", // SQL
+	"../", "..\\",                                            // path traversal
+	"%00", "%0a", "%0d", "%27", "%22",                       // null/injection encoding
+	"<script", "javascript:",                                 // XSS
+	";ls", ";cat", ";rm", ";wget", ";curl",                  // command injection (specific)
+	"|", "`", "$(", "${",                                     // command injection (operators)
+	"php://", "data://", "file://",                           // PHP wrappers
+	"eval(", "exec(", "system(",                              // code execution
+	"call_user_func", "invokefunction",                       // PHP indirect execution (ThinkPHP RCE)
+}
+
+// sensitivePaths are URL paths that should NEVER be suppressed regardless of
+// status code. Even a 404 probe for these is a meaningful finding — it reveals
+// attacker intent and target selection.
+// Source: the team + code review deep research consensus (2026-03-24)
+var sensitivePaths = []string{
+	"/.env",
+	"/.git",
+	"/.aws",
+	"/.ssh",
+	"/.docker",
+	"/.htaccess",
+	"/.htpasswd",
+	"/wp-admin",
+	"/wp-login",
+	"/wp-config",
+	"/actuator",
+	"/_ignition",
+	"/debug",
+	"/phpinfo",
+	"/server-status",
+	"/server-info",
+	"/elmah.axd",
+	"/web.config",
+	"/config.php",
+	"/config.json",
+	"/credentials",
+	"/containers/json",
+}
+
+// hasAttackIndicators returns true if the request contains substrings that
+// suggest an attack payload. Case-insensitive.
+func hasAttackIndicators(request string) bool {
+	upper := strings.ToUpper(request)
+	for _, indicator := range attackIndicators {
+		if strings.Contains(upper, strings.ToUpper(indicator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSensitivePath returns true if the request targets a path that should
+// always be reported, even if the probe failed.
+func hasSensitivePath(request string) bool {
+	lower := strings.ToLower(request)
+	for _, p := range sensitivePaths {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func isFailedProbe(normalizedLine string) (string, bool) {
@@ -486,7 +557,29 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false
 	}
 
-	// Extract status code from normalized line
+	// --- Path 1: Nginx error log "No such file or directory" ---
+	// Structurally a 404. The file doesn't exist on disk.
+	// The error log format has no HTTP status code, but the meaning is
+	// unambiguous: nginx tried to open a file and it wasn't there.
+	if reNginxFileNotFound.MatchString(normalizedLine) {
+		// Extract the request portion for safety checks.
+		// Nginx error logs embed the original request: request: "GET /path HTTP/1.1"
+		requestPart := normalizedLine
+		if m := reNginxErrorRequest.FindStringSubmatch(normalizedLine); m != nil {
+			requestPart = m[1]
+		}
+
+		if hasSensitivePath(requestPart) {
+			return "", false // sensitive path — let LLM classify
+		}
+		if hasAttackIndicators(requestPart) {
+			return "", false // has payload — let LLM classify
+		}
+
+		return "Deterministic: nginx file not found — probe found nothing, no attack payload in request", true
+	}
+
+	// --- Path 2: HTTP access log with failed status code ---
 	var statusCode string
 	var requestPart string
 
@@ -500,17 +593,15 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false // not an HTTP access log line
 	}
 
-	// Is this a failed status code?
 	if !failedStatusCodes[statusCode] {
 		return "", false
 	}
 
-	// Check for attack payloads in the request — if present, let the LLM decide
-	upper := strings.ToUpper(requestPart)
-	for _, indicator := range attackIndicators {
-		if strings.Contains(upper, strings.ToUpper(indicator)) {
-			return "", false // has payload, LLM should classify
-		}
+	if hasSensitivePath(requestPart) {
+		return "", false // sensitive path — let LLM classify
+	}
+	if hasAttackIndicators(requestPart) {
+		return "", false // has payload — let LLM classify
 	}
 
 	reason := fmt.Sprintf("Deterministic: HTTP %s response — probe found nothing, no attack payload in request", statusCode)
