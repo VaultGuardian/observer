@@ -173,12 +173,44 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher) coordinator.DispatchFun
 
 // makeEvidenceCheckCallback creates the function called periodically by the
 // coordinator to check if REC evidence can downgrade a pending alert.
+//
+// Two downgrade paths (design consensus, 2026-03-25):
+//
+//   Path 1 — Transport-only downgrade:
+//     If REC captured the HTTP response and the status code is conclusively
+//     "attack failed" (403/404/405/410), downgrade immediately.
+//     No body preview required. No LLM call required.
+//     These events are already known to contain attack payloads (they're in
+//     the coordinator because they were classified as deny/alert). A 404 on
+//     a SQL injection means the server rejected/ignored the payload. Period.
+//
+//   Path 2 — Body-aware re-classification:
+//     For ambiguous status codes (200, 3xx, 5xx), the status alone doesn't
+//     tell us if the attack succeeded. Check SafeBodyPreview and call the
+//     LLM to inspect the actual response content.
+//
+// Status code tiers (design team agreed):
+//   403, 404, 405, 410 → auto-downgrade (attack failed)
+//   400                → ambiguous in v1, may add later
+//   401                → surface discovery, not a failed probe
+//   200, 3xx           → ambiguous, need body inspection
+//   5xx                → suspicious, never auto-downgrade
 func makeEvidenceCheckCallback(
 	collector rec.EvidenceCollector,
 	llmClient *llm.Client,
 	cache *reclassCache,
 	ctx context.Context,
 ) coordinator.EvidenceCheckFunc {
+	// Status codes where transport alone proves the attack failed.
+	// Only applies to payload-bearing events (which is all events
+	// that reach the coordinator — clean probes are suppressed upstream).
+	transportDowngradeCodes := map[int]bool{
+		403: true, // Forbidden — server blocked the request
+		404: true, // Not found — resource doesn't exist
+		405: true, // Method not allowed — server rejected the method
+		410: true, // Gone — resource permanently removed
+	}
+
 	return func(pending *coordinator.PendingAlert) (bool, string) {
 		method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
 		if method == "" {
@@ -197,9 +229,25 @@ func makeEvidenceCheckCallback(
 			Window:          5 * time.Second,
 		})
 
-		// --- Diagnostic: reveal WHY evidence check fails ---
-		if evidence == nil || evidence.SafeBodyPreview == "" || evidence.Transport == nil {
-			// Build diagnostic without panic on nil fields
+		// --- Path 1: Transport-only downgrade ---
+		// If REC captured transport metadata and the status code is conclusive,
+		// downgrade immediately. Don't need the body to know a 404 failed.
+		if evidence != nil && evidence.Transport != nil {
+			code := evidence.Transport.StatusCode
+			if transportDowngradeCodes[code] {
+				// Update evidence info for logging
+				pending.EvidenceResult = evidence
+				pending.EvidenceJournal = evidence.ForJournal()
+
+				reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
+				log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
+					pending.Key, code, evidence.CandidateCount)
+				return true, reason
+			}
+		}
+
+		// --- Diagnostic: log why we can't downgrade yet ---
+		if evidence == nil || evidence.Transport == nil {
 			evStatus := "nil"
 			evCandidates := 0
 			hasTransport := false
@@ -216,6 +264,21 @@ func makeEvidenceCheckCallback(
 			}
 			log.Printf("[coordinator] Evidence check MISS: key=%s lookup=%s/%s?status=%d candidates=%d transport=%v preview_len=%d format=%s status=%s",
 				pending.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
+			return false, ""
+		}
+
+		// --- Path 2: Body-aware re-classification ---
+		// Status code is ambiguous (200, 3xx, 5xx). Need body to determine
+		// if the attack actually succeeded.
+		if evidence.SafeBodyPreview == "" {
+			log.Printf("[coordinator] Evidence check: transport available (HTTP %d) but ambiguous status, no body preview — key=%s candidates=%d format=%s",
+				evidence.Transport.StatusCode, pending.Key, evidence.CandidateCount,
+				func() string {
+					if evidence.Disclosure != nil {
+						return string(evidence.Disclosure.Format)
+					}
+					return "n/a"
+				}())
 			return false, ""
 		}
 

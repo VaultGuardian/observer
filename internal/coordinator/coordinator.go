@@ -8,41 +8,44 @@ import (
 )
 
 // =============================================================================
-// Alert Coordinator — "Forensic Huddle"
+// Alert Coordinator — "Forensic Huddle" + "Graveyard"
 // =============================================================================
 //
 // WHY THIS EXISTS:
 //   On Docker Swarm, a single HTTP request produces log lines from both
-//   nginx and the backend container. Nginx fires instantly on a seeded
-//   pattern ("SQL injection detected!") before REC can capture the response.
-//   Seconds later, the backend pipeline captures evidence and correctly
-//   determines "the server returned a welcome page, attack was ignored."
-//   But the email already went out.
+//   nginx and the backend container. Two problems:
+//
+//   1. Nginx fires instantly (cached hash hit, nanoseconds). The backend
+//      arrives 10-120 seconds later (queued behind LLM semaphore). By then
+//      the investigation is dispatched and deleted → duplicate email.
+//
+//   2. REC captures evidence (status code, body) but the evidence check
+//      throws it away if the body preview is empty → missed downgrade.
 //
 // HOW IT WORKS:
-//   Instead of dispatching alerts immediately, evidence-eligible HTTP alerts
-//   go into a "huddle" — a short holding period where:
-//     1. Sibling logs from other containers can join (nginx + backend = one finding)
-//     2. REC can capture the response
-//     3. The re-classification cache can check if the body is known-safe
-//     4. A fresh LLM re-classification can run if needed
+//   Two data structures:
 //
-//   Two timers:
-//     - Evidence window (2s): time for REC capture + cache check
-//     - Finalize window (5s): time for LLM re-classification if cache misses
+//   PENDING — active investigations with evidence timers.
+//     - Sibling logs join the same huddle (nginx + backend = one finding)
+//     - REC evidence can downgrade the alert during the window
+//     - Two-phase timer: evidence sprint (2s) → finalize (5s)
 //
-//   If evidence downgrades the alert → suppress (no email)
-//   If timer expires with no evidence → dispatch with honest language
-//   Non-HTTP alerts (SSH, sudo, kernel) bypass the huddle entirely.
+//   GRAVEYARD — recently finalized outcomes (TTL 300s).
+//     - Every investigation writes its outcome here on completion
+//     - Late-arriving siblings check the graveyard before creating new investigations
+//     - If a sibling finds a graveyard entry, it dies silently
+//     - Stores ALL outcomes: alerted, downgraded, suppressed
 //
-// DESIGN:
-//   Three states: pending → resolved (suppressed or confirmed) → dispatched
-//   Key: method|path|statusCode (same request from any container)
-//   Bounded: max 100 pending investigations, oldest evicted if full
+//   AI DESIGN DECISION (2026-03-25):
+//     the team, code review, and / independently agreed on this
+//     architecture. The graveyard must store all finalized states, not just
+//     "emails sent" — otherwise a downgraded nginx finding gets forgotten
+//     and the late backend sibling reopens the case.
 
 const (
 	DefaultEvidenceWindow  = 2 * time.Second
 	DefaultFinalizeWindow  = 5 * time.Second
+	DefaultGraveyardTTL    = 300 * time.Second // 5 minutes — covers worst-case LLM queue delays
 	maxPendingInvestigations = 100
 )
 
@@ -118,12 +121,23 @@ type PendingAlert struct {
 	Dispatched     bool
 }
 
-// Coordinator manages pending alert investigations.
+// FinalizedOutcome is a tombstone left in the graveyard after an investigation
+// completes. Late-arriving siblings check this before creating new investigations.
+type FinalizedOutcome struct {
+	Outcome    string    // "alerted", "downgraded", "suppressed", "evicted"
+	Reason     string    // downgrade reason or alert reason
+	FinalizedAt time.Time
+	EventCount int       // how many events were in the original investigation
+}
+
+// Coordinator manages pending alert investigations and the graveyard.
 type Coordinator struct {
 	mu              sync.Mutex
-	pending         map[string]*PendingAlert // correlationKey → investigation
+	pending         map[string]*PendingAlert      // correlationKey → active investigation
+	graveyard       map[string]*FinalizedOutcome   // correlationKey → recently finalized outcome
 	evidenceWindow  time.Duration
 	finalizeWindow  time.Duration
+	graveyardTTL    time.Duration
 	dispatch        DispatchFunc
 	evidenceCheck   EvidenceCheckFunc
 	ctx             context.Context
@@ -133,6 +147,7 @@ type Coordinator struct {
 type Config struct {
 	EvidenceWindow  time.Duration
 	FinalizeWindow  time.Duration
+	GraveyardTTL    time.Duration
 }
 
 // DefaultConfig returns sensible defaults agreed by the AI design team.
@@ -140,6 +155,7 @@ func DefaultConfig() Config {
 	return Config{
 		EvidenceWindow:  DefaultEvidenceWindow,
 		FinalizeWindow:  DefaultFinalizeWindow,
+		GraveyardTTL:    DefaultGraveyardTTL,
 	}
 }
 
@@ -153,33 +169,39 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 	if cfg.FinalizeWindow == 0 {
 		cfg.FinalizeWindow = DefaultFinalizeWindow
 	}
-	return &Coordinator{
+	if cfg.GraveyardTTL == 0 {
+		cfg.GraveyardTTL = DefaultGraveyardTTL
+	}
+	c := &Coordinator{
 		pending:        make(map[string]*PendingAlert),
+		graveyard:      make(map[string]*FinalizedOutcome),
 		evidenceWindow: cfg.EvidenceWindow,
 		finalizeWindow: cfg.FinalizeWindow,
+		graveyardTTL:   cfg.GraveyardTTL,
 		dispatch:       dispatch,
 		evidenceCheck:  evidenceCheck,
 		ctx:            ctx,
 	}
+
+	// Background goroutine to clean expired graveyard entries
+	go c.graveyardCleanup()
+
+	return c
 }
 
 // Process submits an event to the coordinator.
-// If a pending investigation exists for this correlation key, the event joins it.
-// If not, a new investigation is created with timers.
+// Check order: active investigation → graveyard → create new.
 func (c *Coordinator) Process(key string, alert *PendingAlert) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// --- Check 1: Join active investigation ---
 	if existing, ok := c.pending[key]; ok {
-		// Join existing investigation — this is the sibling log from another container
 		existing.EventCount++
 
-		// If the new event has a better builder (e.g., backend has more context), update
 		if alert.BuildAlert != nil {
 			existing.BuildAlert = alert.BuildAlert
 		}
-
-		// Inherit evidence-related fields if the newcomer has them
 		if alert.NormalizedLine != "" {
 			existing.NormalizedLine = alert.NormalizedLine
 		}
@@ -195,9 +217,16 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		return
 	}
 
-	// New investigation — bounded map
+	// --- Check 2: Graveyard — was this recently finalized? ---
+	if tomb, ok := c.graveyard[key]; ok {
+		log.Printf("[coordinator] Late sibling suppressed via graveyard: key=%s source=%s outcome=%s original_events=%d age=%s",
+			key, alert.ScopeKey, tomb.Outcome, tomb.EventCount,
+			time.Since(tomb.FinalizedAt).Round(time.Millisecond))
+		return
+	}
+
+	// --- Check 3: Create new investigation ---
 	if len(c.pending) >= maxPendingInvestigations {
-		// Evict oldest
 		var oldestKey string
 		var oldestTime time.Time
 		for k, p := range c.pending {
@@ -209,7 +238,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		if oldestKey != "" {
 			old := c.pending[oldestKey]
 			delete(c.pending, oldestKey)
-			// Force-dispatch the evicted alert
+			c.recordFinalized(oldestKey, "evicted", "too many pending", old.EventCount)
 			go c.forceDispatch(old, "evicted from coordinator (too many pending)")
 		}
 	}
@@ -222,14 +251,12 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 	log.Printf("[coordinator] New investigation: key=%s source=%s reason=%s",
 		key, alert.ScopeKey, truncateStr(alert.Reason, 80))
 
-	// Start evidence window timer
 	go c.investigationLoop(key)
 }
 
 // investigationLoop runs the two-phase timer for a pending alert.
 func (c *Coordinator) investigationLoop(key string) {
 	// --- Phase 1: Evidence Sprint (2 seconds) ---
-	// Try evidence check immediately, then again at intervals
 	checkInterval := 500 * time.Millisecond
 	evidenceDeadline := time.After(c.evidenceWindow)
 
@@ -241,19 +268,17 @@ func (c *Coordinator) investigationLoop(key string) {
 			goto finalize
 		case <-time.After(checkInterval):
 			if c.tryEvidenceCheck(key) {
-				return // resolved — either dispatched or suppressed
+				return
 			}
 		}
 	}
 
 finalize:
 	// --- Phase 2: Finalize (up to 5 seconds total) ---
-	// One more evidence check, then dispatch whatever we have
 	if c.tryEvidenceCheck(key) {
 		return
 	}
 
-	// If we still don't have evidence, wait a bit more for LLM
 	remainingTime := c.finalizeWindow - c.evidenceWindow
 	if remainingTime > 0 {
 		finalDeadline := time.After(remainingTime)
@@ -282,6 +307,7 @@ dispatch:
 	}
 	pending.Dispatched = true
 	delete(c.pending, key)
+	c.recordFinalized(key, "alerted", pending.Reason, pending.EventCount)
 	c.mu.Unlock()
 
 	c.dispatch(FinalAlert{
@@ -308,30 +334,27 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	pending, ok := c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		c.mu.Unlock()
-		return true // already handled
+		return true
 	}
 	c.mu.Unlock()
 
-	// Call evidence check (may involve REC lookup + cache/LLM)
-	// This runs outside the lock — it may take time
 	downgraded, reason := c.evidenceCheck(pending)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Re-check state (might have been resolved by another goroutine)
 	pending, ok = c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		return true
 	}
 
 	if downgraded {
-		// Evidence says this is harmless — suppress
 		pending.Resolved = true
 		pending.Downgraded = true
 		pending.DowngradeReason = reason
 		pending.Dispatched = true
 		delete(c.pending, key)
+		c.recordFinalized(key, "downgraded", reason, pending.EventCount)
 
 		log.Printf("[coordinator] Investigation resolved: DOWNGRADED key=%s events=%d reason=%s",
 			key, pending.EventCount, truncateStr(reason, 100))
@@ -356,7 +379,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		return true
 	}
 
-	return false // not resolved yet, keep waiting
+	return false
 }
 
 // forceDispatch sends an alert that was evicted from the coordinator.
@@ -378,6 +401,41 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 	})
 }
 
+// =============================================================================
+// Graveyard — Recently Finalized Outcomes
+// =============================================================================
+
+// recordFinalized writes a tombstone to the graveyard. Must be called with mu held.
+func (c *Coordinator) recordFinalized(key, outcome, reason string, eventCount int) {
+	c.graveyard[key] = &FinalizedOutcome{
+		Outcome:     outcome,
+		Reason:      reason,
+		FinalizedAt: time.Now(),
+		EventCount:  eventCount,
+	}
+}
+
+// graveyardCleanup periodically removes expired tombstones.
+func (c *Coordinator) graveyardCleanup() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now()
+			for key, tomb := range c.graveyard {
+				if now.Sub(tomb.FinalizedAt) > c.graveyardTTL {
+					delete(c.graveyard, key)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
 func truncateStr(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -386,8 +444,8 @@ func truncateStr(s string, max int) string {
 }
 
 // Stats returns current coordinator state for monitoring.
-func (c *Coordinator) Stats() (pending int) {
+func (c *Coordinator) Stats() (pending int, graveyard int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.pending)
+	return len(c.pending), len(c.graveyard)
 }
