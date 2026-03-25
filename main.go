@@ -397,7 +397,7 @@ func makeLogHandler(
 			}
 
 			if isHTTP && collector.Enabled() {
-				correlationKey := fmt.Sprintf("%s|%s|%d", method, path, statusCode)
+				correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
 
 				alertBuilder := func() interface{} {
 					evidence := collector.Lookup(rec.LookupRequest{

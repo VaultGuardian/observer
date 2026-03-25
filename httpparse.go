@@ -90,3 +90,21 @@ func extractResponseBytes(rawLine string) int64 {
 	}
 	return 0
 }
+
+// canonicalPath normalizes a URL path for coordinator correlation keys.
+//
+// The nginx normalizer preserves query strings raw (sacred rule for classification),
+// but the generic normalizer replaces 4+ digit numbers with <NUM>. This means
+// the same request produces different paths from different containers:
+//
+//   nginx:   /?debug=true&test=1774472800
+//   backend: /?debug=true&test=<NUM>
+//
+// canonicalPath applies the same number replacement so both containers produce
+// the same coordinator key. This does NOT affect normalizer output, hash stability,
+// or classification — only the coordinator's correlation key.
+var reCanonicalNumbers = regexp.MustCompile(`\b\d{4,}\b`)
+
+func canonicalPath(path string) string {
+	return reCanonicalNumbers.ReplaceAllString(path, "<NUM>")
+}
