@@ -42,7 +42,7 @@ func main() {
 	seedDenyPatterns(patterns)
 	log.Printf("[observer] Pattern store initialized (%d scopes)", patterns.ScopeCount())
 
-	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey)
+	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey, cfg.Tier1Effort, cfg.Tier2Effort)
 	a := analyzer.New(normReg, patterns, llmClient, cfg.MaxConcurrentLLM)
 	log.Println("[observer] Analyzer pipeline ready")
 

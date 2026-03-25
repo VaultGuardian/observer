@@ -26,6 +26,10 @@ type Config struct {
 
 	// LLM concurrency
 	MaxConcurrentLLM int
+
+	// LLM reasoning effort per tier
+	Tier1Effort string // "low", "medium", "high" — default "low"
+	Tier2Effort string // "low", "medium", "high" — default "medium"
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -41,6 +45,8 @@ func LoadConfig() Config {
 		RECInterface:     getEnv("REC_INTERFACE", ""),
 		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
 		MaxConcurrentLLM: 2,
+		Tier1Effort:      getEnv("LLM_TIER1_EFFORT", "low"),
+		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
 	}
 
 	// Build exclusion set from comma-separated container names

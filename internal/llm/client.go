@@ -68,17 +68,27 @@ type VariableField struct {
 
 // Client handles communication with an LLM inference server (local or cloud).
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	model      string
-	apiKey     string
+	baseURL      string
+	httpClient   *http.Client
+	model        string
+	apiKey       string
+	tier1Effort  string // reasoning_effort for Tier 1 (AnalyzeLog) — "low", "medium", "high"
+	tier2Effort  string // reasoning_effort for Tier 2 (ReclassifyWithEvidence)
 }
 
-func NewClient(baseURL, model, apiKey string) *Client {
+func NewClient(baseURL, model, apiKey, tier1Effort, tier2Effort string) *Client {
+	if tier1Effort == "" {
+		tier1Effort = "low"
+	}
+	if tier2Effort == "" {
+		tier2Effort = "medium"
+	}
 	return &Client{
-		baseURL: baseURL,
-		model:   model,
-		apiKey:  apiKey,
+		baseURL:     baseURL,
+		model:       model,
+		apiKey:      apiKey,
+		tier1Effort: tier1Effort,
+		tier2Effort: tier2Effort,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -109,114 +119,38 @@ CLASSIFICATION + ACTION RULES:
 
 INTENT × OUTCOME IS EVERYTHING. The request path tells you what the attacker WANTED. The status code tells you what HAPPENED. You must consider both.
 
-- "safe" + "allow": Normal operational logs (app startup, health checks, routine requests from legitimate clients, crawler/bot traffic with normal responses)
-- "noise" + "suppress": Uninteresting output (debug spam, metric dumps, heartbeats, routine status). NOT the same as "safe" — suppress means "not worth caring about ever."
+- "safe" + "allow": Normal operational logs (app startup, health checks, routine requests, crawler/bot traffic with normal responses)
+- "noise" + "suppress": Uninteresting output (debug spam, metric dumps, heartbeats, routine status)
+- "recon_failed" + "suppress": Attacker probed and GOT NOTHING (error response codes on suspicious paths)
+- "recon_success" + "alert": Attacker probed something sensitive and GOT A REAL RESPONSE (200 on /.env, /.git, /config, etc.) — this is URGENT
+- "suspicious" + "alert": Unusual activity that is NOT a simple failed probe (unexpected auth, abnormal response sizes, legitimate paths with abnormal behavior)
+- "malicious" + "deny": Confirmed attack payloads in the request itself, regardless of status code (SQL injection, shell injection, PHP wrappers, encoded exploits)
 
-- "recon_failed" + "suppress": An attacker or scanner probed for something and GOT NOTHING. Examples:
-  * ANY request to a sensitive path (.env, wp-admin, phpunit, /etc/passwd, autodiscover, etc.) that returned 404, 403, 405, or 400
-  * Port scans, path enumeration, CMS probes, vulnerability scanners — all with error responses
-  * TLS handshake failures, malformed requests returning 400
-  * This is the most common type of "attack" on any internet-facing server. It is background noise.
-  * The attacker FAILED. There is nothing to investigate. Suppress it.
+KEY RULES:
+- ALWAYS look at the HTTP status code
+- Status 200 on a sensitive path = recon_success = alert
+- Status 302 to login = recon_failed. Status 302 to content = recon_success
+- Attack payloads in the URL (UNION SELECT, ;ls, php://) = malicious regardless of status code
 
-- "recon_success" + "alert": An attacker or scanner probed for something sensitive and GOT A REAL RESPONSE. Examples:
-  * Request to /.env, /config.yml, /api/.env, /.git/HEAD, etc. that returned 200 or 301/302 to a content page
-  * Sensitive path that returned actual content instead of an error
-  * This is URGENT — it means something is exposed that should not be.
+NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
-- "suspicious" + "alert": Unusual activity that is NOT a simple failed probe. Examples:
-  * Successful authentication from an unexpected source
-  * Unusual response sizes or patterns
-  * Legitimate paths but abnormal behavior
-  * Do NOT use "suspicious" for scanner traffic that returned error codes — that is "recon_failed"
-
-- "malicious" + "deny": Confirmed attack payloads in the request itself, regardless of status code. Examples:
-  * Shell injection (;ls, | cat /etc/passwd, etc.) in URL or parameters
-  * SQL injection (UNION SELECT, OR 1=1) in URL or parameters
-  * PHP wrapper attacks (php://input, allow_url_include)
-  * Encoded exploit payloads
-  * The payload IS the evidence — the status code doesn't matter here
-
-CRITICAL RULES FOR HTTP ACCESS LOGS:
-- ALWAYS look at the HTTP status code (200, 301, 302, 400, 403, 404, 405, 500, etc.)
-- Status 404/403/405/400 on a suspicious path = recon_failed = suppress
-- Status 200 on a suspicious path = recon_success = alert (something is exposed!)
-- Status 302 on a suspicious path = check context. Redirect to a login page = recon_failed. Redirect to content = recon_success.
-- A scanner hitting 50 paths and getting 404 on all of them is NOT 50 alerts. It is noise. Suppress it.
-- A single 200 on /.env is worth more than 1000 failed probes. Alert on it.
-
-CRITICAL RULES FOR ERROR LOGS:
-- nginx "open() failed (2: No such file or directory)" = the file does not exist = recon_failed = suppress
-- Application errors from normal operation = safe or noise
-- Errors triggered by malicious input = check the request content for payloads
-
-APPLICATION NOISE RULES (critical — read carefully):
-Treat routine application/framework errors as noise, not security incidents, unless the log line itself contains explicit exploit behavior, attacker-controlled payloads, sensitive data disclosure, or command execution.
-
-The following are NOISE → suppress:
-- Node.js stack frames: lines starting with whitespace + "at " (e.g. "    at handleDocumentRequest (/app/node_modules/...)")
-- Python tracebacks: "Traceback (most recent call last):" and subsequent "  File ..." lines
-- Java/JVM exceptions: "Exception in thread", "at com.example.Class.method(File.java:123)"
-- Go panics: "panic:" followed by "goroutine N [running]:" (without attacker-controlled input)
-- Route not found / missing handler errors (e.g. "no route", "no loader for route", "Cannot GET /path")
-- Framework startup/shutdown messages (e.g. "Listening on port", "Server started", "Graceful shutdown")
-- Health check failures, readiness probe failures, liveness probe failures
-- Connection pool events: "connection recycled", "pool exhausted", "connection timeout"
-- Database connection routine events: "connected", "disconnected", "reconnecting"
-
-A stack trace ALONE is not an attack. Do NOT classify stack traces as "suspicious" or "alert" unless they contain:
-- SQL injection payloads in the error message
-- Path traversal sequences in file paths
-- Deserialization gadget class names
-- Command injection strings
-- Template injection markers
-- Sensitive data in the error output
-
-When in doubt: a framework error that says "no route for /denyProSubmission" is an application bug, not an attack. Suppress it.
-
-PATTERN RULES (critical — read carefully):
+PATTERN RULES:
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
-- PREFER "prefix" when the log line starts with a recognizable fixed string. This is the fastest and safest option.
-- Use "regex" only when the line has variable content in the MIDDLE that a prefix can't skip. Always anchor with ^ and use \d+ for numbers, \S+ for non-space tokens. Be specific.
-- Use "contains" only as a last resort. Minimum 10 characters.
-- Return empty pattern_type and pattern ("") if you are not confident.
+- PREFER "prefix" — fastest and safest.
+- Use "regex" only when variable content is in the MIDDLE. Always anchor with ^. Be specific.
+- Use "contains" only as last resort. Minimum 10 characters.
+- PATTERN MUST match the NORMALIZED version (timestamps=<TS>, IPs=<IP>, numbers=<NUM>, UUIDs=<UUID>).
 
-PATTERN MUST match the normalized version of the log line, not the raw version.
-The normalized line has timestamps replaced with <TS>, IPs with <IP>, durations with <DUR>,
-numbers (4+ digits) with <NUM>, UUIDs with <UUID>.
-
-VARIABLE FIELDS RULES:
+VARIABLE FIELDS:
 - Identify parts of the RAW log line that change between structurally identical lines.
-- Common variable types: timestamp, pid, ip, connection_id, duration, byte_count, port, user_agent, request_id, session_id
-- The "token" must be the EXACT text from the raw line.
-- The "replacement" should be a placeholder like <PID>, <TS>, <IP>, <CONN>, <DUR>, <BYTES>, <PORT>, <UA>, <REQ_ID>
-- Only include fields you are confident about. Empty array is fine if unsure.
-
-EXAMPLES:
-Line: "GET /.env HTTP/1.1 404 0"
-→ classification: "recon_failed", action: "suppress", reason: "Probe for .env file returned 404 — attacker found nothing"
-
-Line: "GET /.env HTTP/1.1 200 1534"
-→ classification: "recon_success", action: "alert", reason: ".env file returned 200 with 1534 bytes — configuration file is exposed"
-
-Line: "GET /wp-admin/install.php HTTP/1.1 404 0"
-→ classification: "recon_failed", action: "suppress", reason: "WordPress install probe returned 404"
-
-Line: "POST /?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input HTTP/1.1 405 150"
-→ classification: "malicious", action: "deny", reason: "PHP wrapper injection attempt in query string"
-
-Line: "open() /usr/share/nginx/default/tool.php failed (2: No such file or directory)"
-→ classification: "recon_failed", action: "suppress", reason: "Nginx file-not-found for probed PHP path"
-
-Line: "Connected to database in 47ms"
-Normalized: "Connected to database in <DUR>"
-→ classification: "safe", action: "allow", pattern_type: "prefix", pattern: "Connected to database in"
+- Types: timestamp, pid, ip, connection_id, duration, byte_count, port, user_agent, request_id
+- "token" = exact text from raw line. "replacement" = placeholder like <PID>, <TS>, <IP>
+- Empty array is fine if unsure.
 
 CRITICAL JSON RULES:
-- Your response MUST be valid JSON. Do NOT use regex-style escapes inside JSON strings.
-- In JSON, the ONLY valid escape sequences are: \" \\ \/ \b \f \n \r \t \uXXXX
-- WRONG: \; \+ \( \) \[ \] \- \. — these are NOT valid JSON escapes and will break parsing.
-- If your pattern contains special regex characters like ; + ( ) [ ] put them as-is WITHOUT a backslash, OR double-escape with \\\\ for literal backslashes.
+- Response MUST be valid JSON. Do NOT use regex-style escapes inside JSON strings.
+- Only valid escapes: \" \\ \/ \b \f \n \r \t \uXXXX
+- Put regex characters like ; + ( ) [ ] as-is WITHOUT backslash, or double-escape with \\\\
 - When in doubt, use a simpler prefix pattern WITHOUT regex characters.`
 
 	userPrompt := fmt.Sprintf("Source: %s:%s\nRaw log line: %s\nNormalized line: %s",
@@ -229,7 +163,7 @@ CRITICAL JSON RULES:
 			{"role": "user", "content": userPrompt},
 		},
 		"max_completion_tokens": 4096,
-		"reasoning_effort":     "medium",
+		"reasoning_effort":     c.tier1Effort,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -269,11 +203,20 @@ CRITICAL JSON RULES:
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(rawBody, &chatResp); err != nil {
 		return nil, fmt.Errorf("decoding LLM response: %w", err)
 	}
+
+	log.Printf("[llm] AnalyzeLog tokens: prompt=%d completion=%d total=%d effort=%s latency=%s",
+		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, chatResp.Usage.TotalTokens,
+		c.tier1Effort, llmLatency.Round(time.Millisecond))
 
 	if len(chatResp.Choices) == 0 {
 		return nil, fmt.Errorf("LLM returned no choices")
@@ -321,9 +264,6 @@ CRITICAL JSON RULES:
 	// or classification=malicious but action=allow, override the action to match
 	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
 	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
-
-	log.Printf("[llm] AnalyzeLog completed in %s: classification=%s action=%s",
-		llmLatency.Round(time.Millisecond), verdict.Classification, verdict.Action)
 
 	return &verdict, nil
 }
@@ -478,7 +418,7 @@ Based on this response evidence, did the attack succeed or did the server ignore
 			{"role": "user", "content": userPrompt},
 		},
 		"max_completion_tokens": 4096,
-		"reasoning_effort":     "medium",
+		"reasoning_effort":     c.tier2Effort,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -517,11 +457,20 @@ Based on this response evidence, did the attack succeed or did the server ignore
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(rawBody, &chatResp); err != nil {
 		return nil, fmt.Errorf("decoding reclassify response: %w", err)
 	}
+
+	log.Printf("[llm] ReclassifyWithEvidence tokens: prompt=%d completion=%d total=%d effort=%s latency=%s",
+		chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, chatResp.Usage.TotalTokens,
+		c.tier2Effort, reclassLatency.Round(time.Millisecond))
 
 	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
 		return nil, fmt.Errorf("reclassify returned empty content")
@@ -543,9 +492,6 @@ Based on this response evidence, did the attack succeed or did the server ignore
 
 	// Determine if this is a downgrade
 	result.Downgraded = isDowngrade(originalClassification, result.Classification)
-
-	log.Printf("[llm] ReclassifyWithEvidence completed in %s: classification=%s downgraded=%v",
-		reclassLatency.Round(time.Millisecond), result.Classification, result.Downgraded)
 
 	return &result, nil
 }
