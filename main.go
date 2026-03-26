@@ -17,6 +17,7 @@ import (
 	"github.com/vaultguardian/observer/internal/notifier"
 	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/rec"
+	"github.com/vaultguardian/observer/internal/store"
 	"github.com/vaultguardian/observer/internal/watcher"
 )
 
@@ -41,6 +42,13 @@ func main() {
 	}
 	seedDenyPatterns(patterns)
 	log.Printf("[observer] Pattern store initialized (%d scopes)", patterns.ScopeCount())
+
+	// ------- Init SQLite findings store -------
+	db, err := store.Init(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("[observer] Failed to init SQLite store: %v", err)
+	}
+	defer db.Close()
 
 	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey, cfg.Tier1Effort, cfg.Tier2Effort)
 	a := analyzer.New(normReg, patterns, llmClient, cfg.MaxConcurrentLLM)
@@ -99,7 +107,7 @@ func main() {
 	}()
 
 	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector)
+	go runPeriodicStats(ctx, a, patterns, collector, db)
 
 	// ------- Re-Classification Cache -------
 	reclassCache := newReclassCache()
@@ -108,12 +116,12 @@ func main() {
 	alertCoordinator := coordinator.New(
 		ctx,
 		coordinator.DefaultConfig(),
-		makeDispatchCallback(dispatch),
+		makeDispatchCallback(dispatch, db),
 		makeEvidenceCheckCallback(collector, llmClient, reclassCache, ctx),
 	)
 
 	// ------- Log handler -------
-	handler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch)
+	handler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db)
 
 	// ------- Start watching -------
 	w := watcher.New(cfg.DockerSocket, handler)
@@ -140,7 +148,7 @@ func main() {
 
 // makeDispatchCallback creates the function called when a coordinator
 // investigation concludes — either dispatching or suppressing the alert.
-func makeDispatchCallback(dispatch *notifier.Dispatcher) coordinator.DispatchFunc {
+func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordinator.DispatchFunc {
 	return func(alert coordinator.FinalAlert) {
 		if alert.Downgraded {
 			log.Printf("[DOWNGRADED] EventID=%s key=%s events=%d Original→recon_failed Reason=%s",
@@ -148,6 +156,25 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher) coordinator.DispatchFun
 			log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s %s Line=%s",
 				alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
+
+			// Record downgraded finding to SQLite
+			db.RecordFinding(context.Background(), &store.Finding{
+				EventID:         alert.EventID,
+				Timestamp:       time.Now(),
+				SourceType:      "docker",
+				SourceName:      alert.ScopeKey,
+				Verdict:         "downgraded",
+				Classification:  alert.Severity,
+				Reason:          alert.Reason,
+				MatchedVia:      alert.MatchedVia,
+				RawLine:         alert.Line,
+				NormalizedHash:  alert.Hash,
+				CoordinatorKey:  alert.ScopeKey,
+				CoordinatorEvents: alert.EventCount,
+				Downgraded:      true,
+				DowngradeReason: alert.DowngradeReason,
+				Notified:        false,
+			})
 			return
 		}
 
@@ -168,6 +195,23 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher) coordinator.DispatchFun
 			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
 		dispatch.Dispatch(context.Background(), builtAlert)
+
+		// Record dispatched alert to SQLite
+		db.RecordFinding(context.Background(), &store.Finding{
+			EventID:         alert.EventID,
+			Timestamp:       time.Now(),
+			SourceType:      "docker",
+			SourceName:      alert.ScopeKey,
+			Verdict:         alert.Verdict,
+			Classification:  alert.Severity,
+			Reason:          alert.Reason,
+			MatchedVia:      alert.MatchedVia,
+			RawLine:         alert.Line,
+			NormalizedHash:  alert.Hash,
+			CoordinatorKey:  alert.ScopeKey,
+			CoordinatorEvents: alert.EventCount,
+			Notified:        true,
+		})
 	}
 }
 
@@ -344,6 +388,7 @@ func makeLogHandler(
 	collector rec.EvidenceCollector,
 	alertCoordinator *coordinator.Coordinator,
 	dispatch *notifier.Dispatcher,
+	db *store.Store,
 ) watcher.LogHandler {
 	return func(line watcher.LogLine) {
 		if cfg.ExcludeContainers[line.ContainerName] {
@@ -386,8 +431,39 @@ func makeLogHandler(
 			return
 
 		case patternstore.VerdictDeny, patternstore.VerdictAlert:
-			method, path, _, statusCode := parseNormalizedLine(evt.NormalizedLine)
+			method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
 			isHTTP := method != ""
+
+			// --- Recon routing: log + store, no email ---
+			// Reconnaissance (successful or failed) is telemetry, not an alert.
+			// Record it to SQLite for trend analysis and dashboard queries.
+			// No email, no coordinator, no notification.
+			if result.LLMClassification == "recon_success" || result.LLMClassification == "recon_failed" {
+				log.Printf("[RECON] EventID=%s Source=%s Classification=%s Reason=%s MatchedVia=%s Line=%s",
+					evt.ID, evt.ScopeKey(), result.LLMClassification, result.Reason, result.Source,
+					truncate(evt.Line, 200))
+
+				db.RecordFinding(context.Background(), &store.Finding{
+					EventID:        evt.ID,
+					Timestamp:      evt.Timestamp,
+					SourceType:     string(evt.SourceType),
+					SourceName:     evt.SourceName,
+					DestHost:       host,
+					HTTPMethod:     method,
+					HTTPPath:       path,
+					HTTPStatus:     statusCode,
+					Verdict:        "recon",
+					Classification: result.LLMClassification,
+					Confidence:     result.LLMConfidence,
+					Reason:         result.Reason,
+					MatchedVia:     result.Source,
+					RawLine:        evt.Line,
+					NormalizedLine: evt.NormalizedLine,
+					NormalizedHash: evt.Hash,
+					Notified:       false,
+				})
+				return
+			}
 
 			severity := "malicious"
 			notifSeverity := notifier.SeverityMalicious
@@ -432,6 +508,23 @@ func makeLogHandler(
 					evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 					truncate(evt.Line, 200))
 				dispatch.Dispatch(context.Background(), buildAlert(notifSeverity, nil))
+
+				// Record non-coordinator alert to SQLite
+				db.RecordFinding(context.Background(), &store.Finding{
+					EventID:        evt.ID,
+					Timestamp:      evt.Timestamp,
+					SourceType:     string(evt.SourceType),
+					SourceName:     evt.SourceName,
+					Verdict:        string(result.Verdict),
+					Classification: result.LLMClassification,
+					Confidence:     result.LLMConfidence,
+					Reason:         result.Reason,
+					MatchedVia:     result.Source,
+					RawLine:        evt.Line,
+					NormalizedLine: evt.NormalizedLine,
+					NormalizedHash: evt.Hash,
+					Notified:       true,
+				})
 			}
 
 		case patternstore.VerdictUnknown:
@@ -446,13 +539,19 @@ func makeLogHandler(
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store) {
 	ticker := time.NewTicker(30 * time.Second)
+	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
+	defer pruneTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-pruneTicker.C:
+			if err := db.Prune(ctx); err != nil {
+				log.Printf("[store] Prune error: %v", err)
+			}
 		case <-ticker.C:
 			if err := a.Persist(); err != nil {
 				log.Printf("[observer] Failed to persist state: %v", err)
@@ -471,6 +570,20 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
 					rStats.BufferEntries, rStats.BufferBytes)
 			}
+
+			// Record pipeline stats to SQLite
+			db.RecordPipelineStats(ctx, &store.PipelineStats{
+				Timestamp:       time.Now(),
+				Processed:       aStats.TotalProcessed,
+				PatternHits:     aStats.PatternHits,
+				NoiseSuppressed: aStats.NoiseSuppressed,
+				LLMCalls:        aStats.LLMCalls,
+				LLMErrors:       aStats.LLMErrors,
+				PatternsLearned: aStats.PatternsLearned,
+				DenyCount:       pStats.DenyHits,
+				AlertCount:      pStats.AlertHits,
+				SuppressCount:   pStats.SuppressHits,
+			})
 		}
 	}
 }

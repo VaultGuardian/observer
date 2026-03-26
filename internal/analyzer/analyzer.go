@@ -304,6 +304,35 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	}
 
 	if err := a.patterns.Learn(scopeKey, v, pattern); err != nil {
+		// --- Regex fallback to prefix ---
+		// DESIGN DECISION (v0.19.1, 2026-03-25): All 3 AIs agreed.
+		// When the LLM generates a regex that fails validation (doesn't compile,
+		// doesn't match original line, too broad), don't throw the LLM call away.
+		// Extract a prefix from the normalized line instead. 10 lines of Go,
+		// zero LLM cost, ~80% of the caching value.
+		if pt == patternstore.PatternRegex && evt.NormalizedLine != "" {
+			prefixLen := 40
+			prefixVal := evt.NormalizedLine
+			if len(prefixVal) > prefixLen {
+				prefixVal = prefixVal[:prefixLen]
+			}
+			if len(prefixVal) >= 5 { // minimum prefix length enforced by store
+				fallback := patternstore.LearnedPattern{
+					Type:         patternstore.PatternPrefix,
+					Value:        prefixVal,
+					Source:       "llm_regex_fallback",
+					Reason:       verdict.Reason,
+					OriginalLine: evt.NormalizedLine,
+					CreatedAt:    time.Now(),
+				}
+				if fbErr := a.patterns.Learn(scopeKey, v, fallback); fbErr == nil {
+					a.stats.PatternsLearned.Add(1)
+					log.Printf("[analyzer] Regex failed (%v), learned prefix fallback for %s [%s]: %q",
+						err, scopeKey, v, prefixVal)
+					return true
+				}
+			}
+		}
 		log.Printf("[analyzer] Failed to learn pattern: %v", err)
 		return false
 	}

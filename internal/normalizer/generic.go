@@ -41,6 +41,11 @@ var (
 
 	// Duration-like patterns: 3ms, 47ms, 1.23s, 200µs, 5m30s
 	reDuration = regexp.MustCompile(`\b\d+[\.\d]*(?:ns|µs|us|μs|ms|s|m|h)\b`)
+
+	// ANSI escape codes: color, bold, reset, etc. (e.g. \x1b[0m, \x1b[32m, \x1b[1;31m)
+	// Zero security signal — purely presentation. Destabilizes hashes and breaks
+	// JSON parsing when the LLM echoes them back in its response.
+	reANSI = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
 
 func (g *GenericNormalizer) Normalize(line string) string {
@@ -50,6 +55,10 @@ func (g *GenericNormalizer) Normalize(line string) string {
 	}
 
 	// Docker framing already stripped by NormalizeEvent().
+
+	// Strip ANSI escape codes first — they're presentation noise that
+	// destabilizes hashes and can break JSON parsing downstream.
+	line = reANSI.ReplaceAllString(line, "")
 
 	// Strip timestamps (most specific first)
 	line = reISO8601.ReplaceAllString(line, "<TS>")
