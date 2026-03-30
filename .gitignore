@@ -1,0 +1,39 @@
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Go binary
+observer
+observer.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+vendor/
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# Pattern store (local runtime data)
+patternstore.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+coverage.out
+*.test
+*.prof
