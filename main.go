@@ -569,6 +569,8 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
 					rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
 					rStats.BufferEntries, rStats.BufferBytes)
+				log.Printf("[observer] REC parse: req_prefix=%d req_fail=%d resp_prefix=%d resp_fail=%d",
+					rStats.ReqPrefixHits, rStats.ReqParseFails, rStats.RespPrefixHits, rStats.RespParseFails)
 			}
 
 			// Record pipeline stats to SQLite

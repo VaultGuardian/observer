@@ -408,6 +408,10 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.VXLANUnwrapped = lc.sniffer.vxlanCount
 		stats.VXLANHTTPReq = lc.sniffer.vxlanHTTPReq
 		stats.VXLANHTTPResp = lc.sniffer.vxlanHTTPResp
+		stats.ReqPrefixHits = lc.sniffer.reqPrefixHits
+		stats.ReqParseFails = lc.sniffer.reqParseFails
+		stats.RespPrefixHits = lc.sniffer.respPrefixHits
+		stats.RespParseFails = lc.sniffer.respParseFails
 	}
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()

@@ -61,15 +61,31 @@ type pendingRequest struct {
 //   Reliable transaction reconstruction. Not forensic-grade. Not suitable
 //   for high-throughput environments or compliance evidence without caveats.
 //
-// HOW IT WORKS:
+// HOW IT WORKS (v0.22 — SPECULATIVE PARSE):
 //   1. Opens an AF_PACKET raw socket (requires CAP_NET_RAW)
 //   2. Reads ethernet frames, parses IPv4 headers manually
-//   3. For TCP: filters by configured ports, parses HTTP request/response
+//   3. For TCP: checks payload prefix speculatively:
+//      - Starts with HTTP method (GET, POST, etc.) → try handleRequest()
+//      - Starts with "HTTP/" → try handleResponse()
+//      - Neither → skip (not HTTP, no cost)
+//      NO PORT GATE. The payload decides, not the port number.
 //   4. For UDP: detects VXLAN (dst port 4789), unwraps inner Ethernet frame,
 //      and recurses back to step 2 with a depth guard (max 2 levels)
 //   5. Uses stdlib net/http to parse HTTP request/response from TCP payload
 //   6. Tracks request→response pairing via FIFO queue per TCP stream
 //   7. Inserts completed transactions into the ring buffer
+//
+// WHY SPECULATIVE PARSE (design consensus, 2026-03-30):
+//   The AF_PACKET socket already receives ALL IPv4 packets — no BPF filter.
+//   The previous port gate (s.ports[dstPort]) was a userspace `if` statement
+//   that threw away packets the kernel already delivered. Services on ports
+//   outside the configured list (3000, 19999, etc.) were invisible despite
+//   their traffic being right there in the buffer.
+//
+//   Speculative parse tries to parse any TCP payload that looks like HTTP.
+//   If it parses → great, we learned something. If not → skip, zero cost.
+//   The port list is retained as metadata for telemetry (which ports are
+//   producing successful parses) but NOT as a correctness gate.
 //
 // KNOWN LIMITATIONS (be honest about these):
 //
@@ -97,7 +113,8 @@ type pendingRequest struct {
 //
 //   6. CPU COST: Every IPv4 packet hits userspace parsing. No BPF
 //      filter yet. Acceptable on low-traffic boxes, problematic at scale.
-//      BPF port filtering is a Phase 2 optimization.
+//      BPF port filtering is a Phase 2 optimization — port knowledge
+//      learned from successful speculative parses will seed the BPF filter.
 //
 //   7. ENCRYPTED OVERLAYS: If Docker Swarm overlay networks are created
 //      with --opt encrypted, IPsec encrypts the VXLAN payload. VXLAN
@@ -108,9 +125,13 @@ type pendingRequest struct {
 type sniffer struct {
 	buffer    *RingBuffer
 	iface     string // empty = capture on all interfaces
-	ports     map[int]bool
 	maxBody   int
 	vxlanPort uint16 // VXLAN destination port (default 4789, from Docker API or config)
+
+	// Known ports — retained as metadata for telemetry, NOT a correctness gate.
+	// Populated from config at startup. Successful speculative parses on new
+	// ports get logged so operators can see what's active.
+	knownPorts map[int]bool
 
 	// FIFO queue of pending requests per TCP stream direction.
 	// Nginx uses HTTP keep-alive on upstream connections, so multiple
@@ -122,31 +143,48 @@ type sniffer struct {
 	pending map[streamKey][]*pendingRequest
 	mu      sync.Mutex
 
-	// Debug counters for startup logging
+	// --- Core counters (same meaning as before) ---
 	packetCount   int64
-	httpReqCount  int64
-	httpRespCount int64
+	httpReqCount  int64 // HTTP requests successfully parsed (not just prefix-hit)
+	httpRespCount int64 // HTTP responses successfully parsed (not just prefix-hit)
 	pairMissCount int64 // responses where request was never seen
 	vxlanCount    int64 // VXLAN packets successfully unwrapped
 	vxlanHTTPReq  int64 // HTTP requests found inside VXLAN tunnels
 	vxlanHTTPResp int64 // HTTP responses found inside VXLAN tunnels
+
+	// --- Speculative parse telemetry (new in v0.22) ---
+	// These counters make soak tests decisive. After a soak, you can see:
+	//   "port 3000: 450 req prefix hits, 448 parsed, 2 failed" → parser works
+	//   "port 9000: 0 prefix hits" → service doesn't speak plaintext HTTP here
+	//   "port 80: 200 resp prefix hits, 0 parsed" → parser limitation (multi-segment?)
+	reqPrefixHits  int64 // payloads that looked like HTTP requests (prefix matched)
+	reqParseFails  int64 // prefix matched but stdlib parse failed
+	respPrefixHits int64 // payloads that looked like HTTP responses (prefix matched)
+	respParseFails int64 // prefix matched but stdlib parse failed
+
+	// Per-port success tracking. Maps port number → successful parse count.
+	// Protected by mu. Used for telemetry logging, not filtering.
+	portReqHits  map[int]int64
+	portRespHits map[int]int64
 }
 
 func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16) *sniffer {
-	portSet := make(map[int]bool, len(ports))
+	knownPorts := make(map[int]bool, len(ports))
 	for _, p := range ports {
-		portSet[p] = true
+		knownPorts[p] = true
 	}
 	if vxlanPort == 0 {
 		vxlanPort = DefaultVXLANPort
 	}
 	return &sniffer{
-		buffer:    buffer,
-		iface:     iface,
-		ports:     portSet,
-		pending:   make(map[streamKey][]*pendingRequest),
-		maxBody:   maxBody,
-		vxlanPort: vxlanPort,
+		buffer:       buffer,
+		iface:        iface,
+		knownPorts:   knownPorts,
+		pending:      make(map[streamKey][]*pendingRequest),
+		maxBody:      maxBody,
+		vxlanPort:    vxlanPort,
+		portReqHits:  make(map[int]int64),
+		portRespHits: make(map[int]int64),
 	}
 }
 
@@ -192,6 +230,9 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 			log.Printf("[rec] Sniffer stopping (packets=%d httpReq=%d httpResp=%d pairMisses=%d vxlan=%d vxlanReq=%d vxlanResp=%d)",
 				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount,
 				s.vxlanCount, s.vxlanHTTPReq, s.vxlanHTTPResp)
+			log.Printf("[rec] Speculative parse stats: reqPrefixHits=%d reqParseFails=%d respPrefixHits=%d respParseFails=%d",
+				s.reqPrefixHits, s.reqParseFails, s.respPrefixHits, s.respParseFails)
+			s.logPortStats()
 			return
 		default:
 		}
@@ -227,6 +268,12 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 //   1. Try VXLAN decap first. If it succeeds, recurse with inner frame.
 //   2. If not VXLAN, proceed with normal Ethernet → IPv4 → TCP → HTTP.
 //
+// SPECULATIVE PARSE (v0.22):
+//   No port gate. Every TCP payload with data is checked by prefix:
+//   - Looks like HTTP request? → try handleRequest()
+//   - Looks like HTTP response? → try handleResponse()
+//   - Neither? → skip (not HTTP, fast path)
+//
 // This handles both Swarm (VXLAN-encapsulated HTTP) and plain docker-compose
 // (direct TCP HTTP) transparently, with zero configuration.
 func (s *sniffer) processFrame(frame []byte, depth int) {
@@ -244,7 +291,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 		return
 	}
 
-	// --- Normal Ethernet → IPv4 → TCP → HTTP ---
+	// --- Normal Ethernet → IPv4 → TCP → Speculative HTTP ---
 	if len(frame) < 14 {
 		return
 	}
@@ -290,31 +337,42 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 
 	key := streamKey{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 
-	if s.ports[int(dstPort)] {
-		s.handleRequest(key, payload)
-		if depth > 0 {
-			s.vxlanHTTPReq++
+	// --- Speculative parse: let the payload decide, not the port ---
+	//
+	// Try request first (more common on the inbound side of a proxy),
+	// then response. If neither prefix matches, skip — not HTTP.
+	// handleRequest/handleResponse return true only on successful parse,
+	// not just prefix match. This keeps httpReqCount/httpRespCount meaning
+	// "successfully parsed" (same semantics as before).
+
+	if looksLikeHTTPRequest(payload) {
+		s.reqPrefixHits++
+		if s.handleRequest(key, payload, int(dstPort)) {
+			if depth > 0 {
+				s.vxlanHTTPReq++
+			}
 		}
 		return
 	}
-	if s.ports[int(srcPort)] {
-		s.handleResponse(key, payload)
-		if depth > 0 {
-			s.vxlanHTTPResp++
+
+	if looksLikeHTTPResponse(payload) {
+		s.respPrefixHits++
+		if s.handleResponse(key, payload, int(srcPort)) {
+			if depth > 0 {
+				s.vxlanHTTPResp++
+			}
 		}
 		return
 	}
 }
 
 // handleRequest tries to parse an HTTP request from a single TCP segment.
-func (s *sniffer) handleRequest(key streamKey, payload []byte) {
-	if !looksLikeHTTPRequest(payload) {
-		return
-	}
-
+// Returns true if the request was successfully parsed, false otherwise.
+func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool {
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(payload)))
 	if err != nil {
-		return // partial headers, TLS, or garbage — skip
+		s.reqParseFails++
+		return false // partial headers, TLS, or garbage — skip
 	}
 	defer req.Body.Close()
 
@@ -329,6 +387,7 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte) {
 		userAgent: req.UserAgent(),
 		timestamp: time.Now(),
 	})
+	s.portReqHits[dstPort]++
 	s.mu.Unlock()
 
 	log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
@@ -337,17 +396,16 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte) {
 		req.Method, req.RequestURI)
 
 	s.httpReqCount++
+	return true
 }
 
 // handleResponse tries to parse an HTTP response from a single TCP segment.
-func (s *sniffer) handleResponse(key streamKey, payload []byte) {
-	if !bytes.HasPrefix(payload, []byte("HTTP/")) {
-		return
-	}
-
+// Returns true if the response was successfully parsed, false otherwise.
+func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) bool {
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
 	if err != nil {
-		return
+		s.respParseFails++
+		return false
 	}
 	defer resp.Body.Close()
 
@@ -366,6 +424,7 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte) {
 			delete(s.pending, reverseKey) // clean up empty slices
 		}
 	}
+	s.portRespHits[srcPort]++
 	s.mu.Unlock()
 
 	// Read body preview — whatever fits in this single TCP segment after headers.
@@ -382,11 +441,11 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte) {
 	}
 
 	captured := CapturedResponse{
-		Timestamp:     time.Now(),
-		StatusCode:    resp.StatusCode,
-		ContentType:   resp.Header.Get("Content-Type"),
-		ContentLength: contentLength,
-		BodyPreview:   bodyPreview,
+		Timestamp:       time.Now(),
+		StatusCode:      resp.StatusCode,
+		ContentType:     resp.Header.Get("Content-Type"),
+		ContentLength:   contentLength,
+		BodyPreview:     bodyPreview,
 		BodyPreviewHash: bodyPreviewHash,
 		// NOTE: SourceContainer is NOT populated by the sniffer.
 		// We see IP addresses on the wire, not container names.
@@ -422,6 +481,7 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte) {
 
 	s.buffer.Insert(captured)
 	s.httpRespCount++
+	return true
 }
 
 // cleanupLoop removes stale pending requests every 30 seconds.
@@ -454,6 +514,34 @@ func (s *sniffer) cleanupLoop(ctx context.Context) {
 	}
 }
 
+// logPortStats logs which ports had successful HTTP parses.
+// Called on shutdown for visibility into what the speculative parse found.
+func (s *sniffer) logPortStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.portReqHits) == 0 && len(s.portRespHits) == 0 {
+		return
+	}
+
+	log.Printf("[rec] Port stats (requests):")
+	for port, count := range s.portReqHits {
+		known := ""
+		if s.knownPorts[port] {
+			known = " (configured)"
+		}
+		log.Printf("[rec]   port %d: %d parsed%s", port, count, known)
+	}
+	log.Printf("[rec] Port stats (responses):")
+	for port, count := range s.portRespHits {
+		known := ""
+		if s.knownPorts[port] {
+			known = " (configured)"
+		}
+		log.Printf("[rec]   port %d: %d parsed%s", port, count, known)
+	}
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -478,4 +566,12 @@ func looksLikeHTTPRequest(payload []byte) bool {
 		return true
 	}
 	return false
+}
+
+// looksLikeHTTPResponse checks if a payload starts with an HTTP response line.
+// This is the response-side equivalent of looksLikeHTTPRequest().
+// Previously this check was inline in handleResponse; now it's the routing
+// decision for speculative parse.
+func looksLikeHTTPResponse(payload []byte) bool {
+	return len(payload) >= 5 && bytes.HasPrefix(payload, []byte("HTTP/"))
 }

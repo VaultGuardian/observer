@@ -245,4 +245,12 @@ type RECStats struct {
 	VXLANHTTPResp int64 // HTTP responses found inside VXLAN tunnels
 	BufferEntries int   // current ring buffer occupancy
 	BufferBytes   int64 // current ring buffer memory usage
+
+	// --- Speculative parse telemetry (v0.22) ---
+	// These counters separate "port-gated miss" from "parser limitation"
+	// and "namespace/proxy miss" in soak tests.
+	ReqPrefixHits  int64 // payloads that looked like HTTP requests (prefix matched)
+	ReqParseFails  int64 // prefix matched but stdlib parse failed
+	RespPrefixHits int64 // payloads that looked like HTTP responses (prefix matched)
+	RespParseFails int64 // prefix matched but stdlib parse failed
 }
