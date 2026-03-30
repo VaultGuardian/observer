@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vaultguardian/observer/internal/analyzer"
+	"github.com/vaultguardian/observer/internal/api"
 	"github.com/vaultguardian/observer/internal/coordinator"
 	"github.com/vaultguardian/observer/internal/event"
 	"github.com/vaultguardian/observer/internal/llm"
@@ -91,6 +92,24 @@ func main() {
 	// ------- Start REC capture -------
 	if err := collector.Start(ctx); err != nil {
 		log.Printf("[observer] REC failed to start: %v (continuing without evidence capture)", err)
+	}
+
+	// ------- Start Dashboard API -------
+	apiServer, err := api.NewServer(
+		api.ServerConfig{
+			Port:    cfg.DashboardPort,
+			KeyFile: cfg.DashboardKeyFile,
+		},
+		db, patterns, a, collector,
+	)
+	if err != nil {
+		log.Printf("[observer] Dashboard API failed to start: %v (continuing without dashboard)", err)
+	} else {
+		go func() {
+			if err := apiServer.Start(); err != nil {
+				log.Printf("[observer] Dashboard API error: %v", err)
+			}
+		}()
 	}
 
 	// ------- LLM health check (non-blocking) -------

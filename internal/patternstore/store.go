@@ -426,6 +426,143 @@ func (s *Store) ScopeCount() int {
 	return len(s.scopes)
 }
 
+// =============================================================================
+// Dashboard API Read Methods
+// =============================================================================
+
+// ScopeSummary is a compact view of one scope for the dashboard.
+type ScopeSummary struct {
+	ScopeKey     string        `json:"scope_key"`
+	AllowCount   int           `json:"allow_count"`
+	DenyCount    int           `json:"deny_count"`
+	AlertCount   int           `json:"alert_count"`
+	SuppressCount int          `json:"suppress_count"`
+}
+
+// ListScopes returns a summary of every scope in the store.
+func (s *Store) ListScopes() []ScopeSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	summaries := make([]ScopeSummary, 0, len(s.scopes)+1)
+
+	// Global scope
+	summaries = append(summaries, ScopeSummary{
+		ScopeKey:      "__global__",
+		AllowCount:    bucketSize(&s.global.Allow),
+		DenyCount:     bucketSize(&s.global.Deny),
+		AlertCount:    bucketSize(&s.global.Alert),
+		SuppressCount: bucketSize(&s.global.Suppress),
+	})
+
+	for key, scope := range s.scopes {
+		summaries = append(summaries, ScopeSummary{
+			ScopeKey:      key,
+			AllowCount:    bucketSize(&scope.Allow),
+			DenyCount:     bucketSize(&scope.Deny),
+			AlertCount:    bucketSize(&scope.Alert),
+			SuppressCount: bucketSize(&scope.Suppress),
+		})
+	}
+	return summaries
+}
+
+// ListPatterns returns all patterns in a specific scope and verdict bucket.
+// Returns nil if the scope doesn't exist.
+func (s *Store) ListPatterns(scopeKey string, verdict Verdict) []LearnedPattern {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var scope *ScopeEntry
+	if scopeKey == "__global__" {
+		scope = s.global
+	} else {
+		scope = s.scopes[scopeKey]
+	}
+	if scope == nil {
+		return nil
+	}
+
+	bucket := s.getBucketReadOnly(scope, verdict)
+	if bucket == nil {
+		return nil
+	}
+
+	var patterns []LearnedPattern
+	for _, p := range bucket.Hashes {
+		patterns = append(patterns, *p)
+	}
+	for _, p := range bucket.Prefixes {
+		patterns = append(patterns, *p)
+	}
+	for _, p := range bucket.Regexes {
+		patterns = append(patterns, *p)
+	}
+	for _, p := range bucket.Contains {
+		patterns = append(patterns, *p)
+	}
+	return patterns
+}
+
+// DeletePattern removes a pattern by its value from a scope/verdict bucket.
+// Returns true if found and deleted.
+func (s *Store) DeletePattern(scopeKey string, verdict Verdict, patternValue string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var scope *ScopeEntry
+	if scopeKey == "__global__" {
+		scope = s.global
+	} else {
+		scope = s.scopes[scopeKey]
+	}
+	if scope == nil {
+		return false
+	}
+
+	bucket := s.getBucket(scope, verdict)
+	if bucket == nil {
+		return false
+	}
+
+	// Try hash first
+	if _, ok := bucket.Hashes[patternValue]; ok {
+		delete(bucket.Hashes, patternValue)
+		return true
+	}
+
+	// Try prefix/regex/contains lists
+	for _, list := range []*[]*LearnedPattern{&bucket.Prefixes, &bucket.Regexes, &bucket.Contains} {
+		for i, p := range *list {
+			if p.Value == patternValue {
+				*list = append((*list)[:i], (*list)[i+1:]...)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// getBucketReadOnly returns the bucket for a verdict (read-only, no creation).
+func (s *Store) getBucketReadOnly(scope *ScopeEntry, v Verdict) *PatternBucket {
+	switch v {
+	case VerdictAllow:
+		return &scope.Allow
+	case VerdictDeny:
+		return &scope.Deny
+	case VerdictAlert:
+		return &scope.Alert
+	case VerdictSuppress:
+		return &scope.Suppress
+	default:
+		return nil
+	}
+}
+
+func bucketSize(b *PatternBucket) int {
+	return len(b.Hashes) + len(b.Prefixes) + len(b.Regexes) + len(b.Contains)
+}
+
 // --- Persistence ---
 
 type persistedStore struct {

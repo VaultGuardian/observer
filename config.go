@@ -30,6 +30,10 @@ type Config struct {
 	// LLM reasoning effort per tier
 	Tier1Effort string // "low", "medium", "high" — default "low"
 	Tier2Effort string // "low", "medium", "high" — default "medium"
+
+	// Dashboard API
+	DashboardPort int
+	DashboardKeyFile string
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -47,6 +51,15 @@ func LoadConfig() Config {
 		MaxConcurrentLLM: 2,
 		Tier1Effort:      getEnv("LLM_TIER1_EFFORT", "low"),
 		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
+		DashboardPort:    9090,
+		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+	}
+
+	// Parse dashboard port
+	if portStr := getEnv("DASHBOARD_PORT", ""); portStr != "" {
+		if port, err := strconv.Atoi(portStr); err == nil && port > 0 && port < 65536 {
+			cfg.DashboardPort = port
+		}
 	}
 
 	// Build exclusion set from comma-separated container names
