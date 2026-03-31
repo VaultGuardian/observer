@@ -125,9 +125,6 @@ func main() {
 		}
 	}()
 
-	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db)
-
 	// ------- Re-Classification Cache -------
 	reclassCache := newReclassCache()
 
@@ -138,6 +135,9 @@ func main() {
 		makeDispatchCallback(dispatch, db),
 		makeEvidenceCheckCallback(collector, llmClient, reclassCache, ctx),
 	)
+
+	// ------- Periodic persistence + stats -------
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator)
 
 	// ------- Log handler -------
 	handler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db)
@@ -182,6 +182,11 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				Timestamp:       time.Now(),
 				SourceType:      "docker",
 				SourceName:      alert.ScopeKey,
+				DestHost:        alert.Host,
+				HTTPMethod:      alert.HTTPMethod,
+				HTTPPath:        alert.HTTPPath,
+				HTTPStatus:      alert.StatusCode,
+				ResponseBytes:   alert.ResponseBytes,
 				Verdict:         "downgraded",
 				Classification:  alert.Severity,
 				Reason:          alert.Reason,
@@ -221,6 +226,11 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			Timestamp:       time.Now(),
 			SourceType:      "docker",
 			SourceName:      alert.ScopeKey,
+			DestHost:        alert.Host,
+			HTTPMethod:      alert.HTTPMethod,
+			HTTPPath:        alert.HTTPPath,
+			HTTPStatus:      alert.StatusCode,
+			ResponseBytes:   alert.ResponseBytes,
 			Verdict:         alert.Verdict,
 			Classification:  alert.Severity,
 			Reason:          alert.Reason,
@@ -517,6 +527,11 @@ func makeLogHandler(
 					Verdict:        string(result.Verdict),
 					Severity:       severity,
 					Classification: result.LLMClassification,
+					Host:           host,
+					StatusCode:     statusCode,
+					ResponseBytes:  extractResponseBytes(evt.Line),
+					HTTPMethod:     method,
+					HTTPPath:       path,
 					NormalizedLine: evt.NormalizedLine,
 					SourceName:     evt.SourceName,
 					Timestamp:      evt.Timestamp,
@@ -534,6 +549,11 @@ func makeLogHandler(
 					Timestamp:      evt.Timestamp,
 					SourceType:     string(evt.SourceType),
 					SourceName:     evt.SourceName,
+					DestHost:       host,
+					HTTPMethod:     method,
+					HTTPPath:       path,
+					HTTPStatus:     statusCode,
+					ResponseBytes:  extractResponseBytes(evt.Line),
 					Verdict:        string(result.Verdict),
 					Classification: result.LLMClassification,
 					Confidence:     result.LLMConfidence,
@@ -558,7 +578,7 @@ func makeLogHandler(
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -590,6 +610,13 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.BufferEntries, rStats.BufferBytes)
 				log.Printf("[observer] REC parse: req_prefix=%d req_fail=%d resp_prefix=%d resp_fail=%d",
 					rStats.ReqPrefixHits, rStats.ReqParseFails, rStats.RespPrefixHits, rStats.RespParseFails)
+			}
+
+			// Catch-all tracker stats
+			caTotal, caCatchAlls, caSuppressed := coord.CatchAllStats()
+			if caTotal > 0 {
+				log.Printf("[observer] CatchAll: fingerprints=%d catch_alls=%d suppressed=%d",
+					caTotal, caCatchAlls, caSuppressed)
 			}
 
 			// Record pipeline stats to SQLite

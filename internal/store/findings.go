@@ -16,7 +16,7 @@ import (
 func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO findings (
 		event_id, timestamp, source_type, source_name,
-		source_ip, dest_host, http_method, http_path, http_status, user_agent,
+		source_ip, dest_host, http_method, http_path, http_status, response_bytes, user_agent,
 		verdict, classification, confidence, reason, matched_via,
 		raw_line, normalized_line, normalized_hash,
 		evidence_status, evidence_status_code, evidence_content_type,
@@ -25,7 +25,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		notified
 	) VALUES (
 		?, ?, ?, ?,
-		?, ?, ?, ?, ?, ?,
+		?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?,
 		?, ?, ?,
 		?, ?, ?,
@@ -34,7 +34,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		?
 	)`,
 		f.EventID, f.Timestamp.Format(time.RFC3339), f.SourceType, f.SourceName,
-		f.SourceIP, f.DestHost, f.HTTPMethod, f.HTTPPath, f.HTTPStatus, f.UserAgent,
+		f.SourceIP, f.DestHost, f.HTTPMethod, f.HTTPPath, f.HTTPStatus, f.ResponseBytes, f.UserAgent,
 		f.Verdict, f.Classification, f.Confidence, f.Reason, f.MatchedVia,
 		f.RawLine, f.NormalizedLine, f.NormalizedHash,
 		f.EvidenceStatus, f.EvidenceStatusCode, f.EvidenceContentType,

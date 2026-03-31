@@ -70,6 +70,13 @@ type FinalAlert struct {
 	Verdict       string // "deny", "alert"
 	Severity      string // "malicious", "suspicious"
 
+	// HTTP metadata (from normalized + raw line parsing)
+	Host          string
+	StatusCode    int
+	ResponseBytes int64
+	HTTPMethod    string
+	HTTPPath      string
+
 	// Evidence fields (may be empty if no evidence arrived)
 	EvidenceJournal string // ForJournal() output
 	Evidence        interface{} // *rec.Evidence — kept as interface to avoid import cycle
@@ -100,6 +107,13 @@ type PendingAlert struct {
 	Verdict        string
 	Severity       string
 	Classification string
+
+	// HTTP metadata (parsed from normalized line + raw line)
+	Host           string
+	StatusCode     int
+	ResponseBytes  int64
+	HTTPMethod     string
+	HTTPPath       string
 
 	// Evidence lookup context
 	NormalizedLine string
@@ -135,6 +149,7 @@ type Coordinator struct {
 	mu              sync.Mutex
 	pending         map[string]*PendingAlert      // correlationKey → active investigation
 	graveyard       map[string]*FinalizedOutcome   // correlationKey → recently finalized outcome
+	catchAll        *CatchAllTracker               // structural inference for catch-all responses
 	evidenceWindow  time.Duration
 	finalizeWindow  time.Duration
 	graveyardTTL    time.Duration
@@ -145,17 +160,19 @@ type Coordinator struct {
 
 // Config holds coordinator settings.
 type Config struct {
-	EvidenceWindow  time.Duration
-	FinalizeWindow  time.Duration
-	GraveyardTTL    time.Duration
+	EvidenceWindow    time.Duration
+	FinalizeWindow    time.Duration
+	GraveyardTTL      time.Duration
+	CatchAllThreshold int // distinct paths before marking as catch-all (default 5)
 }
 
 // DefaultConfig returns sensible defaults agreed by the AI design team.
 func DefaultConfig() Config {
 	return Config{
-		EvidenceWindow:  DefaultEvidenceWindow,
-		FinalizeWindow:  DefaultFinalizeWindow,
-		GraveyardTTL:    DefaultGraveyardTTL,
+		EvidenceWindow:    DefaultEvidenceWindow,
+		FinalizeWindow:    DefaultFinalizeWindow,
+		GraveyardTTL:      DefaultGraveyardTTL,
+		CatchAllThreshold: DefaultCatchAllThreshold,
 	}
 }
 
@@ -175,6 +192,7 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 	c := &Coordinator{
 		pending:        make(map[string]*PendingAlert),
 		graveyard:      make(map[string]*FinalizedOutcome),
+		catchAll:       NewCatchAllTracker(cfg.CatchAllThreshold),
 		evidenceWindow: cfg.EvidenceWindow,
 		finalizeWindow: cfg.FinalizeWindow,
 		graveyardTTL:   cfg.GraveyardTTL,
@@ -225,7 +243,38 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		return
 	}
 
-	// --- Check 3: Create new investigation ---
+	// --- Check 3: Catch-all structural inference ---
+	// If we've seen enough distinct paths return the same (host, status, bytes),
+	// this is a catch-all page. Auto-downgrade without evidence or LLM.
+	if isCatchAll, reason := c.catchAll.Check(alert.Host, alert.StatusCode, alert.ResponseBytes, extractPath(key)); isCatchAll {
+		log.Printf("[coordinator] Catch-all suppressed: key=%s host=%s status=%d bytes=%d source=%s",
+			key, alert.Host, alert.StatusCode, alert.ResponseBytes, alert.ScopeKey)
+
+		c.recordFinalized(key, "downgraded", reason, 1)
+		// Dispatch as downgraded — goes to SQLite, no email
+		go c.dispatch(FinalAlert{
+			EventID:         alert.EventID,
+			ScopeKey:        alert.ScopeKey,
+			Reason:          alert.Reason,
+			MatchedVia:      alert.MatchedVia,
+			Hash:            alert.Hash,
+			Line:            alert.Line,
+			Verdict:         alert.Verdict,
+			Severity:        alert.Severity,
+			Host:            alert.Host,
+			StatusCode:      alert.StatusCode,
+			ResponseBytes:   alert.ResponseBytes,
+			HTTPMethod:      alert.HTTPMethod,
+			HTTPPath:        alert.HTTPPath,
+			Downgraded:      true,
+			DowngradeReason: reason,
+			EventCount:      1,
+			BuildAlert:      alert.BuildAlert,
+		})
+		return
+	}
+
+	// --- Check 4: Create new investigation ---
 	if len(c.pending) >= maxPendingInvestigations {
 		var oldestKey string
 		var oldestTime time.Time
@@ -319,6 +368,11 @@ dispatch:
 		Line:            pending.Line,
 		Verdict:         pending.Verdict,
 		Severity:        pending.Severity,
+		Host:            pending.Host,
+		StatusCode:      pending.StatusCode,
+		ResponseBytes:   pending.ResponseBytes,
+		HTTPMethod:      pending.HTTPMethod,
+		HTTPPath:        pending.HTTPPath,
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		Downgraded:      false,
@@ -368,6 +422,11 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			Line:            pending.Line,
 			Verdict:         pending.Verdict,
 			Severity:        pending.Severity,
+			Host:            pending.Host,
+			StatusCode:      pending.StatusCode,
+			ResponseBytes:   pending.ResponseBytes,
+			HTTPMethod:      pending.HTTPMethod,
+			HTTPPath:        pending.HTTPPath,
 			EvidenceJournal: pending.EvidenceJournal,
 			Evidence:        pending.EvidenceResult,
 			Downgraded:      true,
@@ -394,6 +453,11 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 		Line:            pending.Line,
 		Verdict:         pending.Verdict,
 		Severity:        pending.Severity,
+		Host:            pending.Host,
+		StatusCode:      pending.StatusCode,
+		ResponseBytes:   pending.ResponseBytes,
+		HTTPMethod:      pending.HTTPMethod,
+		HTTPPath:        pending.HTTPPath,
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		EventCount:      pending.EventCount,
@@ -443,9 +507,34 @@ func truncateStr(s string, max int) string {
 	return s[:max] + "..."
 }
 
+// extractPath pulls the path component from a coordinator correlation key.
+// Key format: "METHOD|/path?query|STATUS"
+func extractPath(key string) string {
+	// Find first and last pipe
+	first := -1
+	last := -1
+	for i, c := range key {
+		if c == '|' {
+			if first == -1 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first >= 0 && last > first {
+		return key[first+1 : last]
+	}
+	return key
+}
+
 // Stats returns current coordinator state for monitoring.
 func (c *Coordinator) Stats() (pending int, graveyard int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.pending), len(c.graveyard)
+}
+
+// CatchAllStats returns catch-all tracker state for telemetry.
+func (c *Coordinator) CatchAllStats() (total int, catchAlls int, suppressed int64) {
+	return c.catchAll.Stats()
 }

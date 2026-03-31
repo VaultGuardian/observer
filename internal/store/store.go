@@ -196,6 +196,11 @@ func (s *Store) migrate() error {
 
 			CREATE INDEX IF NOT EXISTS idx_stats_timestamp ON pipeline_stats(timestamp);`,
 		},
+		{
+			version: 4,
+			desc:    "add response_bytes to findings",
+			sql:     `ALTER TABLE findings ADD COLUMN response_bytes INTEGER DEFAULT 0;`,
+		},
 	}
 
 	for _, m := range migrations {
