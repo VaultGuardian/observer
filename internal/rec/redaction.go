@@ -551,6 +551,15 @@ func redactPasswd(body []byte) string {
 // Format Classifier + Structural Redaction
 // =============================================================================
 //
+// ClassifyAndRedact detects the format of a response body and produces a
+// redacted preview safe for LLM re-classification. Exported for use by
+// the catch-all verification pipeline.
+//
+// IMPORTANT: operates on the TRUNCATED body preview
+func ClassifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalysis {
+	return classifyAndRedact(bodyPreview, contentType)
+}
+
 // IMPORTANT: classifyAndRedact operates on the TRUNCATED body preview
 // (max 2KB), not the full response body. Format detection and redaction
 // confidence are based on partial content. This is acceptable for Phase 1

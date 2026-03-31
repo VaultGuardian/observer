@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -128,13 +131,22 @@ func main() {
 	// ------- Re-Classification Cache -------
 	reclassCache := newReclassCache()
 
+	// ------- Self-Suppression Token Registry -------
+	// Created here so both the coordinator and verify callback can reference it.
+	selfSuppress := coordinator.NewSelfSuppressor()
+
 	// ------- Alert Coordinator -------
 	alertCoordinator := coordinator.New(
 		ctx,
 		coordinator.DefaultConfig(),
 		makeDispatchCallback(dispatch, db),
 		makeEvidenceCheckCallback(collector, llmClient, reclassCache, ctx),
+		makeVerifyCallback(db, llmClient, selfSuppress, ctx),
+		selfSuppress,
 	)
+
+	// ------- Seed verified catch-alls from database -------
+	seedCatchAllsFromDB(db, alertCoordinator)
 
 	// ------- Periodic persistence + stats -------
 	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator)
@@ -407,6 +419,229 @@ func makeEvidenceCheckCallback(
 }
 
 // =============================================================================
+// Catch-All Verification Callback
+// =============================================================================
+
+// makeVerifyCallback creates the function called once per fingerprint lifetime
+// when the catch-all tracker wants to confirm a candidate is benign.
+//
+// ARCHITECTURE (design consensus, 2026-03-31):
+//   Structural inference NOMINATES, active verify CONFIRMS.
+//   One HTTP request + one LLM call per fingerprint lifetime.
+//
+// FLOW:
+//   1. GET the sample path via HTTP first, then HTTPS if HTTP doesn't match
+//   2. Compare status + body length against expected fingerprint values
+//   3. Feed body through redaction → LLM re-classification
+//   4. If LLM says benign → confirmed, persist to SQLite
+//   5. If LLM says sensitive → rejected, keep alerting
+//
+// SELF-SUPPRESSION:
+//   Uses cryptographic token in User-Agent. The log handler checks tokens
+//   against the SelfSuppressor registry and drops matching lines.
+//   the design review mandate: no static strings an attacker can copy.
+func makeVerifyCallback(
+	db *store.Store,
+	llmClient *llm.Client,
+	selfSuppress *coordinator.SelfSuppressor,
+	ctx context.Context,
+) coordinator.VerifyFunc {
+
+	// HTTP client with short timeout — localhost should respond in ms
+	httpClient := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // don't follow redirects — we want to see the 302
+		},
+	}
+	httpsClient := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // self-signed certs
+		},
+	}
+
+	return func(req coordinator.VerifyRequest) *coordinator.VerifyResult {
+		fp := req.Fingerprint
+		path := req.SamplePath
+		if path == "" {
+			return &coordinator.VerifyResult{Confirmed: false, Reason: "no sample path available"}
+		}
+
+		log.Printf("[verify] Starting verification: host=%s method=%s status=%d bytes=%d path=%s",
+			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes, path)
+
+		// Generate self-suppression token — unique per verify request.
+		// The log handler will match this token and silently drop the log line.
+		// the design review mandate: cryptographic randomness, not a static string.
+		userAgent, _ := selfSuppress.GenerateToken()
+
+		// Try HTTP first (port 80), then HTTPS (port 443)
+		// The logged response could be from either — match against expected values
+		schemes := []struct {
+			scheme string
+			client *http.Client
+		}{
+			{"http", httpClient},
+			{"https", httpsClient},
+		}
+
+		for _, s := range schemes {
+			url := fmt.Sprintf("%s://%s%s", s.scheme, fp.Host, path)
+
+			httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			if err != nil {
+				log.Printf("[verify] Failed to create request: %v", err)
+				continue
+			}
+			httpReq.Host = fp.Host
+			httpReq.Header.Set("User-Agent", userAgent)
+
+			resp, err := s.client.Do(httpReq)
+			if err != nil {
+				log.Printf("[verify] %s request failed: %v", s.scheme, err)
+				continue
+			}
+
+			// Read body (capped at 4KB like REC)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+
+			bodyLen := int64(len(body))
+			statusMatch := resp.StatusCode == fp.StatusCode
+			sizeMatch := bodyLen == fp.ResponseBytes
+
+			log.Printf("[verify] %s response: status=%d (want %d) body=%d bytes (want %d) match=%v",
+				s.scheme, resp.StatusCode, fp.StatusCode, bodyLen, fp.ResponseBytes, statusMatch && sizeMatch)
+
+			if !statusMatch || !sizeMatch {
+				continue // try next scheme
+			}
+
+			// Status + size match — now verify the body is benign
+			contentType := resp.Header.Get("Content-Type")
+
+			// Redact the body using existing REC pipeline
+			disclosure := rec.ClassifyAndRedact(body, contentType)
+			safePreview := disclosure.RedactedPreview()
+
+			if safePreview == "" {
+				// Redaction couldn't produce a preview — still classify as benign
+				// if the body is very small (redirect pages, error templates)
+				if bodyLen <= 200 {
+					safePreview = string(body) // small enough to use raw
+				} else {
+					log.Printf("[verify] Redaction produced empty preview, format=%s — skipping LLM", disclosure.Format)
+					// For unknown formats, trust the size match alone if body is small-ish
+					if bodyLen <= 2048 {
+						reason := fmt.Sprintf("Verified: %s %d response (%d bytes), format=%s, consistent across %d+ paths",
+							s.scheme, resp.StatusCode, bodyLen, disclosure.Format, coordinator.DefaultCatchAllThreshold)
+						result := &coordinator.VerifyResult{
+							Confirmed:   true,
+							Reason:      reason,
+							ContentType: contentType,
+							BodyHash:    rec.HashBody(body),
+						}
+						persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
+						return result
+					}
+					return &coordinator.VerifyResult{Confirmed: false, Reason: "redaction failed on large body — cannot verify safety"}
+				}
+			}
+
+			// Ask LLM: is this response benign?
+			reclass, err := llmClient.ReclassifyWithEvidence(
+				ctx,
+				"suspicious",                    // original classification
+				"Catch-all verification probe",  // original reason
+				fmt.Sprintf("GET %s → %d", path, resp.StatusCode), // synthetic log line
+				resp.StatusCode,
+				contentType,
+				bodyLen,
+				safePreview,
+			)
+			if err != nil {
+				log.Printf("[verify] LLM error: %v — not confirming", err)
+				return &coordinator.VerifyResult{Confirmed: false, Reason: fmt.Sprintf("LLM error: %v", err)}
+			}
+
+			bodyHash := rec.HashBody(body)
+
+			if reclass.Downgraded {
+				reason := fmt.Sprintf("LLM confirmed benign: %s", reclass.Reason)
+				result := &coordinator.VerifyResult{
+					Confirmed:   true,
+					Reason:      reason,
+					ContentType: contentType,
+					BodyHash:    bodyHash,
+				}
+				persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
+				return result
+			}
+
+			// LLM said NOT benign — reject this fingerprint
+			reason := fmt.Sprintf("LLM rejected: %s (classification=%s)", reclass.Reason, reclass.Classification)
+			log.Printf("[verify] LLM rejected catch-all: %s", reason)
+			return &coordinator.VerifyResult{Confirmed: false, Reason: reason}
+		}
+
+		return &coordinator.VerifyResult{Confirmed: false, Reason: "no scheme matched expected status+size"}
+	}
+}
+
+// persistVerifiedCatchAll saves a confirmed catch-all to SQLite for restart persistence.
+func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinator.CatchAllFingerprint, path string, result *coordinator.VerifyResult, contentType string) {
+	err := db.SaveVerifiedCatchAll(ctx, &store.CatchAllRule{
+		Host:                fp.Host,
+		HTTPMethod:          fp.Method,
+		HTTPStatus:          fp.StatusCode,
+		ResponseBytes:       fp.ResponseBytes,
+		VerifiedAt:          time.Now(),
+		SamplePath:          path,
+		ContentType:         contentType,
+		BodyHash:            result.BodyHash,
+		VerificationVerdict: "benign",
+		VerificationReason:  result.Reason,
+	})
+	if err != nil {
+		log.Printf("[verify] Failed to persist verified catch-all: %v", err)
+	} else {
+		log.Printf("[verify] Persisted verified catch-all: host=%s method=%s status=%d bytes=%d",
+			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes)
+	}
+}
+
+// seedCatchAllsFromDB loads previously verified catch-all fingerprints from SQLite
+// and pre-warms the tracker. Zero learning period for known catch-alls.
+func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
+	rules, err := db.LoadVerifiedCatchAlls(context.Background())
+	if err != nil {
+		log.Printf("[observer] Failed to load catch-all seeds: %v (continuing without pre-warm)", err)
+		return
+	}
+	if len(rules) == 0 {
+		return
+	}
+
+	fps := make([]coordinator.CatchAllFingerprint, len(rules))
+	reasons := make([]string, len(rules))
+	for i, r := range rules {
+		fps[i] = coordinator.CatchAllFingerprint{
+			Host:          r.Host,
+			Method:        r.HTTPMethod,
+			StatusCode:    r.HTTPStatus,
+			ResponseBytes: r.ResponseBytes,
+		}
+		reasons[i] = r.VerificationReason
+	}
+
+	coord.CatchAllTracker().SeedVerified(fps, reasons)
+}
+
+// =============================================================================
 // Log Handler
 // =============================================================================
 
@@ -421,6 +656,14 @@ func makeLogHandler(
 ) watcher.LogHandler {
 	return func(line watcher.LogLine) {
 		if cfg.ExcludeContainers[line.ContainerName] {
+			return
+		}
+
+		// Self-suppression: skip log lines generated by Observer's own
+		// catch-all verify requests. Uses cryptographic tokens — not a
+		// static User-Agent that an attacker could spoof.
+		// (the design review security mandate, 2026-03-31)
+		if alertCoordinator.SelfSuppressor().IsSelfVerify(line.Line) {
 			return
 		}
 
@@ -613,10 +856,10 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			}
 
 			// Catch-all tracker stats
-			caTotal, caCatchAlls, caSuppressed := coord.CatchAllStats()
+			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()
 			if caTotal > 0 {
-				log.Printf("[observer] CatchAll: fingerprints=%d catch_alls=%d suppressed=%d",
-					caTotal, caCatchAlls, caSuppressed)
+				log.Printf("[observer] CatchAll: fingerprints=%d candidates=%d pending=%d verified=%d rejected=%d suppressed=%d",
+					caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed)
 			}
 
 			// Record pipeline stats to SQLite

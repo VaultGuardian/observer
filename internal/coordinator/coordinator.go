@@ -150,6 +150,7 @@ type Coordinator struct {
 	pending         map[string]*PendingAlert      // correlationKey → active investigation
 	graveyard       map[string]*FinalizedOutcome   // correlationKey → recently finalized outcome
 	catchAll        *CatchAllTracker               // structural inference for catch-all responses
+	selfSuppress    *SelfSuppressor                // token registry for verify request self-identification
 	evidenceWindow  time.Duration
 	finalizeWindow  time.Duration
 	graveyardTTL    time.Duration
@@ -179,7 +180,8 @@ func DefaultConfig() Config {
 // New creates a Coordinator.
 //   - dispatch is called when an alert is finalized (send email, log, etc.)
 //   - evidenceCheck is called to attempt REC lookup + re-classification
-func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck EvidenceCheckFunc) *Coordinator {
+//   - verifyFunc is called once per fingerprint lifetime to confirm catch-all is benign
+func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck EvidenceCheckFunc, verifyFunc VerifyFunc, selfSuppress *SelfSuppressor) *Coordinator {
 	if cfg.EvidenceWindow == 0 {
 		cfg.EvidenceWindow = DefaultEvidenceWindow
 	}
@@ -192,7 +194,8 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 	c := &Coordinator{
 		pending:        make(map[string]*PendingAlert),
 		graveyard:      make(map[string]*FinalizedOutcome),
-		catchAll:       NewCatchAllTracker(cfg.CatchAllThreshold),
+		catchAll:       NewCatchAllTracker(cfg.CatchAllThreshold, verifyFunc),
+		selfSuppress:   selfSuppress,
 		evidenceWindow: cfg.EvidenceWindow,
 		finalizeWindow: cfg.FinalizeWindow,
 		graveyardTTL:   cfg.GraveyardTTL,
@@ -244,9 +247,9 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 	}
 
 	// --- Check 3: Catch-all structural inference ---
-	// If we've seen enough distinct paths return the same (host, status, bytes),
-	// this is a catch-all page. Auto-downgrade without evidence or LLM.
-	if isCatchAll, reason := c.catchAll.Check(alert.Host, alert.StatusCode, alert.ResponseBytes, extractPath(key)); isCatchAll {
+	// If we've seen enough distinct paths return the same (host, method, status, bytes),
+	// and the fingerprint has been actively verified as benign, auto-downgrade.
+	if isCatchAll, reason := c.catchAll.Check(alert.Host, alert.HTTPMethod, alert.StatusCode, alert.ResponseBytes, extractPath(key)); isCatchAll {
 		log.Printf("[coordinator] Catch-all suppressed: key=%s host=%s status=%d bytes=%d source=%s",
 			key, alert.Host, alert.StatusCode, alert.ResponseBytes, alert.ScopeKey)
 
@@ -535,6 +538,17 @@ func (c *Coordinator) Stats() (pending int, graveyard int) {
 }
 
 // CatchAllStats returns catch-all tracker state for telemetry.
-func (c *Coordinator) CatchAllStats() (total int, catchAlls int, suppressed int64) {
+func (c *Coordinator) CatchAllStats() (total, candidates, pending, verified, rejected int, suppressed int64) {
 	return c.catchAll.Stats()
+}
+
+// SelfSuppressor returns the self-suppression token registry for use
+// by the log handler to identify Observer's own verify requests.
+func (c *Coordinator) SelfSuppressor() *SelfSuppressor {
+	return c.selfSuppress
+}
+
+// CatchAllTracker returns the tracker for startup seeding.
+func (c *Coordinator) CatchAllTracker() *CatchAllTracker {
+	return c.catchAll
 }

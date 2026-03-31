@@ -16,12 +16,13 @@ type Finding struct {
 	SourceName string    `json:"source_name"` // container name or service
 
 	// Request details
-	SourceIP   string `json:"source_ip,omitempty"`
-	DestHost   string `json:"dest_host,omitempty"`
-	HTTPMethod string `json:"http_method,omitempty"`
-	HTTPPath   string `json:"http_path,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
-	UserAgent  string `json:"user_agent,omitempty"`
+	SourceIP      string `json:"source_ip,omitempty"`
+	DestHost      string `json:"dest_host,omitempty"`
+	HTTPMethod    string `json:"http_method,omitempty"`
+	HTTPPath      string `json:"http_path,omitempty"`
+	HTTPStatus    int    `json:"http_status,omitempty"`
+	ResponseBytes int64  `json:"response_bytes,omitempty"`
+	UserAgent     string `json:"user_agent,omitempty"`
 
 	// Classification
 	Verdict        string  `json:"verdict"`        // allow, deny, alert, suppress, recon, unknown

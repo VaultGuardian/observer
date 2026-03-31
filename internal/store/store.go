@@ -201,6 +201,26 @@ func (s *Store) migrate() error {
 			desc:    "add response_bytes to findings",
 			sql:     `ALTER TABLE findings ADD COLUMN response_bytes INTEGER DEFAULT 0;`,
 		},
+		{
+			version: 5,
+			desc:    "catchall_verified table",
+			sql: `CREATE TABLE IF NOT EXISTS catchall_verified (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				host TEXT NOT NULL,
+				http_method TEXT NOT NULL,
+				http_status INTEGER NOT NULL,
+				response_bytes INTEGER NOT NULL,
+				verified_at TEXT NOT NULL,
+				sample_path TEXT,
+				content_type TEXT,
+				body_hash TEXT,
+				verification_verdict TEXT NOT NULL,
+				verification_reason TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+				UNIQUE(host, http_method, http_status, response_bytes)
+			);`,
+		},
 	}
 
 	for _, m := range migrations {
