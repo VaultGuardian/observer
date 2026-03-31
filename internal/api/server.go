@@ -91,7 +91,27 @@ func (s *Server) Start() error {
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	log.Printf("[api] Dashboard API listening on %s (key file: %s)", addr, s.config.KeyFile)
-	return http.ListenAndServe(addr, mux)
+	return http.ListenAndServe(addr, s.corsMiddleware(mux))
+}
+
+// corsMiddleware handles CORS preflight and adds headers to all responses.
+// Required because the dashboard app runs on a different origin (e.g.
+// localhost:3000 or app.vaultguardian.io) and makes authenticated fetch calls.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Preflight — return immediately, don't hit auth
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // =============================================================================
@@ -366,13 +386,11 @@ func loadOrGenerateToken(keyFile string) (string, error) {
 
 func jsonOK(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*") // dev convenience, lock down later
 	json.NewEncoder(w).Encode(data)
 }
 
 func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
