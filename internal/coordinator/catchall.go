@@ -3,6 +3,7 @@ package coordinator
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,6 +103,15 @@ func (t *CatchAllTracker) Check(host string, statusCode int, responseBytes int64
 	// ResponseBytes == 0 means extractResponseBytes() couldn't parse it.
 	if host == "" || responseBytes <= 0 {
 		return false, ""
+	}
+
+	// Strip query string — we want distinct ROUTES, not distinct parameters.
+	// An attacker fuzzing ?user=admin, ?user=root, ?user=test on /wp-admin
+	// is probing ONE route, not three. Without this, parameter fuzzing would
+	// inflate the path count and falsely trigger catch-all detection.
+	// ( audit, 2026-03-31)
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
 	}
 
 	fp := CatchAllFingerprint{
