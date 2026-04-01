@@ -54,9 +54,12 @@ const (
 type DispatchFunc func(alert FinalAlert)
 
 // EvidenceCheckFunc is called by the coordinator to look up and
-// re-classify evidence for a pending alert. Returns true + reason
-// if the alert should be downgraded (suppressed).
-type EvidenceCheckFunc func(pending *PendingAlert) (downgraded bool, reason string)
+// re-classify evidence for a pending alert. Returns:
+//   - downgraded=true if evidence shows the attack failed (severity reduced)
+//   - escalated=true if evidence confirms real exposure (severity increased)
+//   - reason explaining the decision
+//   - newSeverity is the LLM's updated classification (only meaningful when escalated)
+type EvidenceCheckFunc func(pending *PendingAlert) (downgraded bool, escalated bool, reason string, newSeverity string)
 
 // FinalAlert is what the coordinator emits when an investigation concludes.
 type FinalAlert struct {
@@ -84,6 +87,8 @@ type FinalAlert struct {
 	// Outcome
 	Downgraded     bool
 	DowngradeReason string
+	Escalated       bool
+	EscalateReason  string
 
 	// All events that joined this investigation
 	EventCount     int
@@ -131,6 +136,8 @@ type PendingAlert struct {
 	EventCount     int
 	Downgraded     bool
 	DowngradeReason string
+	Escalated       bool
+	EscalateReason  string
 	Resolved       bool
 	Dispatched     bool
 }
@@ -385,7 +392,7 @@ dispatch:
 }
 
 // tryEvidenceCheck calls the evidence check function and resolves the
-// investigation if evidence downgrades the alert. Returns true if resolved.
+// investigation if evidence downgrades or escalates the alert. Returns true if resolved.
 func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	c.mu.Lock()
 	pending, ok := c.pending[key]
@@ -395,7 +402,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	}
 	c.mu.Unlock()
 
-	downgraded, reason := c.evidenceCheck(pending)
+	downgraded, escalated, reason, newSeverity := c.evidenceCheck(pending)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -434,6 +441,51 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			Evidence:        pending.EvidenceResult,
 			Downgraded:      true,
 			DowngradeReason: reason,
+			EventCount:      pending.EventCount,
+			BuildAlert:      pending.BuildAlert,
+		})
+
+		return true
+	}
+
+	if escalated {
+		pending.Resolved = true
+		pending.Escalated = true
+		pending.EscalateReason = reason
+		pending.Dispatched = true
+		// Upgrade severity — evidence confirmed this is worse than initially thought
+		originalSeverity := pending.Severity
+		if newSeverity != "" {
+			pending.Severity = newSeverity
+		}
+		if pending.Severity == "malicious" {
+			pending.Verdict = "deny"
+		}
+		pending.Reason = reason // replace original reason with evidence-backed reason
+		delete(c.pending, key)
+		c.recordFinalized(key, "escalated", reason, pending.EventCount)
+
+		log.Printf("[coordinator] Investigation resolved: ESCALATED key=%s events=%d %s→%s reason=%s",
+			key, pending.EventCount, originalSeverity, pending.Severity, truncateStr(reason, 100))
+
+		c.dispatch(FinalAlert{
+			EventID:         pending.EventID,
+			ScopeKey:        pending.ScopeKey,
+			Reason:          reason,
+			MatchedVia:      pending.MatchedVia,
+			Hash:            pending.Hash,
+			Line:            pending.Line,
+			Verdict:         pending.Verdict,
+			Severity:        pending.Severity,
+			Host:            pending.Host,
+			StatusCode:      pending.StatusCode,
+			ResponseBytes:   pending.ResponseBytes,
+			HTTPMethod:      pending.HTTPMethod,
+			HTTPPath:        pending.HTTPPath,
+			EvidenceJournal: pending.EvidenceJournal,
+			Evidence:        pending.EvidenceResult,
+			Escalated:       true,
+			EscalateReason:  reason,
 			EventCount:      pending.EventCount,
 			BuildAlert:      pending.BuildAlert,
 		})

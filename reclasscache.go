@@ -30,8 +30,10 @@ import "sync"
 const maxReclassCacheEntries = 1000
 
 type reclassCacheEntry struct {
-	downgraded bool
-	reason     string
+	downgraded  bool
+	escalated   bool
+	reason      string
+	newSeverity string // only set when escalated
 }
 
 type reclassCache struct {
@@ -52,7 +54,7 @@ func (c *reclassCache) get(bodyHash string) (reclassCacheEntry, bool) {
 	return entry, ok
 }
 
-func (c *reclassCache) put(bodyHash string, downgraded bool, reason string) {
+func (c *reclassCache) put(bodyHash string, downgraded bool, escalated bool, reason string, newSeverity string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -64,7 +66,9 @@ func (c *reclassCache) put(bodyHash string, downgraded bool, reason string) {
 	}
 
 	c.entries[bodyHash] = reclassCacheEntry{
-		downgraded: downgraded,
-		reason:     reason,
+		downgraded:  downgraded,
+		escalated:   escalated,
+		reason:      reason,
+		newSeverity: newSeverity,
 	}
 }

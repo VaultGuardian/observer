@@ -214,6 +214,47 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			return
 		}
 
+		if alert.Escalated {
+			log.Printf("[ESCALATED] EventID=%s key=%s events=%d →%s Reason=%s",
+				alert.EventID, alert.ScopeKey, alert.EventCount, alert.Severity, alert.EscalateReason)
+			log.Printf("[INFO] EventID=%s Source=%s EscalatedReason=%s %s Line=%s",
+				alert.EventID, alert.ScopeKey, alert.EscalateReason,
+				alert.EvidenceJournal, truncate(alert.Line, 200))
+
+			// Send alert at escalated severity
+			if alert.BuildAlert != nil {
+				if builtAlert, ok := alert.BuildAlert().(notifier.Alert); ok {
+					// Override to malicious — evidence confirmed real exposure
+					builtAlert.Severity = notifier.SeverityMalicious
+					builtAlert.Reason = alert.EscalateReason
+					dispatch.Dispatch(context.Background(), builtAlert)
+				}
+			}
+
+			// Record escalated finding to SQLite
+			db.RecordFinding(context.Background(), &store.Finding{
+				EventID:           alert.EventID,
+				Timestamp:         time.Now(),
+				SourceType:        "docker",
+				SourceName:        alert.ScopeKey,
+				DestHost:          alert.Host,
+				HTTPMethod:        alert.HTTPMethod,
+				HTTPPath:          alert.HTTPPath,
+				HTTPStatus:        alert.StatusCode,
+				ResponseBytes:     alert.ResponseBytes,
+				Verdict:           "deny",
+				Classification:    "malicious",
+				Reason:            alert.EscalateReason,
+				MatchedVia:        alert.MatchedVia,
+				RawLine:           alert.Line,
+				NormalizedHash:    alert.Hash,
+				CoordinatorKey:    alert.ScopeKey,
+				CoordinatorEvents: alert.EventCount,
+				Notified:          true,
+			})
+			return
+		}
+
 		if alert.BuildAlert == nil {
 			return
 		}
@@ -296,12 +337,12 @@ func makeEvidenceCheckCallback(
 		410: true, // Gone — resource permanently removed
 	}
 
-	return func(pending *coordinator.PendingAlert) (bool, string) {
+	return func(pending *coordinator.PendingAlert) (bool, bool, string, string) {
 		method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
 		if method == "" {
 			log.Printf("[coordinator] Evidence check SKIP: no HTTP in normalized line key=%s normalized=%s",
 				pending.Key, truncate(pending.NormalizedLine, 120))
-			return false, ""
+			return false, false, "", ""
 		}
 
 		evidence := collector.Lookup(rec.LookupRequest{
@@ -328,7 +369,7 @@ func makeEvidenceCheckCallback(
 				reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
 				log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
 					pending.Key, code, evidence.CandidateCount)
-				return true, reason
+				return true, false, reason, ""
 			}
 		}
 
@@ -350,7 +391,7 @@ func makeEvidenceCheckCallback(
 			}
 			log.Printf("[coordinator] Evidence check MISS: key=%s lookup=%s/%s?status=%d candidates=%d transport=%v preview_len=%d format=%s status=%s",
 				pending.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
-			return false, ""
+			return false, false, "", ""
 		}
 
 		// --- Path 2: Body-aware re-classification ---
@@ -365,7 +406,7 @@ func makeEvidenceCheckCallback(
 					}
 					return "n/a"
 				}())
-			return false, ""
+			return false, false, "", ""
 		}
 
 		// Update pending with evidence info for logging
@@ -388,8 +429,11 @@ func makeEvidenceCheckCallback(
 			if cached.downgraded {
 				log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
 					bodyHash[:16], cached.reason)
+			} else if cached.escalated {
+				log.Printf("[reclassify] Cache hit (redacted_body=%s): escalated → %s → %s",
+					bodyHash[:16], cached.newSeverity, cached.reason)
 			}
-			return cached.downgraded, cached.reason
+			return cached.downgraded, cached.escalated, cached.reason, cached.newSeverity
 		}
 
 		// Cache miss — call LLM
@@ -404,17 +448,20 @@ func makeEvidenceCheckCallback(
 			evidence.SafeBodyPreview,
 		)
 		if err != nil {
-			log.Printf("[reclassify] Error: %v — not downgrading", err)
-			return false, ""
+			log.Printf("[reclassify] Error: %v — not changing verdict", err)
+			return false, false, "", ""
 		}
 
-		cache.put(bodyHash, reclass.Downgraded, reclass.Reason)
+		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
 
 		if reclass.Downgraded {
 			log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
 				classification, reclass.Classification, reclass.Reason)
+		} else if reclass.Escalated {
+			log.Printf("[ESCALATED] Original=%s→%s Reason=%s",
+				classification, reclass.Classification, reclass.Reason)
 		}
-		return reclass.Downgraded, reclass.Reason
+		return reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification
 	}
 }
 

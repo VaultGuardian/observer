@@ -345,6 +345,7 @@ type ReclassifyVerdict struct {
 	Reason         string  `json:"reason"`
 	Action         string  `json:"action"`
 	Downgraded     bool    `json:"downgraded"` // true if severity was reduced
+	Escalated      bool    `json:"escalated"`  // true if severity was increased (e.g. suspicious → malicious)
 }
 
 // ReclassifyWithEvidence asks the LLM to re-evaluate a verdict given captured
@@ -490,8 +491,9 @@ Based on this response evidence, did the attack succeed or did the server ignore
 	// Reconcile classification and action
 	result.Action = reconcileClassificationAction(result.Classification, result.Action, result.Reason)
 
-	// Determine if this is a downgrade
+	// Determine if this is a downgrade or escalation
 	result.Downgraded = isDowngrade(originalClassification, result.Classification)
+	result.Escalated = isEscalation(originalClassification, result.Classification)
 
 	return &result, nil
 }
@@ -507,6 +509,21 @@ func isDowngrade(original, updated string) bool {
 		"malicious":     5,
 	}
 	return severity[updated] < severity[original]
+}
+
+// isEscalation returns true if the new classification is MORE severe than the original.
+// This happens when evidence confirms real data exposure (e.g., suspicious → malicious
+// because the response body contained actual credentials).
+func isEscalation(original, updated string) bool {
+	severity := map[string]int{
+		"safe":          0,
+		"noise":         0,
+		"recon_failed":  1,
+		"recon_success": 3,
+		"suspicious":    4,
+		"malicious":     5,
+	}
+	return severity[updated] > severity[original]
 }
 
 func stripCodeBlock(s string) string {
