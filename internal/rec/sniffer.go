@@ -166,9 +166,14 @@ type sniffer struct {
 	// Protected by mu. Used for telemetry logging, not filtering.
 	portReqHits  map[int]int64
 	portRespHits map[int]int64
+
+	// verbose controls per-packet logging. When false (default), only pair
+	// misses, parse failures, and periodic stats are logged. When true, every
+	// REQ and RESP paired line is printed. Use REC_VERBOSE=true for debugging.
+	verbose bool
 }
 
-func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16) *sniffer {
+func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16, verbose bool) *sniffer {
 	knownPorts := make(map[int]bool, len(ports))
 	for _, p := range ports {
 		knownPorts[p] = true
@@ -185,6 +190,7 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxla
 		vxlanPort:    vxlanPort,
 		portReqHits:  make(map[int]int64),
 		portRespHits: make(map[int]int64),
+		verbose:      verbose,
 	}
 }
 
@@ -397,10 +403,12 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool
 	s.portReqHits[dstPort]++
 	s.mu.Unlock()
 
-	log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
-		key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-		key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-		req.Method, req.RequestURI)
+	if s.verbose {
+		log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
+			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
+			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
+			req.Method, req.RequestURI)
+	}
 
 	s.httpReqCount++
 	return true
@@ -471,10 +479,12 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 		captured.Path = pending.path
 		captured.Host = pending.host
 		captured.UserAgent = pending.userAgent
-		log.Printf("[rec] RESP paired: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d method=%s path=%s",
-			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-			resp.StatusCode, pending.method, pending.path)
+		if s.verbose {
+			log.Printf("[rec] RESP paired: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d method=%s path=%s",
+				key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
+				key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
+				resp.StatusCode, pending.method, pending.path)
+		}
 	} else {
 		s.pairMissCount++
 		log.Printf("[rec] RESP pair miss: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d reverseKey=%d.%d.%d.%d:%d→%d.%d.%d.%d:%d pendingStreams=%d",

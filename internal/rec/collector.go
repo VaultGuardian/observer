@@ -82,6 +82,11 @@ type CollectorConfig struct {
 	//
 	// Empty = host namespace capture (existing behavior).
 	NSContainer string
+
+	// Verbose enables per-packet REQ/RESP logging. When false (default),
+	// only pair misses, parse failures, and periodic stats are logged.
+	// Set REC_VERBOSE=true for debugging packet capture issues.
+	Verbose bool
 }
 
 // DefaultCollectorConfig returns the design team-agreed defaults.
@@ -185,7 +190,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	iface := lc.config.Interface
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort)
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose)
 	lc.sniffer = s
 
 	// --- Decide capture mode: namespace or host ---

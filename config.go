@@ -23,6 +23,7 @@ type Config struct {
 	RECInterface  string
 	RECVXLANPort  uint16 // 0 = auto-detect
 	RECNSContainer string
+	RECVerbose     bool
 
 	// LLM concurrency
 	MaxConcurrentLLM int
@@ -48,6 +49,7 @@ func LoadConfig() Config {
 		RECEnabled:       getEnv("REC_ENABLED", "") == "true",
 		RECInterface:     getEnv("REC_INTERFACE", ""),
 		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
+		RECVerbose:       getEnv("REC_VERBOSE", "") == "true",
 		MaxConcurrentLLM: 2,
 		Tier1Effort:      getEnv("LLM_TIER1_EFFORT", "low"),
 		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),

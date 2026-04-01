@@ -78,6 +78,7 @@ func main() {
 	recCfg.Interface = cfg.RECInterface
 	recCfg.VXLANPort = cfg.RECVXLANPort
 	recCfg.NSContainer = cfg.RECNSContainer
+	recCfg.Verbose = cfg.RECVerbose
 	collector := rec.NewCollector(recCfg)
 
 	// ------- Context with graceful shutdown -------
