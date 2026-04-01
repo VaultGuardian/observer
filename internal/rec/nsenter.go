@@ -104,7 +104,11 @@ func openSocketInNamespace(pid int) (int, error) {
 
 	// Create the AF_PACKET socket — this is now inside the container's namespace.
 	// It will see the container's network interfaces (eth0, eth1, lo).
-	fd, sockErr := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_IP)))
+	// ETH_P_ALL (0x0003) captures BOTH incoming AND outgoing packets.
+	// Critical for namespace capture: nginx's outgoing proxy requests to
+	// backend containers are outgoing packets — invisible with ETH_P_IP.
+	// See sniffer.go openSocket() comment for full rationale.
+	fd, sockErr := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(0x0003)))
 
 	// ALWAYS return to host namespace, even if socket creation failed.
 	// If we don't, this OS thread stays in the container namespace and

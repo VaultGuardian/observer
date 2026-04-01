@@ -192,7 +192,14 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxla
 // Runs SYNCHRONOUSLY in Start() — if it fails, Start() returns the error
 // and running stays false.
 func (s *sniffer) openSocket() (int, error) {
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_IP)))
+	// ETH_P_ALL (0x0003) captures BOTH incoming AND outgoing packets.
+	// ETH_P_IP (0x0800) only captures incoming — the kernel's dev_queue_xmit()
+	// path for outgoing packets only delivers to ETH_P_ALL handlers.
+	// In namespace capture mode, nginx's outgoing proxy requests to backends
+	// are outgoing packets on the overlay interface — invisible with ETH_P_IP.
+	// processFrame() already filters for IPv4 at the EtherType check, so
+	// non-IPv4 packets are dropped immediately with zero cost.
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(0x0003)))
 	if err != nil {
 		return -1, fmt.Errorf("opening raw socket: %w (do you have CAP_NET_RAW?)", err)
 	}
