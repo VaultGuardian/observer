@@ -259,10 +259,6 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 		if alert.BuildAlert == nil {
 			return
 		}
-		builtAlert, ok := alert.BuildAlert().(notifier.Alert)
-		if !ok {
-			return
-		}
 
 		severity := "ALERT"
 		if alert.Severity == "suspicious" {
@@ -272,9 +268,10 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			severity, alert.EventID, alert.ScopeKey, alert.Reason,
 			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
-		dispatch.Dispatch(context.Background(), builtAlert)
+		// NO EMAIL — only escalated alerts (evidence-confirmed exposure) send email.
+		// Everything else is logged to SQLite for dashboard review.
 
-		// Record dispatched alert to SQLite
+		// Record finding to SQLite (not notified — review on dashboard)
 		db.RecordFinding(context.Background(), &store.Finding{
 			EventID:         alert.EventID,
 			Timestamp:       time.Now(),
@@ -293,7 +290,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			NormalizedHash:  alert.Hash,
 			CoordinatorKey:  alert.ScopeKey,
 			CoordinatorEvents: alert.EventCount,
-			Notified:        true,
+			Notified:        false,
 		})
 	}
 }
@@ -832,7 +829,9 @@ func makeLogHandler(
 				log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
 					evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 					truncate(evt.Line, 200))
-				dispatch.Dispatch(context.Background(), buildAlert(notifSeverity, nil))
+
+				// NO EMAIL — only escalated alerts send email.
+				// Non-HTTP alerts logged to SQLite for dashboard review.
 
 				// Record non-coordinator alert to SQLite
 				db.RecordFinding(context.Background(), &store.Finding{
@@ -853,7 +852,7 @@ func makeLogHandler(
 					RawLine:        evt.Line,
 					NormalizedLine: evt.NormalizedLine,
 					NormalizedHash: evt.Hash,
-					Notified:       true,
+					Notified:       false,
 				})
 			}
 
