@@ -24,9 +24,10 @@ type AnalysisResult struct {
 	Source  string                   `json:"source,omitempty"` // "pattern", "llm", "seeded"
 
 	// LLM-specific fields (only set when the LLM was consulted)
-	LLMClassification string  `json:"llm_classification,omitempty"`
-	LLMConfidence     float64 `json:"llm_confidence,omitempty"`
-	LLMPatternLearned bool    `json:"llm_pattern_learned,omitempty"`
+	LLMClassification string      `json:"llm_classification,omitempty"`
+	LLMConfidence     float64     `json:"llm_confidence,omitempty"`
+	LLMPatternLearned bool        `json:"llm_pattern_learned,omitempty"`
+	LLMVerdict        *llm.Verdict `json:"-"` // full verdict with call metadata for audit trail
 }
 
 // Analyzer is the core analysis pipeline.
@@ -225,6 +226,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 		LLMClassification: verdict.Classification,
 		LLMConfidence:     verdict.Confidence,
 		LLMPatternLearned: patternLearned,
+		LLMVerdict:        verdict,
 	}
 }
 

@@ -50,6 +50,12 @@ type Verdict struct {
 	// line are variable (change between structurally identical lines).
 	// Used to discover normalization rules for unknown services.
 	VariableFields []VariableField `json:"variable_fields,omitempty"`
+
+	// Call metadata (populated by the client, not the LLM)
+	PromptTokens     int    `json:"-"` // excluded from LLM JSON parse
+	CompletionTokens int    `json:"-"`
+	LatencyMs        int64  `json:"-"`
+	ResponseRaw      string `json:"-"` // full LLM JSON response for audit trail
 }
 
 // VariableField identifies a token in the raw log line that the LLM believes
@@ -265,6 +271,12 @@ CRITICAL JSON RULES:
 	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
 	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
 
+	// Attach call metadata for the audit trail
+	verdict.PromptTokens = chatResp.Usage.PromptTokens
+	verdict.CompletionTokens = chatResp.Usage.CompletionTokens
+	verdict.LatencyMs = llmLatency.Milliseconds()
+	verdict.ResponseRaw = content
+
 	return &verdict, nil
 }
 
@@ -346,6 +358,12 @@ type ReclassifyVerdict struct {
 	Action         string  `json:"action"`
 	Downgraded     bool    `json:"downgraded"` // true if severity was reduced
 	Escalated      bool    `json:"escalated"`  // true if severity was increased (e.g. suspicious → malicious)
+
+	// Call metadata (populated by the client, not the LLM)
+	PromptTokens     int    `json:"-"`
+	CompletionTokens int    `json:"-"`
+	LatencyMs        int64  `json:"-"`
+	ResponseRaw      string `json:"-"`
 }
 
 // ReclassifyWithEvidence asks the LLM to re-evaluate a verdict given captured
@@ -494,6 +512,12 @@ Based on this response evidence, did the attack succeed or did the server ignore
 	// Determine if this is a downgrade or escalation
 	result.Downgraded = isDowngrade(originalClassification, result.Classification)
 	result.Escalated = isEscalation(originalClassification, result.Classification)
+
+	// Attach call metadata for the audit trail
+	result.PromptTokens = chatResp.Usage.PromptTokens
+	result.CompletionTokens = chatResp.Usage.CompletionTokens
+	result.LatencyMs = reclassLatency.Milliseconds()
+	result.ResponseRaw = content
 
 	return &result, nil
 }

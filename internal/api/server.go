@@ -88,6 +88,9 @@ func (s *Server) Start() error {
 	mux.Handle("/api/stats", s.requireAuth(http.HandlerFunc(s.handleStats)))
 	mux.Handle("/api/patterns", s.requireAuth(http.HandlerFunc(s.handlePatterns)))
 	mux.Handle("/api/patterns/delete", s.requireAuth(http.HandlerFunc(s.handleDeletePattern)))
+	mux.Handle("/api/decisions", s.requireAuth(http.HandlerFunc(s.handleDecisions)))
+	mux.Handle("/api/decisions/counts", s.requireAuth(http.HandlerFunc(s.handleDecisionCounts)))
+	mux.Handle("/api/decisions/review", s.requireAuth(http.HandlerFunc(s.handleDecisionReview)))
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	log.Printf("[api] Dashboard API listening on %s (key file: %s)", addr, s.config.KeyFile)
@@ -378,6 +381,141 @@ func loadOrGenerateToken(keyFile string) (string, error) {
 	log.Printf("[api] Dashboard token generated → %s", keyFile)
 	log.Printf("[api] To access the dashboard API, use: Authorization: Bearer <contents of %s>", keyFile)
 	return token, nil
+}
+
+// =============================================================================
+// LLM Decision Audit Trail Endpoints
+// =============================================================================
+
+// handleDecisions lists LLM decisions with optional filters.
+// GET /api/decisions?tier=classify&classification=malicious&review_status=pending&limit=50
+func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	filter := store.LLMDecisionFilter{}
+
+	filter.Tier = r.URL.Query().Get("tier")
+	filter.Classification = r.URL.Query().Get("classification")
+	filter.ReviewStatus = r.URL.Query().Get("review_status")
+	filter.SourceScope = r.URL.Query().Get("source_scope")
+
+	if v := r.URL.Query().Get("min_confidence"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			filter.MinConfidence = f
+		}
+	}
+	if v := r.URL.Query().Get("max_confidence"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			filter.MaxConfidence = f
+		}
+	}
+	if v := r.URL.Query().Get("since"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			filter.Since = t
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			filter.Limit = n
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			filter.Offset = n
+		}
+	}
+
+	decisions, err := s.store.ListLLMDecisions(r.Context(), filter)
+	if err != nil {
+		jsonError(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	jsonOK(w, decisions)
+}
+
+// handleDecisionCounts returns summary stats for the decisions dashboard.
+// GET /api/decisions/counts
+func (s *Server) handleDecisionCounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	counts, err := s.store.GetLLMDecisionCounts(r.Context())
+	if err != nil {
+		jsonError(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	jsonOK(w, counts)
+}
+
+// handleDecisionReview updates the human review on a decision.
+// POST /api/decisions/review
+// Body: {"id": 42, "status": "corrected", "verdict": "safe", "reason": "...", "pattern_deleted": true}
+func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID     int64            `json:"id"`
+		Review store.LLMReview  `json:"review"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == 0 {
+		jsonError(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	if req.Review.Status == "" {
+		jsonError(w, "review.status is required (confirmed, corrected, ignored)", http.StatusBadRequest)
+		return
+	}
+
+	// If correcting and pattern should be deleted, do it
+	if req.Review.PatternDeleted && req.Review.Status == "corrected" {
+		// Look up the decision to find its cache_key and pattern info
+		decision, err := s.store.GetLLMDecision(r.Context(), req.ID)
+		if err != nil {
+			jsonError(w, "decision not found: "+err.Error(), http.StatusNotFound)
+			return
+		}
+
+		// Delete the learned pattern from the pattern store
+		if decision.PatternLearned && decision.PatternValue != "" {
+			bucket := decision.PatternBucket
+			if bucket == "" {
+				bucket = decision.Action // fallback
+			}
+			deleted := s.patterns.DeletePattern(decision.SourceScope, patternstore.Verdict(bucket), decision.PatternValue)
+			if deleted {
+				log.Printf("[api] Deleted pattern from %s/%s: %s (decision #%d corrected)",
+					decision.SourceScope, bucket, decision.PatternValue, req.ID)
+			}
+		}
+
+		// TODO: If cache_key is a body hash (tier 2), invalidate reclassCache
+		// This requires exposing cache invalidation from main.go — deferred to next version
+	}
+
+	if err := s.store.UpdateLLMDecisionReview(r.Context(), req.ID, req.Review); err != nil {
+		jsonError(w, "update failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[api] Decision #%d reviewed: status=%s verdict=%s pattern_deleted=%v",
+		req.ID, req.Review.Status, req.Review.Verdict, req.Review.PatternDeleted)
+
+	jsonOK(w, map[string]string{"status": "ok"})
 }
 
 // =============================================================================

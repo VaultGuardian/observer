@@ -141,8 +141,8 @@ func main() {
 		ctx,
 		coordinator.DefaultConfig(),
 		makeDispatchCallback(dispatch, db),
-		makeEvidenceCheckCallback(collector, llmClient, reclassCache, ctx),
-		makeVerifyCallback(db, llmClient, selfSuppress, ctx),
+		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, ctx),
+		makeVerifyCallback(db, llmClient, selfSuppress, cfg, ctx),
 		selfSuppress,
 	)
 
@@ -323,6 +323,8 @@ func makeEvidenceCheckCallback(
 	collector rec.EvidenceCollector,
 	llmClient *llm.Client,
 	cache *reclassCache,
+	db *store.Store,
+	cfg Config,
 	ctx context.Context,
 ) coordinator.EvidenceCheckFunc {
 	// Status codes where transport alone proves the attack failed.
@@ -452,6 +454,34 @@ func makeEvidenceCheckCallback(
 
 		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
 
+		// Record LLM decision to audit trail (Tier 2: reclassification with evidence)
+		db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+			EventID:          pending.EventID,
+			Timestamp:        time.Now(),
+			Tier:             "reclassify",
+			Model:            cfg.LLMModel,
+			ReasoningEffort:  cfg.Tier2Effort,
+			PromptTokens:     reclass.PromptTokens,
+			CompletionTokens: reclass.CompletionTokens,
+			LatencyMs:        reclass.LatencyMs,
+			SourceScope:      pending.ScopeKey,
+			RawLine:          pending.Line,
+			NormalizedLine:   pending.NormalizedLine,
+			EvidencePreview:  evidence.SafeBodyPreview,
+			EvidenceStatus:   evidence.Transport.StatusCode,
+			EvidenceType:     evidence.Transport.ContentType,
+			EvidenceHash:     evidence.Transport.BodyPreviewHash,
+			LLMResponseRaw:   reclass.ResponseRaw,
+			Classification:   reclass.Classification,
+			Action:           reclass.Action,
+			Confidence:       reclass.Confidence,
+			Reason:           reclass.Reason,
+			CacheKey:         bodyHash,
+			FinalVerdict:     reclass.Classification,
+			Escalated:        reclass.Escalated,
+			Downgraded:       reclass.Downgraded,
+		})
+
 		if reclass.Downgraded {
 			log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
 				classification, reclass.Classification, reclass.Reason)
@@ -489,6 +519,7 @@ func makeVerifyCallback(
 	db *store.Store,
 	llmClient *llm.Client,
 	selfSuppress *coordinator.SelfSuppressor,
+	cfg Config,
 	ctx context.Context,
 ) coordinator.VerifyFunc {
 
@@ -615,6 +646,31 @@ func makeVerifyCallback(
 
 			bodyHash := rec.HashBody(body)
 
+			// Record LLM decision to audit trail (Tier 3: catch-all verification)
+			db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+				Timestamp:        time.Now(),
+				Tier:             "catchall_verify",
+				Model:            cfg.LLMModel,
+				ReasoningEffort:  cfg.Tier2Effort,
+				PromptTokens:     reclass.PromptTokens,
+				CompletionTokens: reclass.CompletionTokens,
+				LatencyMs:        reclass.LatencyMs,
+				SourceScope:      fp.Host,
+				RawLine:          fmt.Sprintf("GET %s → %d", path, resp.StatusCode),
+				EvidencePreview:  safePreview,
+				EvidenceStatus:   resp.StatusCode,
+				EvidenceType:     contentType,
+				EvidenceHash:     bodyHash,
+				LLMResponseRaw:   reclass.ResponseRaw,
+				Classification:   reclass.Classification,
+				Action:           reclass.Action,
+				Confidence:       reclass.Confidence,
+				Reason:           reclass.Reason,
+				CacheKey:         bodyHash,
+				FinalVerdict:     reclass.Classification,
+				Downgraded:       reclass.Downgraded,
+			})
+
 			if reclass.Downgraded {
 				reason := fmt.Sprintf("LLM confirmed benign: %s", reclass.Reason)
 				result := &coordinator.VerifyResult{
@@ -725,6 +781,37 @@ func makeLogHandler(
 		}
 
 		result := a.Analyze(context.Background(), evt)
+
+		// Record LLM decision to audit trail (Tier 1: classification)
+		if result.Source == "llm" && result.LLMVerdict != nil {
+			v := result.LLMVerdict
+			db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+				EventID:          evt.ID,
+				Timestamp:        evt.Timestamp,
+				Tier:             "classify",
+				Model:            cfg.LLMModel,
+				ReasoningEffort:  cfg.Tier1Effort,
+				PromptTokens:     v.PromptTokens,
+				CompletionTokens: v.CompletionTokens,
+				LatencyMs:        v.LatencyMs,
+				SourceScope:      evt.ScopeKey(),
+				RawLine:          evt.Line,
+				NormalizedLine:   evt.NormalizedLine,
+				NormalizedHash:   evt.Hash,
+				LLMResponseRaw:   v.ResponseRaw,
+				Classification:   v.Classification,
+				Action:           v.Action,
+				Confidence:       v.Confidence,
+				Reason:           v.Reason,
+				PatternType:      v.PatternType,
+				PatternValue:     v.Pattern,
+				SourceHint:       v.SourceHint,
+				PatternLearned:   result.LLMPatternLearned,
+				PatternBucket:    v.Action,
+				CacheKey:         v.Pattern,
+				FinalVerdict:     string(result.Verdict),
+			})
+		}
 
 		buildAlert := func(severity notifier.Severity, evidence *rec.Evidence) notifier.Alert {
 			return notifier.Alert{

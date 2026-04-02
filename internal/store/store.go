@@ -221,6 +221,76 @@ func (s *Store) migrate() error {
 				UNIQUE(host, http_method, http_status, response_bytes)
 			);`,
 		},
+		{
+			version: 6,
+			desc:    "llm_decisions audit trail",
+			sql: `CREATE TABLE IF NOT EXISTS llm_decisions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+				-- Call metadata
+				event_id TEXT,
+				timestamp TEXT NOT NULL,
+				tier TEXT NOT NULL,
+				model TEXT NOT NULL,
+				reasoning_effort TEXT,
+				prompt_tokens INTEGER,
+				completion_tokens INTEGER,
+				latency_ms INTEGER,
+
+				-- Input context
+				source_scope TEXT,
+				raw_line TEXT,
+				normalized_line TEXT,
+				normalized_hash TEXT,
+				evidence_preview TEXT,
+				evidence_status_code INTEGER,
+				evidence_content_type TEXT,
+				evidence_body_hash TEXT,
+
+				-- LLM output (immutable)
+				llm_response_raw TEXT,
+				classification TEXT,
+				action TEXT,
+				confidence REAL,
+				reason TEXT,
+				pattern_type TEXT,
+				pattern_value TEXT,
+				source_hint TEXT,
+
+				-- What Observer did with it
+				pattern_learned INTEGER DEFAULT 0,
+				pattern_bucket TEXT,
+				cache_key TEXT,
+				final_verdict TEXT,
+				escalated INTEGER DEFAULT 0,
+				downgraded INTEGER DEFAULT 0,
+				finding_id TEXT,
+				notified INTEGER DEFAULT 0,
+
+				-- Prompt/model versioning
+				prompt_version TEXT,
+				code_version TEXT,
+
+				-- Human review (gold layer)
+				review_status TEXT DEFAULT 'pending',
+				reviewed_by TEXT,
+				reviewed_at TEXT,
+				reviewer_verdict TEXT,
+				reviewer_reason TEXT,
+				pattern_deleted INTEGER DEFAULT 0,
+				replacement_pattern TEXT,
+
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_timestamp ON llm_decisions(timestamp);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_tier ON llm_decisions(tier);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_classification ON llm_decisions(classification);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_review_status ON llm_decisions(review_status);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_event_id ON llm_decisions(event_id);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_source_scope ON llm_decisions(source_scope);
+			CREATE INDEX IF NOT EXISTS idx_llm_decisions_cache_key ON llm_decisions(cache_key);`,
+		},
 	}
 
 	for _, m := range migrations {
@@ -260,6 +330,7 @@ func (s *Store) Prune(ctx context.Context) error {
 		{"recon/downgraded findings >90d", "DELETE FROM findings WHERE (verdict = 'recon' OR downgraded = 1) AND timestamp < ?", cutoff90d},
 		{"scanner sessions >90d", "DELETE FROM scanner_sessions WHERE last_seen < ?", cutoff90d},
 		{"pipeline stats >90d", "DELETE FROM pipeline_stats WHERE timestamp < ?", cutoff90d},
+		{"unreviewed LLM decisions >7d", "DELETE FROM llm_decisions WHERE review_status = 'pending' AND timestamp < ?", cutoff7d},
 	}
 
 	for _, q := range queries {
