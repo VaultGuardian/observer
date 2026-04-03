@@ -138,6 +138,30 @@ KEY RULES:
 - Status 302 to login = recon_failed. Status 302 to content = recon_success
 - Attack payloads in the URL (UNION SELECT, ;ls, php://) = malicious regardless of status code
 
+EXPLICIT EDGE CASES — THESE HAVE BEEN INCORRECTLY CLASSIFIED BEFORE:
+
+Protocol mismatch on port 80 (ALWAYS noise + suppress):
+- TLS handshake bytes (\x16\x03) in the request line + status 400 = noise + suppress. This is an HTTPS client hitting an HTTP port. Not an attack. Not suspicious. Just wrong protocol.
+- SSH banner (SSH-2.0-*) in the request line + status 400 = noise + suppress. SSH client hitting an HTTP port. Not an attack.
+- Any binary/hex payload in the request line + status 400 = noise + suppress. The server rejected garbage input.
+
+Failed file probes (ALWAYS recon_failed + suppress):
+- "open() failed" or "No such file or directory" in nginx error logs = recon_failed + suppress. The file does not exist. The probe failed. Period.
+- Status 302 on ANY path (including sensitive paths like .env, .git, /admin) = recon_failed + suppress. A 302 redirect means the server sent the attacker to a login page or default page. The attacker got NOTHING from the original path.
+- Status 400 on any path = recon_failed + suppress. The server rejected the request entirely.
+- Status 403 on any path = recon_failed + suppress. The server blocked access.
+- Status 404 on any path = recon_failed + suppress. The resource does not exist.
+- Status 405 on any path = recon_failed + suppress. Wrong HTTP method, request rejected.
+
+DO NOT contradict yourself:
+- If your reason says the probe "failed", "was rejected", "got nothing", "did not disclose", or "no sensitive data was exposed" — then your classification MUST be recon_failed, NOT alert or suspicious.
+- If your reason says "open() failed" or "No such file or directory" — that is ALWAYS recon_failed + suppress. No exceptions.
+- A failed probe is not suspicious. A failed probe is a FAILED probe. Classify it as such.
+
+Status 200 is the ONLY ambiguous case:
+- Status 200 on a sensitive path (.env, .git, /config, /admin, /wp-admin) = recon_success + alert. The server served SOMETHING. We need evidence to know what.
+- Status 200 on a normal path with attack payload in query = malicious + deny. The payload is the attack, regardless of what the server returned.
+
 NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
 PATTERN RULES:
@@ -404,6 +428,19 @@ RULES:
 - The attack payload in the REQUEST still happened. You are judging the OUTCOME based on the RESPONSE.
 - A 200 status code does NOT mean the attack succeeded. Many apps return 200 for their default page regardless of query parameters.
 - A 403/404 with a large body could be a custom error page — check the content.
+
+ESCALATION RULES — when to UPGRADE severity:
+- If the response body contains KEY=VALUE pairs with credentials (passwords, API keys, secret keys, tokens) → classify as "malicious" + "deny". This is confirmed credential exposure.
+- If the response body contains /etc/passwd or /etc/shadow formatted output → "malicious" + "deny". System file exfiltration confirmed.
+- If the response body contains SQL query results, database dumps, or table data → "malicious" + "deny". Data exfiltration confirmed.
+- If the response body contains JSON with user records, emails, or PII → "malicious" + "deny". Data breach confirmed.
+
+DOWNGRADE RULES — when to REDUCE severity:
+- Generic HTML page (framework welcome page, admin login, redirect landing) → "recon_failed" + "suppress"
+- Nginx default pages (302 Found, 404 Not Found, standard error HTML) → "recon_failed" + "suppress"
+- MinIO Console HTML (login page served for any unknown path) → "recon_failed" + "suppress"
+- Empty or trivial response (short UUID, "ok", status JSON) → "recon_failed" + "suppress"
+- CapRover dashboard HTML (UI app shell with static assets) → "recon_failed" + "suppress"
 
 CRITICAL: Look at the actual body content, not just the status code. The body tells the truth.`
 
