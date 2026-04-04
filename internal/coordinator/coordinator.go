@@ -145,10 +145,11 @@ type PendingAlert struct {
 // FinalizedOutcome is a tombstone left in the graveyard after an investigation
 // completes. Late-arriving siblings check this before creating new investigations.
 type FinalizedOutcome struct {
-	Outcome    string    // "alerted", "downgraded", "suppressed", "evicted"
-	Reason     string    // downgrade reason or alert reason
-	FinalizedAt time.Time
-	EventCount int       // how many events were in the original investigation
+	Outcome       string    // "alerted", "downgraded", "suppressed", "evicted", "escalated"
+	Reason        string    // downgrade reason or alert reason
+	FinalizedAt   time.Time
+	EventCount    int       // how many events were in the original investigation
+	EvidenceBased bool      // true if downgrade was based on response body evidence
 }
 
 // Coordinator manages pending alert investigations and the graveyard.
@@ -247,10 +248,26 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 
 	// --- Check 2: Graveyard — was this recently finalized? ---
 	if tomb, ok := c.graveyard[key]; ok {
-		log.Printf("[coordinator] Late sibling suppressed via graveyard: key=%s source=%s outcome=%s original_events=%d age=%s",
-			key, alert.ScopeKey, tomb.Outcome, tomb.EventCount,
-			time.Since(tomb.FinalizedAt).Round(time.Millisecond))
-		return
+		// Evidence-based downgrades use a SHORT graveyard TTL (30 seconds).
+		// This deduplicates the nginx+backend sibling pair (arrives within seconds)
+		// but allows re-evaluation if the response body changes.
+		//
+		// WHY: If /.env was downgraded because it returned a framework page,
+		// but the app is redeployed and now /.env returns real credentials,
+		// the graveyard must NOT suppress the new (dangerous) request.
+		// 30 seconds is enough to catch siblings, short enough to re-evaluate.
+		//
+		// Non-evidence outcomes (alerted, escalated, transport downgrades)
+		// use the full 300-second TTL since they don't depend on response body.
+		if tomb.EvidenceBased && time.Since(tomb.FinalizedAt) > 30*time.Second {
+			// Evidence-based tombstone expired — allow fresh investigation
+			delete(c.graveyard, key)
+		} else {
+			log.Printf("[coordinator] Late sibling suppressed via graveyard: key=%s source=%s outcome=%s original_events=%d age=%s",
+				key, alert.ScopeKey, tomb.Outcome, tomb.EventCount,
+				time.Since(tomb.FinalizedAt).Round(time.Millisecond))
+			return
+		}
 	}
 
 	// --- Check 3: Catch-all structural inference ---
@@ -260,7 +277,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		log.Printf("[coordinator] Catch-all suppressed: key=%s host=%s status=%d bytes=%d source=%s",
 			key, alert.Host, alert.StatusCode, alert.ResponseBytes, alert.ScopeKey)
 
-		c.recordFinalized(key, "downgraded", reason, 1)
+		c.recordFinalized(key, "downgraded", reason, 1, false)
 		// Dispatch as downgraded — goes to SQLite, no email
 		go c.dispatch(FinalAlert{
 			EventID:         alert.EventID,
@@ -297,7 +314,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		if oldestKey != "" {
 			old := c.pending[oldestKey]
 			delete(c.pending, oldestKey)
-			c.recordFinalized(oldestKey, "evicted", "too many pending", old.EventCount)
+			c.recordFinalized(oldestKey, "evicted", "too many pending", old.EventCount, false)
 			go c.forceDispatch(old, "evicted from coordinator (too many pending)")
 		}
 	}
@@ -366,7 +383,7 @@ dispatch:
 	}
 	pending.Dispatched = true
 	delete(c.pending, key)
-	c.recordFinalized(key, "alerted", pending.Reason, pending.EventCount)
+	c.recordFinalized(key, "alerted", pending.Reason, pending.EventCount, false)
 	c.mu.Unlock()
 
 	c.dispatch(FinalAlert{
@@ -418,7 +435,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		pending.DowngradeReason = reason
 		pending.Dispatched = true
 		delete(c.pending, key)
-		c.recordFinalized(key, "downgraded", reason, pending.EventCount)
+		c.recordFinalized(key, "downgraded", reason, pending.EventCount, true)
 
 		log.Printf("[coordinator] Investigation resolved: DOWNGRADED key=%s events=%d reason=%s",
 			key, pending.EventCount, truncateStr(reason, 100))
@@ -463,7 +480,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		}
 		pending.Reason = reason // replace original reason with evidence-backed reason
 		delete(c.pending, key)
-		c.recordFinalized(key, "escalated", reason, pending.EventCount)
+		c.recordFinalized(key, "escalated", reason, pending.EventCount, false)
 
 		log.Printf("[coordinator] Investigation resolved: ESCALATED key=%s events=%d %s→%s reason=%s",
 			key, pending.EventCount, originalSeverity, pending.Severity, truncateStr(reason, 100))
@@ -525,12 +542,15 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 // =============================================================================
 
 // recordFinalized writes a tombstone to the graveyard. Must be called with mu held.
-func (c *Coordinator) recordFinalized(key, outcome, reason string, eventCount int) {
+// evidenceBased should be true when the downgrade was based on response body evidence —
+// these tombstones get a shorter TTL (30s) to allow re-evaluation if the body changes.
+func (c *Coordinator) recordFinalized(key, outcome, reason string, eventCount int, evidenceBased bool) {
 	c.graveyard[key] = &FinalizedOutcome{
-		Outcome:     outcome,
-		Reason:      reason,
-		FinalizedAt: time.Now(),
-		EventCount:  eventCount,
+		Outcome:       outcome,
+		Reason:        reason,
+		FinalizedAt:   time.Now(),
+		EventCount:    eventCount,
+		EvidenceBased: evidenceBased,
 	}
 }
 
@@ -546,7 +566,7 @@ func (c *Coordinator) graveyardCleanup() {
 			c.mu.Lock()
 			now := time.Now()
 			for key, tomb := range c.graveyard {
-				if now.Sub(tomb.FinalizedAt) > c.graveyardTTL {
+				if now.Sub(tomb.FinalizedAt) > c.graveyardTTL || (tomb.EvidenceBased && now.Sub(tomb.FinalizedAt) > 30*time.Second) {
 					delete(c.graveyard, key)
 				}
 			}

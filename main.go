@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -28,6 +29,16 @@ import (
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[observer] VaultGuardian Observer starting...")
+
+	// --- pprof profiling endpoint (localhost only) ---
+	// CPU:        go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+	// Memory:     go tool pprof http://localhost:6060/debug/pprof/heap
+	// Goroutines: curl http://localhost:6060/debug/pprof/goroutine?debug=2
+	go func() {
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			log.Printf("[observer] pprof server failed: %v", err)
+		}
+	}()
 
 	cfg := LoadConfig()
 
