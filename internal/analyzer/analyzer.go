@@ -34,6 +34,7 @@ type AnalysisResult struct {
 // Provided by the caller so T1, T2, and catch-all share one pool.
 type LLMScheduler interface {
 	TryAcquire() (release func(), ok bool)
+	AcquireBlocking(ctx context.Context) (release func(), ok bool)
 }
 
 // Analyzer is the core analysis pipeline.
@@ -60,19 +61,23 @@ type Stats struct {
 	NoiseSuppressed atomic.Int64 `json:"noise_suppressed"` // deterministic stack trace / framework noise
 	LLMCalls        atomic.Int64 `json:"llm_calls"`
 	LLMErrors       atomic.Int64 `json:"llm_errors"`
-	LLMDropped      atomic.Int64 `json:"llm_dropped"` // dropped due to semaphore full
+	LLMDropped      atomic.Int64 `json:"llm_dropped"` // deferred to retry queue (or dropped if queue full)
 	PatternsLearned atomic.Int64 `json:"patterns_learned"`
+	Retried         atomic.Int64 `json:"retried"`       // events classified via retry queue
+	RetriedPatternHit atomic.Int64 `json:"retried_pattern_hit"` // retries resolved by pattern store (no LLM needed)
 }
 
 // StatsSnapshot is a plain copy for logging/serialization.
 type StatsSnapshot struct {
-	TotalProcessed  int64 `json:"total_processed"`
-	PatternHits     int64 `json:"pattern_hits"`
-	NoiseSuppressed int64 `json:"noise_suppressed"`
-	LLMCalls        int64 `json:"llm_calls"`
-	LLMErrors       int64 `json:"llm_errors"`
-	LLMDropped      int64 `json:"llm_dropped"`
-	PatternsLearned int64 `json:"patterns_learned"`
+	TotalProcessed    int64 `json:"total_processed"`
+	PatternHits       int64 `json:"pattern_hits"`
+	NoiseSuppressed   int64 `json:"noise_suppressed"`
+	LLMCalls          int64 `json:"llm_calls"`
+	LLMErrors         int64 `json:"llm_errors"`
+	LLMDropped        int64 `json:"llm_dropped"`
+	PatternsLearned   int64 `json:"patterns_learned"`
+	Retried           int64 `json:"retried"`
+	RetriedPatternHit int64 `json:"retried_pattern_hit"`
 }
 
 // New creates an Analyzer with the given components.
@@ -158,19 +163,61 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// --- Step 3: Unknown → consult LLM (with backpressure) ---
 
 	// Try to acquire a slot from the global LLM scheduler.
-	// Non-blocking: if all slots are busy, skip LLM and return unknown.
-	// The line stays VerdictUnknown and will be classified on next occurrence.
+	// Non-blocking: if all slots are busy, return deferred.
+	// The pipeline will push this to a retry queue for blocking classification.
 	release, ok := a.llmScheduler.TryAcquire()
 	if !ok {
 		a.stats.LLMDropped.Add(1)
 		return AnalysisResult{
 			Event:   evt,
 			Verdict: patternstore.VerdictUnknown,
-			Reason:  "LLM concurrency limit reached",
+			Reason:  "LLM concurrency limit reached — deferred to retry queue",
 			Source:  "backpressure",
 		}
 	}
 	defer release()
+
+	return a.classifyWithLLM(ctx, evt)
+}
+
+// AnalyzeRetry is called by retry workers for events deferred due to LLM backpressure.
+// Re-checks the pattern store first (may have learned the pattern since deferral),
+// then does a BLOCKING LLM acquire if still unknown.
+func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisResult {
+	a.stats.Retried.Add(1)
+
+	// Pattern store may have learned this since we deferred
+	result := a.patterns.Match(evt.ScopeKey(), evt.Hash, evt.NormalizedLine)
+	if result != nil {
+		a.stats.PatternHits.Add(1)
+		a.stats.RetriedPatternHit.Add(1)
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: result.Verdict,
+			Tier:    result.Tier,
+			Reason:  result.Pattern.Reason,
+			Source:  result.Pattern.Source + "_retry",
+		}
+	}
+
+	// Blocking acquire — wait for a slot, this event deserves classification
+	release, ok := a.llmScheduler.AcquireBlocking(ctx)
+	if !ok {
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictUnknown,
+			Reason:  "context cancelled waiting for LLM slot",
+			Source:  "retry_cancelled",
+		}
+	}
+	defer release()
+
+	return a.classifyWithLLM(ctx, evt)
+}
+
+// classifyWithLLM runs LLM classification and pattern learning.
+// Caller must hold an LLM scheduler slot.
+func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) AnalysisResult {
 
 	a.stats.LLMCalls.Add(1)
 
@@ -363,13 +410,15 @@ func mapActionToVerdict(action string) patternstore.Verdict {
 // GetStats returns a snapshot of current pipeline statistics.
 func (a *Analyzer) GetStats() StatsSnapshot {
 	return StatsSnapshot{
-		TotalProcessed:  a.stats.TotalProcessed.Load(),
-		PatternHits:     a.stats.PatternHits.Load(),
-		NoiseSuppressed: a.stats.NoiseSuppressed.Load(),
-		LLMCalls:        a.stats.LLMCalls.Load(),
-		LLMErrors:       a.stats.LLMErrors.Load(),
-		LLMDropped:      a.stats.LLMDropped.Load(),
-		PatternsLearned: a.stats.PatternsLearned.Load(),
+		TotalProcessed:    a.stats.TotalProcessed.Load(),
+		PatternHits:       a.stats.PatternHits.Load(),
+		NoiseSuppressed:   a.stats.NoiseSuppressed.Load(),
+		LLMCalls:          a.stats.LLMCalls.Load(),
+		LLMErrors:         a.stats.LLMErrors.Load(),
+		LLMDropped:        a.stats.LLMDropped.Load(),
+		PatternsLearned:   a.stats.PatternsLearned.Load(),
+		Retried:           a.stats.Retried.Load(),
+		RetriedPatternHit: a.stats.RetriedPatternHit.Load(),
 	}
 }
 

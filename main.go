@@ -172,9 +172,6 @@ func main() {
 	// ------- Seed verified catch-alls from database -------
 	seedCatchAllsFromDB(db, alertCoordinator)
 
-	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, &pipelineDrops)
-
 	// ------- Ingestion Pipeline -------
 	// Decouples watcher goroutines from the analysis pipeline.
 	// code review code review (April 2026): synchronous ingestion means watcher
@@ -184,7 +181,15 @@ func main() {
 	const pipelineBufferSize = 1000
 	pipeline := make(chan watcher.LogLine, pipelineBufferSize)
 
-	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db)
+	// Retry queue for deferred Tier 1 classifications.
+	// When LLM slots are full, events land here instead of being dropped.
+	// Retry workers do blocking acquire — events may be delayed, never lost.
+	// code review + the team consensus: "Observer may delay, but should not abandon."
+	const retryQueueSize = 500
+	retryQueue := make(chan *retryEvent, retryQueueSize)
+	var retryQueueDrops atomic.Int64
+
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db, retryQueue, &retryQueueDrops)
 
 	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
 	numWorkers := cfg.MaxConcurrentLLM * 2
@@ -198,8 +203,140 @@ func main() {
 			}
 		}()
 	}
-	log.Printf("[observer] Pipeline ready: buffer=%d workers=%d llm_slots=%d",
-		pipelineBufferSize, numWorkers, cfg.MaxConcurrentLLM)
+
+	// Retry workers: drain deferred events with blocking LLM acquire.
+	// Fewer than primary workers — retries are background, not latency-sensitive.
+	numRetryWorkers := 2
+	for i := 0; i < numRetryWorkers; i++ {
+		go func() {
+			for item := range retryQueue {
+				result := a.AnalyzeRetry(ctx, item.evt)
+
+				// Record LLM decision if one was made
+				if result.Source == "llm" && result.LLMVerdict != nil {
+					v := result.LLMVerdict
+					db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+						EventID:          item.evt.ID,
+						Timestamp:        item.evt.Timestamp,
+						Tier:             "classify_retry",
+						Model:            cfg.LLMModel,
+						ReasoningEffort:  cfg.Tier1Effort,
+						PromptTokens:     v.PromptTokens,
+						CompletionTokens: v.CompletionTokens,
+						LatencyMs:        v.LatencyMs,
+						SourceScope:      item.evt.ScopeKey(),
+						RawLine:          item.evt.Line,
+						NormalizedLine:   item.evt.NormalizedLine,
+						NormalizedHash:   item.evt.Hash,
+						LLMResponseRaw:   v.ResponseRaw,
+						Classification:   v.Classification,
+						Action:           v.Action,
+						Confidence:       v.Confidence,
+						Reason:           v.Reason,
+						PatternType:      v.PatternType,
+						PatternValue:     v.Pattern,
+						SourceHint:       v.SourceHint,
+						PatternLearned:   result.LLMPatternLearned,
+						PatternBucket:    v.Action,
+						CacheKey:         v.Pattern,
+						FinalVerdict:     string(result.Verdict),
+					})
+				}
+
+				// Process result — same routing as primary pipeline
+				switch result.Verdict {
+				case patternstore.VerdictAllow, patternstore.VerdictSuppress:
+					// Done — pattern learned or noise confirmed
+				case patternstore.VerdictDeny, patternstore.VerdictAlert:
+					method, path, host, statusCode := parseNormalizedLine(item.evt.NormalizedLine)
+					isHTTP := method != ""
+
+					if result.LLMClassification == "recon_success" || result.LLMClassification == "recon_failed" {
+						db.RecordFinding(context.Background(), &store.Finding{
+							EventID:        item.evt.ID,
+							Timestamp:      item.evt.Timestamp,
+							SourceType:     string(item.evt.SourceType),
+							SourceName:     item.evt.SourceName,
+							DestHost:       host,
+							HTTPMethod:     method,
+							HTTPPath:       path,
+							HTTPStatus:     statusCode,
+							Verdict:        "recon",
+							Classification: result.LLMClassification,
+							Confidence:     result.LLMConfidence,
+							Reason:         result.Reason,
+							MatchedVia:     result.Source,
+							RawLine:        item.evt.Line,
+							NormalizedLine: item.evt.NormalizedLine,
+							NormalizedHash: item.evt.Hash,
+							Notified:       false,
+						})
+						continue
+					}
+
+					severity := "malicious"
+					notifSeverity := notifier.SeverityMalicious
+					if result.Verdict == patternstore.VerdictAlert {
+						severity = "suspicious"
+						notifSeverity = notifier.SeveritySuspicious
+					}
+
+					if isHTTP && collector.Enabled() {
+						correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
+						alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
+							EventID:        item.evt.ID,
+							ScopeKey:       item.evt.ScopeKey(),
+							Reason:         result.Reason,
+							MatchedVia:     result.Source,
+							Hash:           item.evt.Hash,
+							Line:           item.evt.Line,
+							Verdict:        string(result.Verdict),
+							Severity:       severity,
+							Classification: result.LLMClassification,
+							Host:           host,
+							StatusCode:     statusCode,
+							HTTPMethod:     method,
+							HTTPPath:       path,
+							NormalizedLine: item.evt.NormalizedLine,
+							SourceName:     item.evt.SourceName,
+							Timestamp:      item.evt.Timestamp,
+							BuildAlert: func() interface{} {
+								evidence := collector.Lookup(rec.LookupRequest{
+									Method:          method,
+									Path:            path,
+									SourceContainer: item.evt.SourceName,
+									StatusCode:      statusCode,
+									Timestamp:       item.evt.Timestamp,
+									Window:          5 * time.Second,
+									ExpectedBytes:   extractResponseBytes(item.evt.Line),
+								})
+								return notifier.Alert{
+									EventID:        item.evt.ID,
+									Severity:       notifSeverity,
+									ContainerID:    item.line.ContainerID,
+									ContainerName:  item.line.ContainerName,
+									LogLine:        item.evt.Line,
+									NormalizedHash: item.evt.Hash,
+									Reason:         result.Reason,
+									MatchedVia:     result.Source,
+									Classification: result.LLMClassification,
+									Confidence:     result.LLMConfidence,
+									Timestamp:      item.evt.Timestamp,
+									Evidence:       evidence,
+								}
+							},
+						})
+					}
+				}
+			}
+		}()
+	}
+
+	log.Printf("[observer] Pipeline ready: buffer=%d workers=%d retry_queue=%d retry_workers=%d llm_slots=%d",
+		pipelineBufferSize, numWorkers, retryQueueSize, numRetryWorkers, cfg.MaxConcurrentLLM)
+
+	// ------- Periodic persistence + stats -------
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, &pipelineDrops, &retryQueueDrops)
 
 	// Ingestion handler: lightweight, just pushes to channel.
 	// Non-blocking: if pipeline is full, drop the line rather than stall the watcher.
@@ -826,6 +963,12 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 // =============================================================================
 
 // makeLogHandler creates the core pipeline handler that processes each log line.
+// retryEvent holds a deferred event for the retry queue.
+type retryEvent struct {
+	evt  *event.Event
+	line watcher.LogLine
+}
+
 func makeLogHandler(
 	cfg Config,
 	a *analyzer.Analyzer,
@@ -833,6 +976,8 @@ func makeLogHandler(
 	alertCoordinator *coordinator.Coordinator,
 	dispatch *notifier.Dispatcher,
 	db *store.Store,
+	retryQueue chan *retryEvent,
+	retryQueueDrops *atomic.Int64,
 ) watcher.LogHandler {
 	return func(line watcher.LogLine) {
 		if cfg.ExcludeContainers[line.ContainerName] {
@@ -861,6 +1006,20 @@ func makeLogHandler(
 		}
 
 		result := a.Analyze(context.Background(), evt)
+
+		// Deferred classification: LLM was busy, push to retry queue.
+		// Retry workers will do a blocking acquire and classify later.
+		// Much better than dropping — one-off attacks still get classified.
+		if result.Source == "backpressure" {
+			select {
+			case retryQueue <- &retryEvent{evt: evt, line: line}:
+				log.Printf("[observer] Deferred to retry queue: %s %s", evt.ScopeKey(), truncate(evt.NormalizedLine, 80))
+			default:
+				retryQueueDrops.Add(1)
+				log.Println("[observer] WARNING: retry queue full — truly dropping unknown event")
+			}
+			return
+		}
 
 		// Record LLM decision to audit trail (Tier 1: classification)
 		if result.Source == "llm" && result.LLMVerdict != nil {
@@ -1035,7 +1194,7 @@ func makeLogHandler(
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, pipelineDrops *atomic.Int64) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -1056,8 +1215,10 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			pStats := patterns.GetStats()
 			llmTotal, llmDropped := scheduler.Stats()
 			drops := pipelineDrops.Load()
-			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d",
-				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned, llmTotal, llmDropped, drops)
+			retryDrops := retryQueueDrops.Load()
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d",
+				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned,
+				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops)
 			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 				pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
