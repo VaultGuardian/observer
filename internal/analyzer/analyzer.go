@@ -30,6 +30,12 @@ type AnalysisResult struct {
 	LLMVerdict        *llm.Verdict `json:"-"` // full verdict with call metadata for audit trail
 }
 
+// LLMScheduler controls concurrent LLM access across all tiers.
+// Provided by the caller so T1, T2, and catch-all share one pool.
+type LLMScheduler interface {
+	TryAcquire() (release func(), ok bool)
+}
+
 // Analyzer is the core analysis pipeline.
 // It orchestrates: normalize → pattern match → LLM classify → learn.
 type Analyzer struct {
@@ -38,9 +44,9 @@ type Analyzer struct {
 	llmClient   *llm.Client
 	hints       *normalizer.HintCollector
 
-	// llmSem limits concurrent LLM calls to prevent flooding the
-	// inference server when a burst of unknown logs arrives (e.g. startup).
-	llmSem chan struct{}
+	// llmScheduler limits concurrent LLM calls globally.
+	// Shared with T2 evidence and catch-all verification paths.
+	llmScheduler LLMScheduler
 
 	// stats uses atomic counters — safe for concurrent goroutines.
 	stats Stats
@@ -70,18 +76,14 @@ type StatsSnapshot struct {
 }
 
 // New creates an Analyzer with the given components.
-// maxConcurrentLLM controls how many LLM calls can run in parallel.
-// Recommended: 2-4 for local Ollama, 10+ for cloud APIs.
-func New(normalizers *normalizer.Registry, patterns *patternstore.Store, llmClient *llm.Client, maxConcurrentLLM int) *Analyzer {
-	if maxConcurrentLLM < 1 {
-		maxConcurrentLLM = 2
-	}
+// The scheduler controls global LLM concurrency across all tiers.
+func New(normalizers *normalizer.Registry, patterns *patternstore.Store, llmClient *llm.Client, scheduler LLMScheduler) *Analyzer {
 	return &Analyzer{
-		normalizers: normalizers,
-		patterns:    patterns,
-		llmClient:   llmClient,
-		hints:       normalizer.NewHintCollector(),
-		llmSem:      make(chan struct{}, maxConcurrentLLM),
+		normalizers:  normalizers,
+		patterns:     patterns,
+		llmClient:    llmClient,
+		hints:        normalizer.NewHintCollector(),
+		llmScheduler: scheduler,
 	}
 }
 
@@ -155,14 +157,11 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 
 	// --- Step 3: Unknown → consult LLM (with backpressure) ---
 
-	// Try to acquire semaphore. If full, don't block — log as unknown.
-	// This prevents 30 startup logs from creating 30 concurrent LLM calls.
-	select {
-	case a.llmSem <- struct{}{}:
-		// Acquired slot
-		defer func() { <-a.llmSem }()
-	default:
-		// Semaphore full — skip LLM, return unknown
+	// Try to acquire a slot from the global LLM scheduler.
+	// Non-blocking: if all slots are busy, skip LLM and return unknown.
+	// The line stays VerdictUnknown and will be classified on next occurrence.
+	release, ok := a.llmScheduler.TryAcquire()
+	if !ok {
 		a.stats.LLMDropped.Add(1)
 		return AnalysisResult{
 			Event:   evt,
@@ -171,6 +170,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 			Source:  "backpressure",
 		}
 	}
+	defer release()
 
 	a.stats.LLMCalls.Add(1)
 

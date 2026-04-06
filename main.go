@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,11 @@ import (
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// Pipeline drop counter — tracked as first-class metric, not just a warning log.
+	// code review review: "under pressure you can silently lose security-relevant events
+	// unless you track and expose this as a first-class metric."
+	var pipelineDrops atomic.Int64
 	log.Println("[observer] VaultGuardian Observer starting...")
 
 	// --- pprof profiling endpoint (localhost only) ---
@@ -66,7 +72,13 @@ func main() {
 	defer db.Close()
 
 	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey, cfg.Tier1Effort, cfg.Tier2Effort)
-	a := analyzer.New(normReg, patterns, llmClient, cfg.MaxConcurrentLLM)
+
+	// Global LLM scheduler — shared across T1 classify, T2 evidence, catch-all verify.
+	// code review code review (April 2026): without unified scheduling, T2 and catch-all
+	// calls run unbounded while T1 is throttled. One scheduler, three acquire modes.
+	llmScheduler := NewLLMScheduler(cfg.MaxConcurrentLLM)
+
+	a := analyzer.New(normReg, patterns, llmClient, llmScheduler)
 	log.Println("[observer] Analyzer pipeline ready")
 
 	notifCfg, err := notifier.LoadConfig(cfg.DataDir)
@@ -152,8 +164,8 @@ func main() {
 		ctx,
 		coordinator.DefaultConfig(),
 		makeDispatchCallback(dispatch, db),
-		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, ctx),
-		makeVerifyCallback(db, llmClient, selfSuppress, cfg, ctx),
+		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, llmScheduler, ctx),
+		makeVerifyCallback(db, llmClient, selfSuppress, cfg, llmScheduler, ctx),
 		selfSuppress,
 	)
 
@@ -161,13 +173,47 @@ func main() {
 	seedCatchAllsFromDB(db, alertCoordinator)
 
 	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator)
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, &pipelineDrops)
 
-	// ------- Log handler -------
-	handler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db)
+	// ------- Ingestion Pipeline -------
+	// Decouples watcher goroutines from the analysis pipeline.
+	// code review code review (April 2026): synchronous ingestion means watcher
+	// throughput is coupled to LLM call latency. A burst of unknown lines
+	// stalls the per-container stream. Bounded channel provides backpressure
+	// without blocking the watcher.
+	const pipelineBufferSize = 1000
+	pipeline := make(chan watcher.LogLine, pipelineBufferSize)
+
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db)
+
+	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
+	numWorkers := cfg.MaxConcurrentLLM * 2
+	if numWorkers < 4 {
+		numWorkers = 4
+	}
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for line := range pipeline {
+				pipelineHandler(line)
+			}
+		}()
+	}
+	log.Printf("[observer] Pipeline ready: buffer=%d workers=%d llm_slots=%d",
+		pipelineBufferSize, numWorkers, cfg.MaxConcurrentLLM)
+
+	// Ingestion handler: lightweight, just pushes to channel.
+	// Non-blocking: if pipeline is full, drop the line rather than stall the watcher.
+	ingestionHandler := func(line watcher.LogLine) {
+		select {
+		case pipeline <- line:
+		default:
+			pipelineDrops.Add(1)
+			log.Println("[observer] WARNING: pipeline full — dropping log line")
+		}
+	}
 
 	// ------- Start watching -------
-	w := watcher.New(cfg.DockerSocket, handler)
+	w := watcher.New(cfg.DockerSocket, ingestionHandler)
 	w.SetSelfID(cfg.SelfID)
 
 	log.Println("[observer] Starting container log watcher...")
@@ -336,6 +382,7 @@ func makeEvidenceCheckCallback(
 	cache *reclassCache,
 	db *store.Store,
 	cfg Config,
+	scheduler *LLMScheduler,
 	ctx context.Context,
 ) coordinator.EvidenceCheckFunc {
 	// Status codes where transport alone proves the attack failed.
@@ -447,7 +494,12 @@ func makeEvidenceCheckCallback(
 			return cached.downgraded, cached.escalated, cached.reason, cached.newSeverity
 		}
 
-		// Cache miss — call LLM
+		// Cache miss — call LLM (blocking acquire: T2 evidence is high priority)
+		release, ok := scheduler.AcquireBlocking(ctx)
+		if !ok {
+			log.Printf("[reclassify] Context cancelled waiting for LLM slot")
+			return false, false, "", ""
+		}
 		reclass, err := llmClient.ReclassifyWithEvidence(
 			ctx,
 			classification,
@@ -458,6 +510,7 @@ func makeEvidenceCheckCallback(
 			evidence.Transport.ContentLength,
 			evidence.SafeBodyPreview,
 		)
+		release() // free LLM slot immediately after call completes
 		if err != nil {
 			log.Printf("[reclassify] Error: %v — not changing verdict", err)
 			return false, false, "", ""
@@ -531,6 +584,7 @@ func makeVerifyCallback(
 	llmClient *llm.Client,
 	selfSuppress *coordinator.SelfSuppressor,
 	cfg Config,
+	scheduler *LLMScheduler,
 	ctx context.Context,
 ) coordinator.VerifyFunc {
 
@@ -577,7 +631,12 @@ func makeVerifyCallback(
 		}
 
 		for _, s := range schemes {
-			url := fmt.Sprintf("%s://%s%s", s.scheme, fp.Host, path)
+			// SECURITY: Always verify through localhost — never use attacker-controlled
+			// host as network destination. nginx routes based on Host header, so we
+			// connect to 127.0.0.1 and set Host to the observed value.
+			// Without this, an attacker who sends requests with a custom Host header
+			// could trick Observer into making outbound requests to arbitrary servers (SSRF).
+			url := fmt.Sprintf("%s://127.0.0.1%s", s.scheme, path)
 
 			httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 			if err != nil {
@@ -640,6 +699,14 @@ func makeVerifyCallback(
 			}
 
 			// Ask LLM: is this response benign?
+			// Blocking acquire: catch-all verify fires once per fingerprint LIFETIME
+			// (~3-5/week). If we drop it, the fingerprint is permanently rejected
+			// with no retry mechanism. Worth waiting for a slot.
+			release, ok := scheduler.AcquireBlocking(ctx)
+			if !ok {
+				log.Printf("[verify] Context cancelled waiting for LLM slot")
+				return &coordinator.VerifyResult{Confirmed: false, Reason: "context cancelled"}
+			}
 			reclass, err := llmClient.ReclassifyWithEvidence(
 				ctx,
 				"suspicious",                    // original classification
@@ -650,6 +717,7 @@ func makeVerifyCallback(
 				bodyLen,
 				safePreview,
 			)
+			release() // free LLM slot immediately
 			if err != nil {
 				log.Printf("[verify] LLM error: %v — not confirming", err)
 				return &coordinator.VerifyResult{Confirmed: false, Reason: fmt.Sprintf("LLM error: %v", err)}
@@ -780,12 +848,13 @@ func makeLogHandler(
 		}
 
 		evt := &event.Event{
-			ID:         event.NewID(),
-			SourceType: event.SourceDocker,
-			SourceName: line.ContainerName,
-			Line:       line.Line,
-			Stream:     line.Stream,
-			Timestamp:  line.Timestamp,
+			ID:          event.NewID(),
+			SourceType:  event.SourceDocker,
+			SourceName:  line.ContainerName,
+			Line:        line.Line,
+			Stream:      line.Stream,
+			Timestamp:   line.Timestamp,
+			ProcessedAt: time.Now(),
 			Metadata: map[string]string{
 				"container_id": line.ContainerID,
 			},
@@ -966,7 +1035,7 @@ func makeLogHandler(
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, pipelineDrops *atomic.Int64) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -985,8 +1054,10 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			}
 			aStats := a.GetStats()
 			pStats := patterns.GetStats()
-			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d",
-				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned)
+			llmTotal, llmDropped := scheduler.Stats()
+			drops := pipelineDrops.Load()
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d",
+				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned, llmTotal, llmDropped, drops)
 			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 				pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)

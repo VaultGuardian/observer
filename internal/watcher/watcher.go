@@ -161,12 +161,26 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 			continue
 		}
 
+		// Parse Docker timestamp from log line.
+		// Docker API with timestamps=true prepends RFC3339Nano:
+		//   "2026-04-06T16:46:30.916575123Z actual log content"
+		// Parse it for accurate event timing. Keep full line intact —
+		// the normalizer already strips the timestamp prefix downstream.
+		emittedAt := time.Now() // fallback if parsing fails
+		if len(line) > 30 && line[4] == '-' && line[7] == '-' && line[10] == 'T' {
+			if spaceIdx := strings.IndexByte(line, ' '); spaceIdx > 0 && spaceIdx < 40 {
+				if ts, err := time.Parse(time.RFC3339Nano, line[:spaceIdx]); err == nil {
+					emittedAt = ts
+				}
+			}
+		}
+
 		w.handler(LogLine{
 			ContainerID:   c.ID,
 			ContainerName: name,
 			Line:          line,
 			Stream:        streamType,
-			Timestamp:     time.Now(),
+			Timestamp:     emittedAt,
 		})
 	}
 }

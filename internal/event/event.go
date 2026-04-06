@@ -48,8 +48,15 @@ type Event struct {
 	// Stream distinguishes output channels: "stdout", "stderr", "journal", etc.
 	Stream string `json:"stream,omitempty"`
 
-	// Timestamp is when the event was received by the collector.
+	// Timestamp is when the log line was emitted by the source.
+	// For Docker: parsed from the Docker multiplexed stream timestamp.
+	// For journald: parsed from the journal entry timestamp.
+	// Falls back to time.Now() if the source timestamp can't be parsed.
 	Timestamp time.Time `json:"timestamp"`
+
+	// ProcessedAt is when Observer received and began processing this event.
+	// Use this for pipeline latency measurement. Use Timestamp for correlation.
+	ProcessedAt time.Time `json:"processed_at"`
 
 	// Metadata holds source-specific extras that don't warrant top-level fields yet.
 	// Examples: "container_id", "image", "pid", "uid", "unit_instance"
