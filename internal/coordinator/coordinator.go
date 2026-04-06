@@ -93,6 +93,9 @@ type FinalAlert struct {
 	// All events that joined this investigation
 	EventCount     int
 
+	// Event timestamp (emitted by source, not processing time)
+	Timestamp      time.Time
+
 	// For the dispatch function to use
 	BuildAlert     func() interface{} // returns notifier.Alert — kept as interface to avoid import cycle
 }
@@ -296,6 +299,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 			Downgraded:      true,
 			DowngradeReason: reason,
 			EventCount:      1,
+			Timestamp:       alert.Timestamp,
 			BuildAlert:      alert.BuildAlert,
 		})
 		return
@@ -404,6 +408,7 @@ dispatch:
 		Evidence:        pending.EvidenceResult,
 		Downgraded:      false,
 		EventCount:      pending.EventCount,
+		Timestamp:       pending.Timestamp,
 		BuildAlert:      pending.BuildAlert,
 	})
 }
@@ -459,6 +464,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			Downgraded:      true,
 			DowngradeReason: reason,
 			EventCount:      pending.EventCount,
+			Timestamp:       pending.Timestamp,
 			BuildAlert:      pending.BuildAlert,
 		})
 
@@ -504,6 +510,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			Escalated:       true,
 			EscalateReason:  reason,
 			EventCount:      pending.EventCount,
+			Timestamp:       pending.Timestamp,
 			BuildAlert:      pending.BuildAlert,
 		})
 
@@ -533,6 +540,7 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		EventCount:      pending.EventCount,
+		Timestamp:       pending.Timestamp,
 		BuildAlert:      pending.BuildAlert,
 	})
 }

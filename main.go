@@ -249,7 +249,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			// Record downgraded finding to SQLite
 			db.RecordFinding(context.Background(), &store.Finding{
 				EventID:         alert.EventID,
-				Timestamp:       time.Now(),
+				Timestamp:       alert.Timestamp,
 				SourceType:      "docker",
 				SourceName:      alert.ScopeKey,
 				DestHost:        alert.Host,
@@ -292,7 +292,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			// Record escalated finding to SQLite
 			db.RecordFinding(context.Background(), &store.Finding{
 				EventID:           alert.EventID,
-				Timestamp:         time.Now(),
+				Timestamp:         alert.Timestamp,
 				SourceType:        "docker",
 				SourceName:        alert.ScopeKey,
 				DestHost:          alert.Host,
@@ -331,7 +331,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 		// Record finding to SQLite (not notified — review on dashboard)
 		db.RecordFinding(context.Background(), &store.Finding{
 			EventID:         alert.EventID,
-			Timestamp:       time.Now(),
+			Timestamp:       alert.Timestamp,
 			SourceType:      "docker",
 			SourceName:      alert.ScopeKey,
 			DestHost:        alert.Host,

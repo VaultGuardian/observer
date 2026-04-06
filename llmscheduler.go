@@ -32,7 +32,7 @@ import (
 // LLMScheduler controls concurrent access to the LLM inference server.
 type LLMScheduler struct {
 	sem     chan struct{}
-	dropped atomic.Int64 // T1/catch-all calls dropped due to full semaphore
+	dropped atomic.Int64 // T1 classify calls dropped due to full semaphore
 	total   atomic.Int64 // total calls (all tiers)
 }
 
@@ -60,7 +60,7 @@ func (s *LLMScheduler) AcquireBlocking(ctx context.Context) (release func(), ok 
 }
 
 // TryAcquire attempts to get a slot without blocking.
-// Use for Tier 1 classification and catch-all verification.
+// Use for Tier 1 classification where dropping is safe (line stays VerdictUnknown).
 // Returns (release, true) on success, (nil, false) if full.
 func (s *LLMScheduler) TryAcquire() (release func(), ok bool) {
 	select {
