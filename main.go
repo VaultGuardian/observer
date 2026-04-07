@@ -251,7 +251,7 @@ func main() {
 					method, path, host, statusCode := parseNormalizedLine(item.evt.NormalizedLine)
 					isHTTP := method != ""
 
-					if result.LLMClassification == "recon_success" || result.LLMClassification == "recon_failed" {
+					if result.LLMClassification == "recon_failed" {
 						db.RecordFinding(context.Background(), &store.Finding{
 							EventID:        item.evt.ID,
 							Timestamp:      item.evt.Timestamp,
@@ -1078,10 +1078,11 @@ func makeLogHandler(
 			isHTTP := method != ""
 
 			// --- Recon routing: log + store, no email ---
-			// Reconnaissance (successful or failed) is telemetry, not an alert.
-			// Record it to SQLite for trend analysis and dashboard queries.
-			// No email, no coordinator, no notification.
-			if result.LLMClassification == "recon_success" || result.LLMClassification == "recon_failed" {
+			// recon_failed = probe found nothing. Telemetry only.
+			// recon_success = probe got a 200. Must flow through coordinator
+			// for evidence check — if the response contains credentials,
+			// T2 reclassify will escalate to malicious and send email.
+			if result.LLMClassification == "recon_failed" {
 				log.Printf("[RECON] EventID=%s Source=%s Classification=%s Reason=%s MatchedVia=%s Line=%s",
 					evt.ID, evt.ScopeKey(), result.LLMClassification, result.Reason, result.Source,
 					truncate(evt.Line, 200))
