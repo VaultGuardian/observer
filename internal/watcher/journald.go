@@ -54,6 +54,7 @@ var defaultNoiseUnits = map[string]bool{
 	"irqbalance":          true, // IRQ balancing
 	"fwupd":               true, // Firmware update daemon
 	"thermald":            true, // Thermal management
+	"observer":            true, // ourselves — prevent feedback loop
 }
 
 // JournaldWatcher streams entries from systemd journal via journalctl subprocess.
