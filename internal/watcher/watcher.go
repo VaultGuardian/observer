@@ -22,13 +22,21 @@ type Container struct {
 	Image string   `json:"Image"`
 }
 
-// LogLine is a raw log line received from a container.
+// LogLine is a raw log line received from any collector.
 type LogLine struct {
+	// Docker fields (populated by Docker watcher)
 	ContainerID   string
 	ContainerName string
-	Line          string
-	Stream        string // "stdout" or "stderr"
-	Timestamp     time.Time
+
+	// Generic source identity (populated by journald and future watchers).
+	// When set, these override ContainerName/SourceDocker in event creation.
+	SourceType string            // "docker", "journal", "file", etc.
+	SourceName string            // container name, unit name, file path, etc.
+	Metadata   map[string]string // source-specific extras (unit, pid, priority, etc.)
+
+	Line      string
+	Stream    string // "stdout", "stderr", "journal", "kernel", etc.
+	Timestamp time.Time
 }
 
 // LogHandler is called for each log line received.

@@ -28,6 +28,10 @@ type Config struct {
 	// LLM concurrency
 	MaxConcurrentLLM int
 
+	// Journald watcher
+	JournaldEnabled bool
+	ExcludeUnits    map[string]bool
+
 	// LLM reasoning effort per tier
 	Tier1Effort string // "low", "medium", "high" — default "low"
 	Tier2Effort string // "low", "medium", "high" — default "medium"
@@ -83,6 +87,19 @@ func LoadConfig() Config {
 		} else {
 			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q — using auto-detect", portStr)
 		}
+	}
+
+	// Journald watcher
+	cfg.JournaldEnabled = getEnv("JOURNALD_ENABLED", "") == "true"
+	cfg.ExcludeUnits = make(map[string]bool)
+	if raw := getEnv("JOURNALD_EXCLUDE_UNITS", ""); raw != "" {
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				cfg.ExcludeUnits[name] = true
+			}
+		}
+		log.Printf("[observer] Additional journald exclude units: %s", raw)
 	}
 
 	return cfg

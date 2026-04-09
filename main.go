@@ -286,6 +286,7 @@ func main() {
 						alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
 							EventID:        item.evt.ID,
 							ScopeKey:       item.evt.ScopeKey(),
+							SourceType:     item.evt.SourceType,
 							Reason:         result.Reason,
 							MatchedVia:     result.Source,
 							Hash:           item.evt.Hash,
@@ -350,13 +351,36 @@ func main() {
 	}
 
 	// ------- Start watching -------
-	w := watcher.New(cfg.DockerSocket, ingestionHandler)
-	w.SetSelfID(cfg.SelfID)
 
-	log.Println("[observer] Starting container log watcher...")
-	if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatalf("[observer] Watcher error: %v", err)
+	// Docker watcher: only start if the socket exists.
+	// Runs in a goroutine so journald watcher can run concurrently.
+	if _, err := os.Stat(cfg.DockerSocket); err == nil {
+		w := watcher.New(cfg.DockerSocket, ingestionHandler)
+		w.SetSelfID(cfg.SelfID)
+		go func() {
+			log.Println("[observer] Starting container log watcher...")
+			if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("[observer] Docker watcher error: %v", err)
+			}
+		}()
+	} else {
+		log.Printf("[observer] Docker socket %s not found — skipping container watcher", cfg.DockerSocket)
 	}
+
+	// Journald watcher: streams sshd, systemd, kernel logs from the system journal.
+	// Pushes into the same pipeline channel as Docker — same workers, same LLM, same pattern store.
+	if cfg.JournaldEnabled {
+		jw := watcher.NewJournaldWatcher(ingestionHandler, cfg.ExcludeUnits)
+		go func() {
+			log.Println("[observer] Starting journald watcher...")
+			if err := jw.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("[observer] Journald watcher error: %v", err)
+			}
+		}()
+	}
+
+	// Block until shutdown signal.
+	<-ctx.Done()
 
 	// ------- Shutdown -------
 	if err := a.Persist(); err != nil {
@@ -387,7 +411,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			db.RecordFinding(context.Background(), &store.Finding{
 				EventID:         alert.EventID,
 				Timestamp:       alert.Timestamp,
-				SourceType:      "docker",
+				SourceType:      alert.SourceType,
 				SourceName:      alert.ScopeKey,
 				DestHost:        alert.Host,
 				HTTPMethod:      alert.HTTPMethod,
@@ -430,7 +454,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			db.RecordFinding(context.Background(), &store.Finding{
 				EventID:           alert.EventID,
 				Timestamp:         alert.Timestamp,
-				SourceType:        "docker",
+				SourceType:        alert.SourceType,
 				SourceName:        alert.ScopeKey,
 				DestHost:          alert.Host,
 				HTTPMethod:        alert.HTTPMethod,
@@ -469,7 +493,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 		db.RecordFinding(context.Background(), &store.Finding{
 			EventID:         alert.EventID,
 			Timestamp:       alert.Timestamp,
-			SourceType:      "docker",
+			SourceType:      alert.SourceType,
 			SourceName:      alert.ScopeKey,
 			DestHost:        alert.Host,
 			HTTPMethod:      alert.HTTPMethod,
@@ -992,17 +1016,29 @@ func makeLogHandler(
 			return
 		}
 
+		// Resolve source identity. Journald and future watchers set
+		// SourceType/SourceName directly. Docker watcher uses the legacy
+		// ContainerID/ContainerName fields.
+		sourceType := line.SourceType
+		sourceName := line.SourceName
+		metadata := line.Metadata
+		if sourceType == "" {
+			sourceType = event.SourceDocker
+			sourceName = line.ContainerName
+			metadata = map[string]string{
+				"container_id": line.ContainerID,
+			}
+		}
+
 		evt := &event.Event{
 			ID:          event.NewID(),
-			SourceType:  event.SourceDocker,
-			SourceName:  line.ContainerName,
+			SourceType:  sourceType,
+			SourceName:  sourceName,
 			Line:        line.Line,
 			Stream:      line.Stream,
 			Timestamp:   line.Timestamp,
 			ProcessedAt: time.Now(),
-			Metadata: map[string]string{
-				"container_id": line.ContainerID,
-			},
+			Metadata:    metadata,
 		}
 
 		result := a.Analyze(context.Background(), evt)
@@ -1135,6 +1171,7 @@ func makeLogHandler(
 				alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
 					EventID:        evt.ID,
 					ScopeKey:       evt.ScopeKey(),
+					SourceType:     evt.SourceType,
 					Reason:         result.Reason,
 					MatchedVia:     result.Source,
 					Hash:           evt.Hash,

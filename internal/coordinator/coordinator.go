@@ -66,6 +66,7 @@ type FinalAlert struct {
 	// The primary event that triggered the investigation
 	EventID       string
 	ScopeKey      string
+	SourceType    string // "docker", "journal", etc. — for findings recording
 	Reason        string
 	MatchedVia    string
 	Hash          string
@@ -108,6 +109,7 @@ type PendingAlert struct {
 	// Primary event info (from the first log that triggered)
 	EventID        string
 	ScopeKey       string
+	SourceType     string // "docker", "journal", etc.
 	Reason         string
 	MatchedVia     string
 	Hash           string
@@ -285,6 +287,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		go c.dispatch(FinalAlert{
 			EventID:         alert.EventID,
 			ScopeKey:        alert.ScopeKey,
+			SourceType:      alert.SourceType,
 			Reason:          alert.Reason,
 			MatchedVia:      alert.MatchedVia,
 			Hash:            alert.Hash,
@@ -393,6 +396,7 @@ dispatch:
 	c.dispatch(FinalAlert{
 		EventID:         pending.EventID,
 		ScopeKey:        pending.ScopeKey,
+		SourceType:      pending.SourceType,
 		Reason:          pending.Reason,
 		MatchedVia:      pending.MatchedVia,
 		Hash:            pending.Hash,
@@ -448,6 +452,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		c.dispatch(FinalAlert{
 			EventID:         pending.EventID,
 			ScopeKey:        pending.ScopeKey,
+		SourceType:      pending.SourceType,
 			Reason:          pending.Reason,
 			MatchedVia:      pending.MatchedVia,
 			Hash:            pending.Hash,
@@ -494,6 +499,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		c.dispatch(FinalAlert{
 			EventID:         pending.EventID,
 			ScopeKey:        pending.ScopeKey,
+		SourceType:      pending.SourceType,
 			Reason:          reason,
 			MatchedVia:      pending.MatchedVia,
 			Hash:            pending.Hash,
@@ -526,6 +532,7 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 	c.dispatch(FinalAlert{
 		EventID:         pending.EventID,
 		ScopeKey:        pending.ScopeKey,
+		SourceType:      pending.SourceType,
 		Reason:          pending.Reason,
 		MatchedVia:      pending.MatchedVia,
 		Hash:            pending.Hash,
