@@ -370,7 +370,7 @@ func main() {
 	// Journald watcher: streams sshd, systemd, kernel logs from the system journal.
 	// Pushes into the same pipeline channel as Docker — same workers, same LLM, same pattern store.
 	if cfg.JournaldEnabled {
-		jw := watcher.NewJournaldWatcher(ingestionHandler, cfg.ExcludeUnits)
+		jw := watcher.NewJournaldWatcher(ingestionHandler, cfg.ExcludeUnits, "")
 		go func() {
 			log.Println("[observer] Starting journald watcher...")
 			if err := jw.Run(ctx); err != nil && ctx.Err() == nil {

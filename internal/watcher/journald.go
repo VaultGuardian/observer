@@ -14,28 +14,34 @@ import (
 // Field names use journald's native double-underscore convention.
 type journalEntry struct {
 	// Core fields
-	Message              string `json:"MESSAGE"`
-	SyslogIdentifier     string `json:"SYSLOG_IDENTIFIER"`
-	SystemdUnit          string `json:"_SYSTEMD_UNIT"`
-	Priority             string `json:"PRIORITY"`
-	PID                  string `json:"_PID"`
-	UID                  string `json:"_UID"`
-	RealtimeTimestamp     string `json:"__REALTIME_TIMESTAMP"` // microseconds since epoch
-	MonotonicTimestamp    string `json:"__MONOTONIC_TIMESTAMP"`
+	Message           string `json:"MESSAGE"`
+	SyslogIdentifier  string `json:"SYSLOG_IDENTIFIER"`
+	SystemdUnit       string `json:"_SYSTEMD_UNIT"`
+	Priority          string `json:"PRIORITY"`
+	PID               string `json:"_PID"`
+	UID               string `json:"_UID"`
+	RealtimeTimestamp string `json:"__REALTIME_TIMESTAMP"` // microseconds since epoch
 
 	// Transport — how the message reached journald
-	Transport            string `json:"_TRANSPORT"` // "syslog", "journal", "stdout", "kernel"
+	Transport string `json:"_TRANSPORT"` // "syslog", "journal", "stdout", "kernel"
 
 	// Process info
-	Comm                 string `json:"_COMM"`
-	Exe                  string `json:"_EXE"`
-	CmdLine              string `json:"_CMDLINE"`
-	Hostname             string `json:"_HOSTNAME"`
+	Comm     string `json:"_COMM"`
+	Exe      string `json:"_EXE"`
+	CmdLine  string `json:"_CMDLINE"`
+	Hostname string `json:"_HOSTNAME"`
 }
 
 // defaultNoiseUnits are systemd units that produce high-volume, low-security-value
 // log entries. Filtering these before the pipeline saves LLM calls and pattern store space.
 // Users can override via JOURNALD_EXCLUDE_UNITS env var.
+//
+// Entries are matched case-insensitively against both _SYSTEMD_UNIT (trusted,
+// kernel-attached) and SYSLOG_IDENTIFIER (for entries without a unit, like kernel).
+//
+// SECURITY: Self-suppression (observer) uses _SYSTEMD_UNIT exclusively.
+// An attacker can spoof SYSLOG_IDENTIFIER but cannot spoof _SYSTEMD_UNIT,
+// which the kernel attaches. (the design review security mandate, 2026-04-09)
 var defaultNoiseUnits = map[string]bool{
 	"systemd-resolved":    true, // DNS resolver — constant chatter
 	"systemd-timesyncd":   true, // NTP sync — periodic, harmless
@@ -54,29 +60,40 @@ var defaultNoiseUnits = map[string]bool{
 	"irqbalance":          true, // IRQ balancing
 	"fwupd":               true, // Firmware update daemon
 	"thermald":            true, // Thermal management
-	"observer":            true, // ourselves — prevent feedback loop
+	"dockerd":             true, // Docker daemon chatter (the design review recommendation)
+	"containerd":          true, // Container runtime chatter (the design review recommendation)
 }
 
 // JournaldWatcher streams entries from systemd journal via journalctl subprocess.
 // Zero CGO, zero dependencies — works on any Linux box with journalctl.
 type JournaldWatcher struct {
 	handler      LogHandler
-	excludeUnits map[string]bool
+	excludeUnits map[string]bool // all keys stored lowercase
+	selfUnit     string          // our own systemd unit name for self-suppression
 }
 
 // NewJournaldWatcher creates a watcher that streams journal entries.
 // excludeUnits merges with defaultNoiseUnits. Pass nil for defaults only.
-func NewJournaldWatcher(handler LogHandler, excludeUnits map[string]bool) *JournaldWatcher {
+// selfUnit is the systemd unit name for Observer (e.g. "observer.service").
+// If empty, defaults to "observer.service".
+func NewJournaldWatcher(handler LogHandler, excludeUnits map[string]bool, selfUnit string) *JournaldWatcher {
+	// Store all keys lowercase for case-insensitive matching
 	merged := make(map[string]bool, len(defaultNoiseUnits)+len(excludeUnits))
 	for k, v := range defaultNoiseUnits {
-		merged[k] = v
+		merged[strings.ToLower(k)] = v
 	}
 	for k, v := range excludeUnits {
-		merged[k] = v
+		merged[strings.ToLower(k)] = v
 	}
+
+	if selfUnit == "" {
+		selfUnit = "observer.service"
+	}
+
 	return &JournaldWatcher{
 		handler:      handler,
 		excludeUnits: merged,
+		selfUnit:     selfUnit,
 	}
 }
 
@@ -140,6 +157,15 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 			continue
 		}
 
+		// --- Self-suppression (anti-spoof) ---
+		// Filter our own logs using _SYSTEMD_UNIT, which is kernel-attached
+		// and cannot be spoofed by an attacker. An attacker CAN spoof
+		// SYSLOG_IDENTIFIER="observer" to hide behind our noise filter,
+		// but they CANNOT spoof _SYSTEMD_UNIT.
+		if entry.SystemdUnit == j.selfUnit {
+			continue
+		}
+
 		// Identify the source — SYSLOG_IDENTIFIER is the cleanest identifier.
 		// Falls back to _COMM (process name) if identifier isn't set.
 		sourceName := entry.SyslogIdentifier
@@ -150,8 +176,10 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 			sourceName = "unknown"
 		}
 
-		// Noise filter: skip known-noisy units
-		if j.excludeUnits[sourceName] {
+		// --- Noise filter (case-insensitive, _SYSTEMD_UNIT only) ---
+		// Only checks the trusted kernel-attached unit name.
+		// SYSLOG_IDENTIFIER is NOT checked because it can be spoofed.
+		if j.isNoiseUnit(entry.SystemdUnit) {
 			continue
 		}
 
@@ -187,6 +215,28 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 
 	// Wait for process to exit
 	return cmd.Wait()
+}
+
+// isNoiseUnit checks if a journal entry should be suppressed.
+// ONLY checks _SYSTEMD_UNIT (trusted, kernel-attached). Does NOT check
+// SYSLOG_IDENTIFIER because it can be spoofed by any process.
+// Entries without a _SYSTEMD_UNIT (kernel, early boot) are never noise-filtered.
+func (j *JournaldWatcher) isNoiseUnit(systemdUnit string) bool {
+	if systemdUnit == "" {
+		return false
+	}
+	unitBase := strings.ToLower(stripUnitSuffix(systemdUnit))
+	return j.excludeUnits[unitBase]
+}
+
+// stripUnitSuffix removes .service, .socket, .timer, .scope suffixes from a unit name.
+func stripUnitSuffix(unit string) string {
+	for _, suffix := range []string{".service", ".socket", ".timer", ".scope", ".slice"} {
+		if strings.HasSuffix(unit, suffix) {
+			return strings.TrimSuffix(unit, suffix)
+		}
+	}
+	return unit
 }
 
 // parseInt64 parses a string as int64. Avoids importing strconv for one function.

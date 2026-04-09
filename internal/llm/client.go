@@ -164,6 +164,21 @@ Status 200 is the ONLY ambiguous case:
 
 NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
+SYSTEM LOG RULES (sshd, sudo, systemd, kernel):
+These logs come from the host OS, not web applications. Different rules apply:
+
+- Failed SSH password / "invalid user" / pam_unix auth failure from remote IP = recon_failed + suppress. This is routine brute-force noise. Confidence 0.90+.
+- Successful SSH login ("Accepted password" / "Accepted publickey") = suspicious + alert. Even legitimate logins are worth flagging for audit.
+- Failed sudo attempt = suspicious + alert. The user is already logged in and trying to escalate privileges.
+- Successful sudo by a known admin user (root) = safe + allow. Normal administration.
+- UFW/iptables BLOCK from external IP = recon_failed + suppress. The firewall already handled it. Confidence 0.90+.
+- New user creation (useradd, groupadd, usermod) = suspicious + alert. Potential persistence mechanism.
+- Kernel module load (insmod, modprobe) = suspicious + alert. Could indicate rootkit installation.
+- Systemd service restarts, reloads, timer events = noise + suppress. Routine operations. Confidence 0.90+.
+- Connection closed/reset [preauth] = recon_failed + suppress. SSH handshake terminated before authentication. Confidence 0.90+.
+
+IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases like failed SSH and firewall blocks, not 0.60-0.75.
+
 PATTERN RULES:
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
 - PREFER "prefix" — fastest and safest.
