@@ -189,8 +189,6 @@ func main() {
 	retryQueue := make(chan *retryEvent, retryQueueSize)
 	var retryQueueDrops atomic.Int64
 
-	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops)
-
 	// Shared result router — one function for post-classification routing.
 	// Both primary pipeline and retry workers use this. No duplication, no drift.
 	router := &resultRouter{
@@ -199,6 +197,8 @@ func main() {
 		collector:        collector,
 		alertCoordinator: alertCoordinator,
 	}
+
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops)
 
 	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
 	numWorkers := cfg.MaxConcurrentLLM * 2
@@ -220,7 +220,7 @@ func main() {
 		go func() {
 			for item := range retryQueue {
 				result := a.AnalyzeRetry(ctx, item.evt)
-				router.Route(item.evt, result, item.line, "classify_retry")
+				router.Route(item.evt, &result, item.line, "classify_retry")
 			}
 		}()
 	}
@@ -952,7 +952,7 @@ func makeLogHandler(
 		// Route the classification result — shared with retry workers.
 		// One function, one truth: LLM audit trail, recon routing,
 		// HTTP coordinator path, non-HTTP direct-to-findings.
-		router.Route(evt, result, line, "classify")
+		router.Route(evt, &result, line, "classify")
 	}
 }
 
