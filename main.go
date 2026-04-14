@@ -189,7 +189,16 @@ func main() {
 	retryQueue := make(chan *retryEvent, retryQueueSize)
 	var retryQueueDrops atomic.Int64
 
-	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, dispatch, db, retryQueue, &retryQueueDrops)
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops)
+
+	// Shared result router — one function for post-classification routing.
+	// Both primary pipeline and retry workers use this. No duplication, no drift.
+	router := &resultRouter{
+		cfg:              cfg,
+		db:               db,
+		collector:        collector,
+		alertCoordinator: alertCoordinator,
+	}
 
 	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
 	numWorkers := cfg.MaxConcurrentLLM * 2
@@ -211,124 +220,7 @@ func main() {
 		go func() {
 			for item := range retryQueue {
 				result := a.AnalyzeRetry(ctx, item.evt)
-
-				// Record LLM decision if one was made
-				if result.Source == "llm" && result.LLMVerdict != nil {
-					v := result.LLMVerdict
-					db.RecordLLMDecision(context.Background(), &store.LLMDecision{
-						EventID:          item.evt.ID,
-						Timestamp:        item.evt.Timestamp,
-						Tier:             "classify_retry",
-						Model:            cfg.LLMModel,
-						ReasoningEffort:  cfg.Tier1Effort,
-						PromptTokens:     v.PromptTokens,
-						CompletionTokens: v.CompletionTokens,
-						LatencyMs:        v.LatencyMs,
-						SourceScope:      item.evt.ScopeKey(),
-						RawLine:          item.evt.Line,
-						NormalizedLine:   item.evt.NormalizedLine,
-						NormalizedHash:   item.evt.Hash,
-						LLMResponseRaw:   v.ResponseRaw,
-						Classification:   v.Classification,
-						Action:           v.Action,
-						Confidence:       v.Confidence,
-						Reason:           v.Reason,
-						PatternType:      v.PatternType,
-						PatternValue:     v.Pattern,
-						SourceHint:       v.SourceHint,
-						PatternLearned:   result.LLMPatternLearned,
-						PatternBucket:    v.Action,
-						CacheKey:         v.Pattern,
-						FinalVerdict:     string(result.Verdict),
-					})
-				}
-
-				// Process result — same routing as primary pipeline
-				switch result.Verdict {
-				case patternstore.VerdictAllow, patternstore.VerdictSuppress:
-					// Done — pattern learned or noise confirmed
-				case patternstore.VerdictDeny, patternstore.VerdictAlert:
-					method, path, host, statusCode := parseNormalizedLine(item.evt.NormalizedLine)
-					isHTTP := method != ""
-
-					if result.LLMClassification == "recon_failed" {
-						db.RecordFinding(context.Background(), &store.Finding{
-							EventID:        item.evt.ID,
-							Timestamp:      item.evt.Timestamp,
-							SourceType:     string(item.evt.SourceType),
-							SourceName:     item.evt.SourceName,
-							DestHost:       host,
-							HTTPMethod:     method,
-							HTTPPath:       path,
-							HTTPStatus:     statusCode,
-							Verdict:        "recon",
-							Classification: result.LLMClassification,
-							Confidence:     result.LLMConfidence,
-							Reason:         result.Reason,
-							MatchedVia:     result.Source,
-							RawLine:        item.evt.Line,
-							NormalizedLine: item.evt.NormalizedLine,
-							NormalizedHash: item.evt.Hash,
-							Notified:       false,
-						})
-						continue
-					}
-
-					severity := "malicious"
-					notifSeverity := notifier.SeverityMalicious
-					if result.Verdict == patternstore.VerdictAlert {
-						severity = "suspicious"
-						notifSeverity = notifier.SeveritySuspicious
-					}
-
-					if isHTTP && collector.Enabled() {
-						correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
-						alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
-							EventID:        item.evt.ID,
-							ScopeKey:       item.evt.ScopeKey(),
-							SourceType:     item.evt.SourceType,
-							Reason:         result.Reason,
-							MatchedVia:     result.Source,
-							Hash:           item.evt.Hash,
-							Line:           item.evt.Line,
-							Verdict:        string(result.Verdict),
-							Severity:       severity,
-							Classification: result.LLMClassification,
-							Host:           host,
-							StatusCode:     statusCode,
-							HTTPMethod:     method,
-							HTTPPath:       path,
-							NormalizedLine: item.evt.NormalizedLine,
-							SourceName:     item.evt.SourceName,
-							Timestamp:      item.evt.Timestamp,
-							BuildAlert: func() interface{} {
-								evidence := collector.Lookup(rec.LookupRequest{
-									Method:          method,
-									Path:            path,
-									SourceContainer: item.evt.SourceName,
-									StatusCode:      statusCode,
-									Timestamp:       item.evt.Timestamp,
-									Window:          5 * time.Second,
-									ExpectedBytes:   extractResponseBytes(item.evt.Line),
-								})
-								return notifier.Alert{
-									EventID:        item.evt.ID,
-									Severity:       notifSeverity,
-									ContainerID:    item.line.ContainerID,
-									ContainerName:  item.line.ContainerName,
-									LogLine:        item.evt.Line,
-									NormalizedHash: item.evt.Hash,
-									Reason:         result.Reason,
-									MatchedVia:     result.Source,
-									Classification: result.LLMClassification,
-									Confidence:     result.LLMConfidence,
-									Timestamp:      item.evt.Timestamp,
-									Evidence:       evidence,
-								}
-							},
-						})
-					}
-				}
+				router.Route(item.evt, result, item.line, "classify_retry")
 			}
 		}()
 	}
@@ -998,8 +890,8 @@ func makeLogHandler(
 	a *analyzer.Analyzer,
 	collector rec.EvidenceCollector,
 	alertCoordinator *coordinator.Coordinator,
-	dispatch *notifier.Dispatcher,
 	db *store.Store,
+	router *resultRouter,
 	retryQueue chan *retryEvent,
 	retryQueueDrops *atomic.Int64,
 ) watcher.LogHandler {
@@ -1057,174 +949,10 @@ func makeLogHandler(
 			return
 		}
 
-		// Record LLM decision to audit trail (Tier 1: classification)
-		if result.Source == "llm" && result.LLMVerdict != nil {
-			v := result.LLMVerdict
-			db.RecordLLMDecision(context.Background(), &store.LLMDecision{
-				EventID:          evt.ID,
-				Timestamp:        evt.Timestamp,
-				Tier:             "classify",
-				Model:            cfg.LLMModel,
-				ReasoningEffort:  cfg.Tier1Effort,
-				PromptTokens:     v.PromptTokens,
-				CompletionTokens: v.CompletionTokens,
-				LatencyMs:        v.LatencyMs,
-				SourceScope:      evt.ScopeKey(),
-				RawLine:          evt.Line,
-				NormalizedLine:   evt.NormalizedLine,
-				NormalizedHash:   evt.Hash,
-				LLMResponseRaw:   v.ResponseRaw,
-				Classification:   v.Classification,
-				Action:           v.Action,
-				Confidence:       v.Confidence,
-				Reason:           v.Reason,
-				PatternType:      v.PatternType,
-				PatternValue:     v.Pattern,
-				SourceHint:       v.SourceHint,
-				PatternLearned:   result.LLMPatternLearned,
-				PatternBucket:    v.Action,
-				CacheKey:         v.Pattern,
-				FinalVerdict:     string(result.Verdict),
-			})
-		}
-
-		buildAlert := func(severity notifier.Severity, evidence *rec.Evidence) notifier.Alert {
-			return notifier.Alert{
-				EventID:        evt.ID,
-				Severity:       severity,
-				ContainerID:    line.ContainerID,
-				ContainerName:  line.ContainerName,
-				LogLine:        evt.Line,
-				NormalizedHash: evt.Hash,
-				Reason:         result.Reason,
-				MatchedVia:     result.Source,
-				Classification: result.LLMClassification,
-				Confidence:     result.LLMConfidence,
-				Timestamp:      time.Now(),
-				Evidence:       evidence,
-			}
-		}
-
-		switch result.Verdict {
-		case patternstore.VerdictAllow, patternstore.VerdictSuppress:
-			return
-
-		case patternstore.VerdictDeny, patternstore.VerdictAlert:
-			method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
-			isHTTP := method != ""
-
-			// --- Recon routing: log + store, no email ---
-			// recon_failed = probe found nothing. Telemetry only.
-			// recon_success = probe got a 200. Must flow through coordinator
-			// for evidence check — if the response contains credentials,
-			// T2 reclassify will escalate to malicious and send email.
-			if result.LLMClassification == "recon_failed" {
-				log.Printf("[RECON] EventID=%s Source=%s Classification=%s Reason=%s MatchedVia=%s Line=%s",
-					evt.ID, evt.ScopeKey(), result.LLMClassification, result.Reason, result.Source,
-					truncate(evt.Line, 200))
-
-				db.RecordFinding(context.Background(), &store.Finding{
-					EventID:        evt.ID,
-					Timestamp:      evt.Timestamp,
-					SourceType:     string(evt.SourceType),
-					SourceName:     evt.SourceName,
-					DestHost:       host,
-					HTTPMethod:     method,
-					HTTPPath:       path,
-					HTTPStatus:     statusCode,
-					Verdict:        "recon",
-					Classification: result.LLMClassification,
-					Confidence:     result.LLMConfidence,
-					Reason:         result.Reason,
-					MatchedVia:     result.Source,
-					RawLine:        evt.Line,
-					NormalizedLine: evt.NormalizedLine,
-					NormalizedHash: evt.Hash,
-					Notified:       false,
-				})
-				return
-			}
-
-			severity := "malicious"
-			notifSeverity := notifier.SeverityMalicious
-			if result.Verdict == patternstore.VerdictAlert {
-				severity = "suspicious"
-				notifSeverity = notifier.SeveritySuspicious
-			}
-
-			if isHTTP && collector.Enabled() {
-				correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
-
-				alertBuilder := func() interface{} {
-					evidence := collector.Lookup(rec.LookupRequest{
-						Method:          method,
-						Path:            path,
-						SourceContainer: evt.SourceName,
-						StatusCode:      statusCode,
-						Timestamp:       evt.Timestamp,
-						Window:          5 * time.Second,
-						ExpectedBytes:   extractResponseBytes(evt.Line),
-					})
-					return buildAlert(notifSeverity, evidence)
-				}
-
-				alertCoordinator.Process(correlationKey, &coordinator.PendingAlert{
-					EventID:        evt.ID,
-					ScopeKey:       evt.ScopeKey(),
-					SourceType:     evt.SourceType,
-					Reason:         result.Reason,
-					MatchedVia:     result.Source,
-					Hash:           evt.Hash,
-					Line:           evt.Line,
-					Verdict:        string(result.Verdict),
-					Severity:       severity,
-					Classification: result.LLMClassification,
-					Host:           host,
-					StatusCode:     statusCode,
-					ResponseBytes:  extractResponseBytes(evt.Line),
-					HTTPMethod:     method,
-					HTTPPath:       path,
-					NormalizedLine: evt.NormalizedLine,
-					SourceName:     evt.SourceName,
-					Timestamp:      evt.Timestamp,
-					BuildAlert:     alertBuilder,
-				})
-			} else {
-				log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
-					evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
-					truncate(evt.Line, 200))
-
-				// NO EMAIL — only escalated alerts send email.
-				// Non-HTTP alerts logged to SQLite for dashboard review.
-
-				// Record non-coordinator alert to SQLite
-				db.RecordFinding(context.Background(), &store.Finding{
-					EventID:        evt.ID,
-					Timestamp:      evt.Timestamp,
-					SourceType:     string(evt.SourceType),
-					SourceName:     evt.SourceName,
-					DestHost:       host,
-					HTTPMethod:     method,
-					HTTPPath:       path,
-					HTTPStatus:     statusCode,
-					ResponseBytes:  extractResponseBytes(evt.Line),
-					Verdict:        string(result.Verdict),
-					Classification: result.LLMClassification,
-					Confidence:     result.LLMConfidence,
-					Reason:         result.Reason,
-					MatchedVia:     result.Source,
-					RawLine:        evt.Line,
-					NormalizedLine: evt.NormalizedLine,
-					NormalizedHash: evt.Hash,
-					Notified:       false,
-				})
-			}
-
-		case patternstore.VerdictUnknown:
-			if result.Source == "error" {
-				log.Printf("[LLM_ERROR] Source=%s Line=%s", evt.ScopeKey(), truncate(evt.Line, 100))
-			}
-		}
+		// Route the classification result — shared with retry workers.
+		// One function, one truth: LLM audit trail, recon routing,
+		// HTTP coordinator path, non-HTTP direct-to-findings.
+		router.Route(evt, result, line, "classify")
 	}
 }
 
