@@ -22,6 +22,7 @@ import (
 	"github.com/vaultguardian/observer/internal/normalizer"
 	"github.com/vaultguardian/observer/internal/notifier"
 	"github.com/vaultguardian/observer/internal/patternstore"
+	"github.com/vaultguardian/observer/internal/policy"
 	"github.com/vaultguardian/observer/internal/rec"
 	"github.com/vaultguardian/observer/internal/store"
 	"github.com/vaultguardian/observer/internal/watcher"
@@ -70,6 +71,9 @@ func main() {
 		log.Fatalf("[observer] Failed to init SQLite store: %v", err)
 	}
 	defer db.Close()
+
+	// ------- Init Policy Engine (deterministic pre-LLM layer) -------
+	policyEngine := policy.New(db)
 
 	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey, cfg.Tier1Effort, cfg.Tier2Effort)
 
@@ -198,7 +202,7 @@ func main() {
 		alertCoordinator: alertCoordinator,
 	}
 
-	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops)
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops, policyEngine, dispatch)
 
 	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
 	numWorkers := cfg.MaxConcurrentLLM * 2
@@ -229,7 +233,7 @@ func main() {
 		pipelineBufferSize, numWorkers, retryQueueSize, numRetryWorkers, cfg.MaxConcurrentLLM)
 
 	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, &pipelineDrops, &retryQueueDrops)
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, &pipelineDrops, &retryQueueDrops)
 
 	// Ingestion handler: lightweight, just pushes to channel.
 	// Non-blocking: if pipeline is full, drop the line rather than stall the watcher.
@@ -875,6 +879,87 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 }
 
 // =============================================================================
+// Policy Engine Outcome Handler
+// =============================================================================
+
+// routePolicyOutcome handles the result of a policy engine match.
+// This is the "one road to the database and inbox" for policy matches.
+// Uses the same notifier.Dispatcher as coordinator escalations — no bypass lanes.
+//
+// AI Committee mandate (April 2026): do not duplicate dispatch/store logic.
+// All paths to email and SQLite must go through shared functions.
+func routePolicyOutcome(
+	evt *event.Event,
+	pr policy.Result,
+	dispatch *notifier.Dispatcher,
+	db *store.Store,
+) {
+	switch pr.Action {
+	case "allow":
+		// Trusted — suppress silently. No finding recorded to avoid
+		// flooding the dashboard with "Drew logged in from home" entries.
+		return
+
+	case "alert":
+		// Record finding for dashboard review, no email.
+		log.Printf("[POLICY] EventID=%s rule=%s action=alert ip=%s user=%s reason=%s",
+			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
+
+		db.RecordFinding(context.Background(), &store.Finding{
+			EventID:        evt.ID,
+			Timestamp:      evt.Timestamp,
+			SourceType:     evt.SourceType,
+			SourceName:     evt.SourceName,
+			SourceIP:       pr.SourceIP,
+			Verdict:        "alert",
+			Classification: "policy_alert",
+			Confidence:     1.0, // deterministic = 100% confidence
+			Reason:         pr.Reason,
+			MatchedVia:     "policy:" + pr.RuleID,
+			RawLine:        evt.Line,
+			Notified:       false,
+		})
+
+	case "escalate":
+		// Record finding AND send email immediately.
+		// This is the "someone is inside your server" path.
+		log.Printf("[POLICY:ESCALATE] EventID=%s rule=%s ip=%s user=%s reason=%s",
+			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
+
+		db.RecordFinding(context.Background(), &store.Finding{
+			EventID:        evt.ID,
+			Timestamp:      evt.Timestamp,
+			SourceType:     evt.SourceType,
+			SourceName:     evt.SourceName,
+			SourceIP:       pr.SourceIP,
+			Verdict:        "deny",
+			Classification: "policy_escalated",
+			Confidence:     1.0,
+			Reason:         pr.Reason,
+			MatchedVia:     "policy:" + pr.RuleID,
+			RawLine:        evt.Line,
+			Notified:       true,
+		})
+
+		// Send alert through the same dispatcher as HTTP escalations.
+		// SeverityMalicious routes to all configured channels.
+		alert := notifier.Alert{
+			EventID:        evt.ID,
+			Severity:       notifier.SeverityMalicious,
+			ContainerID:    "",
+			ContainerName:  evt.SourceName,
+			LogLine:        evt.Line,
+			Reason:         pr.Reason,
+			MatchedVia:     "policy:" + pr.RuleID,
+			Classification: "policy_escalated",
+			Confidence:     1.0,
+			Timestamp:      evt.Timestamp,
+		}
+		dispatch.Dispatch(context.Background(), alert)
+	}
+}
+
+// =============================================================================
 // Log Handler
 // =============================================================================
 
@@ -894,6 +979,8 @@ func makeLogHandler(
 	router *resultRouter,
 	retryQueue chan *retryEvent,
 	retryQueueDrops *atomic.Int64,
+	policyEngine *policy.Engine,
+	dispatch *notifier.Dispatcher,
 ) watcher.LogHandler {
 	return func(line watcher.LogLine) {
 		if cfg.ExcludeContainers[line.ContainerName] {
@@ -933,6 +1020,18 @@ func makeLogHandler(
 			Metadata:    metadata,
 		}
 
+		// =====================================================
+		// POLICY ENGINE — deterministic pre-LLM layer (v0.34)
+		// Runs AFTER event creation, BEFORE analyzer/LLM.
+		// Short-circuits for host-state events where the log
+		// line IS the evidence (SSH login, useradd, etc.)
+		// Committee consensus: policy is identity, not inference.
+		// =====================================================
+		if pr := policyEngine.Evaluate(evt); pr.Matched {
+			routePolicyOutcome(evt, pr, dispatch, db)
+			return
+		}
+
 		result := a.Analyze(context.Background(), evt)
 
 		// Deferred classification: LLM was busy, push to retry queue.
@@ -960,7 +1059,7 @@ func makeLogHandler(
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -1003,6 +1102,13 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			if caTotal > 0 {
 				log.Printf("[observer] CatchAll: fingerprints=%d candidates=%d pending=%d verified=%d rejected=%d suppressed=%d",
 					caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed)
+			}
+
+			// Policy engine stats
+			policyMatches, policyEscalations, policyAllows, policyAlerts := policyEngine.Stats()
+			if policyMatches > 0 {
+				log.Printf("[observer] Policy: matches=%d escalations=%d allows=%d alerts=%d",
+					policyMatches, policyEscalations, policyAllows, policyAlerts)
 			}
 
 			// Record pipeline stats to SQLite

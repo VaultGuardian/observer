@@ -291,6 +291,21 @@ func (s *Store) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_llm_decisions_source_scope ON llm_decisions(source_scope);
 			CREATE INDEX IF NOT EXISTS idx_llm_decisions_cache_key ON llm_decisions(cache_key);`,
 		},
+		{
+			version: 7,
+			desc:    "trusted_ips table for policy engine allowlist",
+			sql: `CREATE TABLE IF NOT EXISTS trusted_ips (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				ip_address TEXT,
+				cidr TEXT,
+				description TEXT NOT NULL DEFAULT '',
+				added_by TEXT NOT NULL DEFAULT 'api',
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_trusted_ips_address ON trusted_ips(ip_address);
+			CREATE INDEX IF NOT EXISTS idx_trusted_ips_cidr ON trusted_ips(cidr);`,
+		},
 	}
 
 	for _, m := range migrations {

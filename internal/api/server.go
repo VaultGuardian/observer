@@ -91,6 +91,8 @@ func (s *Server) Start() error {
 	mux.Handle("/api/decisions", s.requireAuth(http.HandlerFunc(s.handleDecisions)))
 	mux.Handle("/api/decisions/counts", s.requireAuth(http.HandlerFunc(s.handleDecisionCounts)))
 	mux.Handle("/api/decisions/review", s.requireAuth(http.HandlerFunc(s.handleDecisionReview)))
+	mux.Handle("/api/trusted-ips", s.requireAuth(http.HandlerFunc(s.handleTrustedIPs)))
+	mux.Handle("/api/trusted-ips/delete", s.requireAuth(http.HandlerFunc(s.handleDeleteTrustedIP)))
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	log.Printf("[api] Dashboard API listening on %s (key file: %s)", addr, s.config.KeyFile)
@@ -516,6 +518,99 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 		req.ID, req.Review.Status, req.Review.Verdict, req.Review.PatternDeleted)
 
 	jsonOK(w, map[string]string{"status": "ok"})
+}
+
+// =============================================================================
+// Trusted IPs Endpoints (Policy Engine Allowlist)
+// =============================================================================
+
+// handleTrustedIPs handles GET (list) and POST (add) for trusted IPs.
+// GET /api/trusted-ips — List all trusted IPs/CIDRs
+// POST /api/trusted-ips — Add a trusted IP or CIDR range
+func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listTrustedIPs(w, r)
+	case http.MethodPost:
+		s.addTrustedIP(w, r)
+	default:
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) listTrustedIPs(w http.ResponseWriter, r *http.Request) {
+	ips, err := s.store.ListTrustedIPs(r.Context())
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if ips == nil {
+		ips = []store.TrustedIP{} // return [] not null
+	}
+	jsonOK(w, ips)
+}
+
+func (s *Server) addTrustedIP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IP          string `json:"ip"`
+		CIDR        string `json:"cidr"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.IP == "" && req.CIDR == "" {
+		jsonError(w, "Either 'ip' or 'cidr' is required", http.StatusBadRequest)
+		return
+	}
+
+	entry := &store.TrustedIP{
+		IPAddress:   req.IP,
+		CIDR:        req.CIDR,
+		Description: req.Description,
+		AddedBy:     "api",
+	}
+
+	id, err := s.store.AddTrustedIP(r.Context(), entry)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[api] Trusted IP added: id=%d ip=%s cidr=%s desc=%s", id, req.IP, req.CIDR, req.Description)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":      id,
+		"message": "Trusted IP added",
+	})
+}
+
+// handleDeleteTrustedIP handles POST /api/trusted-ips/delete
+// Body: {"id": 1}
+func (s *Server) handleDeleteTrustedIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.store.RemoveTrustedIP(r.Context(), req.ID); err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	log.Printf("[api] Trusted IP removed: id=%d", req.ID)
+	jsonOK(w, map[string]string{"message": "Trusted IP removed"})
 }
 
 // =============================================================================
