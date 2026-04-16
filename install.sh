@@ -137,7 +137,24 @@ DASHBOARD_PORT="${DASHBOARD_PORT:-9090}"
 # Email alerts (optional)
 echo ""
 echo "  Observer can email you when it finds confirmed exploitation."
-read -rp "  Alert email (optional, press Enter to skip): " ALERT_EMAIL
+echo "  Requires a Resend API key (https://resend.com)"
+read -rp "  Resend API key (optional, press Enter to skip): " RESEND_KEY
+
+ALERT_EMAIL=""
+if [ -n "$RESEND_KEY" ]; then
+    read -rp "  Alert email address: " ALERT_EMAIL
+    [ -n "$ALERT_EMAIL" ] || warn "No email provided — email alerts disabled"
+fi
+
+# Response Evidence Capture
+echo ""
+echo "  REC captures what your server actually sent back to attackers."
+echo "  Recommended for full evidence on escalated alerts."
+read -rp "  Enable Response Evidence Capture? [Y/n]: " REC_CHOICE
+case "$REC_CHOICE" in
+    [nN]|[nN][oO]) REC_ENABLED=false ;;
+    *) REC_ENABLED=true ;;
+esac
 
 echo ""
 
@@ -193,11 +210,15 @@ Environment=LLM_API_KEY=$API_KEY
 Environment=DOCKER_SOCKET=/var/run/docker.sock
 Environment=JOURNALD_ENABLED=$JOURNALD_FOUND
 Environment=EXCLUDE_CONTAINERS=
+
+# Evidence capture
+Environment=REC_ENABLED=$REC_ENABLED
 EOF
 
-# Add alert email if provided
-if [ -n "$ALERT_EMAIL" ]; then
-    echo "Environment=ALERT_EMAIL=$ALERT_EMAIL" >> "$SERVICE_FILE"
+# Add email config if provided
+if [ -n "$RESEND_KEY" ] && [ -n "$ALERT_EMAIL" ]; then
+    echo "Environment=RESEND_API_KEY=$RESEND_KEY" >> "$SERVICE_FILE"
+    echo "Environment=ALERT_EMAIL_TO=$ALERT_EMAIL" >> "$SERVICE_FILE"
 fi
 
 # Add Install section
@@ -324,7 +345,8 @@ if systemctl is-active --quiet observer; then
     ok "Dashboard API: http://$(hostname -I | awk '{print $1}'):$DASHBOARD_PORT"
     [ "$DOCKER_FOUND" = true ] && ok "Monitoring: Docker containers"
     [ "$JOURNALD_FOUND" = true ] && ok "Monitoring: Host OS (journald)"
-    [ -n "$ALERT_EMAIL" ] && ok "Alerts: $ALERT_EMAIL"
+    [ -n "$ALERT_EMAIL" ] && ok "Alerts: $ALERT_EMAIL (via Resend)"
+    [ "$REC_ENABLED" = true ] && ok "Evidence capture: enabled"
     echo ""
     info "Quick commands:"
     echo "  vaultguardian logs      — Watch live logs"
