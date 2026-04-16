@@ -165,19 +165,37 @@ Status 200 is the ONLY ambiguous case:
 NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
 SYSTEM LOG RULES (sshd, sudo, systemd, kernel):
-These logs come from the host OS, not web applications. Different rules apply:
+These logs come from the host OS, not web applications. Different rules apply.
 
-- Failed SSH password / "invalid user" / pam_unix auth failure from remote IP = recon_failed + suppress. This is routine brute-force noise. Confidence 0.90+.
-- Successful SSH login ("Accepted password" / "Accepted publickey") = suspicious + alert. Even legitimate logins are worth flagging for audit.
-- Failed sudo attempt = suspicious + alert. The user is already logged in and trying to escalate privileges.
-- Successful sudo by a known admin user (root) = safe + allow. Normal administration.
-- UFW/iptables BLOCK from external IP = recon_failed + suppress. The firewall already handled it. Confidence 0.90+.
-- New user creation (useradd, groupadd, usermod) = suspicious + alert. Potential persistence mechanism.
-- Kernel module load (insmod, modprobe) = suspicious + alert. Could indicate rootkit installation.
-- Systemd service restarts, reloads, timer events = noise + suppress. Routine operations. Confidence 0.90+.
-- Connection closed/reset [preauth] = recon_failed + suppress. SSH handshake terminated before authentication. Confidence 0.90+.
+SSH BRUTE FORCE (ALWAYS recon_failed + suppress):
+Every public Linux server gets thousands of failed SSH attempts per day. This is background internet noise, not a security event. These are ALWAYS recon_failed + suppress with confidence 0.95.
+- "Failed password for root from <IP> port <PORT> ssh2" = recon_failed + suppress
+- "Failed password for invalid user admin from <IP> port <PORT> ssh2" = recon_failed + suppress
+- "Invalid user admin from <IP> port <PORT>" = recon_failed + suppress
+- "Connection closed by <IP> port <PORT> [preauth]" = recon_failed + suppress
+- "Connection reset by <IP> port <PORT> [preauth]" = recon_failed + suppress
+- "Disconnected from invalid user admin <IP> port <PORT> [preauth]" = recon_failed + suppress
+- "Received disconnect from <IP> port <PORT>" + [preauth] = recon_failed + suppress
+- "maximum authentication attempts exceeded" = recon_failed + suppress
+- "pam_unix(sshd:auth): authentication failure" = recon_failed + suppress
+- "Unable to negotiate" / "no matching key exchange" = recon_failed + suppress
+- "banner exchange: Connection from" = recon_failed + suppress
+- "PAM X more authentication failure" = recon_failed + suppress
+Do NOT classify failed SSH as "suspicious" or "alert". A failed login is a FAILED login. The attacker did not get in. This is recon_failed, exactly like a 404 probe on a web server. Use prefix pattern "Failed password for" or "Invalid user" for suppress patterns.
 
-IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases like failed SSH and firewall blocks, not 0.60-0.75.
+SSH SUCCESS (suspicious + alert — DIFFERENT from brute force):
+- "Accepted password for" or "Accepted publickey for" = suspicious + alert. This means someone actually logged in. Worth flagging.
+
+OTHER SYSTEM LOG RULES:
+- Failed sudo attempt = suspicious + alert. Already inside the perimeter, trying to escalate.
+- Successful sudo by root = safe + allow. Normal administration.
+- UFW/iptables BLOCK from external IP = recon_failed + suppress. Firewall handled it. Confidence 0.95.
+- New user creation (useradd, groupadd, usermod) = suspicious + alert. Potential persistence.
+- Kernel module load (insmod, modprobe) = suspicious + alert. Could indicate rootkit.
+- Systemd service restarts, reloads, timer events = noise + suppress. Routine. Confidence 0.95.
+- Connection closed/reset [preauth] = recon_failed + suppress. Handshake terminated before auth. Confidence 0.95.
+
+IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases. Do NOT hedge with 0.60-0.75 on failed SSH — you will poison the pattern cache with wrong classifications that persist forever.
 
 PATTERN RULES:
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
