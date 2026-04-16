@@ -245,5 +245,25 @@ func defaultRules() []Rule {
 			NeedsTrustCheck: false,
 			DefaultAction:   "alert",
 		},
+
+		// ----- PAM Session (redundant after SSH policy) -----
+		// pam_unix logs "session opened/closed" after every SSH login.
+		// The ssh_login rule already handles the authentication event —
+		// whether escalated (unknown IP) or allowed (trusted IP).
+		// Without this rule, PAM lines fall through to the LLM and get
+		// classified as "suspicious" independently, creating duplicate alerts.
+		{
+			ID:         "pam_session",
+			SourceType: "journal",
+			Pattern:    regexp.MustCompile(`pam_unix\(\S+:session\):\s+session\s+(opened|closed)\s+for\s+user\s+(\S+)`),
+			Extract: func(m []string) Result {
+				return Result{
+					Username: m[2],
+					Reason:   "PAM session " + m[1] + " for " + m[2] + " (handled by SSH policy)",
+				}
+			},
+			NeedsTrustCheck: false,
+			DefaultAction:   "allow",
+		},
 	}
 }
