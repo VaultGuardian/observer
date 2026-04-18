@@ -286,7 +286,7 @@ func (s *Server) handlePatterns(w http.ResponseWriter, r *http.Request) {
 		result := map[string]interface{}{
 			"scope":    scopeKey,
 			"allow":    s.patterns.ListPatterns(scopeKey, patternstore.VerdictAllow),
-			"deny":     s.patterns.ListPatterns(scopeKey, patternstore.VerdictDeny),
+			"malicious":     s.patterns.ListPatterns(scopeKey, patternstore.VerdictMalicious),
 			"alert":    s.patterns.ListPatterns(scopeKey, patternstore.VerdictAlert),
 			"suppress": s.patterns.ListPatterns(scopeKey, patternstore.VerdictSuppress),
 		}

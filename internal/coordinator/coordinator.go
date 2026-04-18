@@ -71,7 +71,7 @@ type FinalAlert struct {
 	MatchedVia    string
 	Hash          string
 	Line          string
-	Verdict       string // "deny", "alert"
+	Verdict       string // "malicious", "alert"
 	Severity      string // "malicious", "suspicious"
 
 	// HTTP metadata (from normalized + raw line parsing)
@@ -487,7 +487,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			pending.Severity = newSeverity
 		}
 		if pending.Severity == "malicious" {
-			pending.Verdict = "deny"
+			pending.Verdict = "malicious"
 		}
 		pending.Reason = reason // replace original reason with evidence-backed reason
 		delete(c.pending, key)

@@ -10,7 +10,7 @@ import (
 // This is the primary write path — called for every event that makes it
 // past deterministic noise suppression.
 //
-// Writes are immediate for deny/alert findings. For allow/suppress (high
+// Writes are immediate for malicious/alert findings. For allow/suppress (high
 // volume), callers may choose to batch via a channel — but that's a future
 // optimization. At current volume (~500 events/day), direct writes are fine.
 func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
@@ -140,12 +140,12 @@ func (s *Store) RecordPipelineStats(ctx context.Context, stats *PipelineStats) e
 	_, err := s.db.ExecContext(ctx, `INSERT INTO pipeline_stats (
 		timestamp, processed, pattern_hits, noise_suppressed,
 		llm_calls, llm_errors, patterns_learned,
-		deny_count, alert_count, suppress_count
+		malicious_count, alert_count, suppress_count
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stats.Timestamp.Format(time.RFC3339),
 		stats.Processed, stats.PatternHits, stats.NoiseSuppressed,
 		stats.LLMCalls, stats.LLMErrors, stats.PatternsLearned,
-		stats.DenyCount, stats.AlertCount, stats.SuppressCount,
+		stats.MaliciousCount, stats.AlertCount, stats.SuppressCount,
 	)
 	if err != nil {
 		return fmt.Errorf("insert pipeline stats: %w", err)

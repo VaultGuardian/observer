@@ -1,276 +1,227 @@
 # Observer
 
-**Detects attacks. Verifies outcomes.**
-Low-noise intrusion detection for Linux workloads.
+**Detects attacks. Verifies outcomes. Learns over time.**
+Low-noise intrusion detection for Linux servers.
 
 ---
 
-Observer watches container logs (and soon host services via journald), classifies threats using an LLM, captures HTTP response evidence, and verifies whether attacks actually succeeded — before waking you up.
+Observer watches your Docker container logs and host system events (sshd, sudo, kernel), classifies threats using an LLM, captures HTTP response evidence, and verifies whether attacks actually succeeded — before waking you up.
 
 Most security tools scream "SQL injection detected!" when a bot sprays your server. Observer captures the server's response, reads it, and tells you "the app returned its welcome page and ignored the payload." One accurate finding instead of fifty false alarms.
+
+## Install
+
+One command on any Linux server with Docker:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
+```
+
+The installer prompts for your OpenAI API key and alert email, sets up the systemd service, and starts Observer. You'll need a GitHub account with access to the repo (private beta).
+
+After install, manage with the CLI:
+
+```bash
+vaultguardian status          # Service status + recent logs
+vaultguardian logs            # Tail logs
+vaultguardian stats           # Pipeline performance
+vaultguardian update          # Update to latest release
+vaultguardian update v0.35    # Update to specific version
+vaultguardian restart         # Restart observer
+vaultguardian version         # Current + available versions
+vaultguardian uninstall       # Remove observer
+```
 
 ## How It Works
 
 ```
-Log line arrives
-  → Normalize (strip timestamps, IPs, variable content)
-  → Pattern store check (nanosecond hash/prefix/regex/contains lookup)
+Log line arrives (Docker container or journald)
+  → Deterministic filters (stack traces, failed HTTP probes)
+  → Policy engine (SSH logins, user creation, privilege escalation)
+  → Pattern store (nanosecond hash/prefix/regex/contains lookup)
     → Known-good? Skip silently.
     → Known-noise? Suppress silently.
-    → Known-bad? → Coordinator holds for evidence (2-5s)
+    → Known-bad? → Coordinator holds for evidence
     → Unknown? → LLM classifies → learns pattern → next time is instant
 
 If alert-worthy:
   → REC captures the HTTP response from inside the container namespace
   → Structural redaction (keep visible text, strip secrets)
   → Re-classify with evidence: "Did the attack succeed or get ignored?"
-    → Cache hit? Instant verdict, zero LLM cost.
-    → Cache miss? LLM re-evaluates with the response body.
   → Downgraded? Log it, don't email.
-  → Confirmed? Alert with evidence attached.
+  → Confirmed credential exposure? Email immediately.
 ```
 
-The system gets **cheaper as it learns**. First time seeing an attack technique: LLM call (~2s). Every repeat: cache hit (nanoseconds, free). First time seeing a response body: LLM re-classification. Every repeat with the same body: cached verdict (free).
+## What It Catches
+
+**Policy engine (deterministic, pre-LLM):**
+- SSH login from unknown IP → instant email alert
+- New user created (`useradd`) → escalation
+- Privilege grant (`usermod -aG sudo`) → escalation
+- SSH authorized_keys modification → escalation
+- Failed sudo attempts → alert
+
+**LLM classification (learns over time):**
+- SQL injection, shell injection, PHP wrappers, encoded exploits
+- Path traversal, reconnaissance probes
+- Successful vs failed attack outcomes (intent × outcome)
+- Protocol mismatches, binary probes, scanner noise
+
+**Deterministic suppression (never hits the LLM):**
+- Application stack traces (Node.js, Python, Go, Java)
+- Failed HTTP probes (404/403/405/400 with no attack payload)
+- SSH brute force (thousands/day on every public server)
+- Nginx file-not-found errors
+- Firewall blocks (UFW/iptables)
 
 ## What Makes It Different
 
-- **Evidence-aware.** Captures HTTP responses and uses them to verify whether attacks succeeded. A `200 OK` with a welcome page is different from a `200 OK` with your database.
-- **Intent × outcome classification.** Distinguishes "attacker probed and got nothing" (suppress) from "attacker probed and got data" (alert immediately).
-- **Learns over time.** LLM classifies novel log lines once, then the pattern store handles all repeats at zero cost. Your bill shrinks as the system gets smarter.
-- **Low noise by design.** Failed scanners are suppressed. Duplicate alerts from multiple containers are grouped. False alarms are downgraded with evidence. You only hear about things that matter.
-- **Single binary, no dependencies.** One Go binary, systemd service, no Docker-in-Docker, no sidecar containers, no cloud requirement.
-- **Three deployment topologies, auto-detected:**
+- **Evidence-aware.** Captures HTTP responses and verifies whether attacks succeeded. A `200 OK` with a welcome page is different from a `200 OK` with your database credentials.
+- **Intent × outcome.** "Attacker probed and got nothing" (suppress) vs "attacker probed and got data" (email immediately).
+- **Learns over time.** First novel log line: LLM call (~3s, fraction of a cent). Every repeat: cache hit (nanoseconds, free). Cache rates reach 97%+ within hours.
+- **Low noise by design.** Failed scanners suppressed. SSH brute force invisible. Duplicate alerts grouped. False alarms downgraded with evidence.
+- **Single binary, no dependencies.** One Go binary, one systemd service. No Docker-in-Docker, no sidecar, no cloud requirement.
+- **Trusted IP allowlist.** Known IPs (your office, VPN) bypass SSH alerts. Unknown IP logs in → instant email.
 
-| Deployment | How REC captures HTTP | Config needed |
-|---|---|---|
-| docker-compose | Host AF_PACKET socket | Just `REC_ENABLED=true` |
-| Multi-node Swarm | VXLAN decapsulation (RFC 7348) | Auto-detected |
-| Single-node Swarm | Namespace capture via `setns` | `REC_NS_CONTAINER=captain-nginx` |
+## Production Numbers
 
-## Quick Start
+Real production stats from a server running Observer for 30 days:
 
-### As a systemd service (production)
-
-```bash
-# Build (from your dev machine)
-GOOS=linux GOARCH=amd64 go build -o observer .
-
-# Copy to server
-scp observer yourserver:/usr/local/bin/observer
-
-# Create service file
-sudo tee /etc/systemd/system/observer.service << 'EOF'
-[Unit]
-Description=VaultGuardian Observer
-After=docker.service
-Requires=docker.service
-
-[Service]
-ExecStart=/usr/local/bin/observer
-Restart=always
-RestartSec=5
-
-# Core config
-Environment=DOCKER_SOCKET=/var/run/docker.sock
-Environment=DATA_DIR=/var/lib/observer
-Environment=LLM_URL=https://api.openai.com
-Environment=LLM_MODEL=gpt-5-mini-2025-08-07
-Environment=LLM_API_KEY=sk-your-key-here
-
-# Alerts
-Environment=RESEND_API_KEY=re_your-key-here
-Environment=ALERT_EMAIL_TO=you@example.com
-
-# Response Evidence Capture (opt-in)
-Environment=REC_ENABLED=true
-Environment=REC_NS_CONTAINER=captain-nginx
-
-# Capabilities
-AmbientCapabilities=CAP_NET_RAW
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable observer
-sudo systemctl start observer
-sudo journalctl -u observer -f
-```
-
-### With Docker Compose (development/testing)
-
-```bash
-docker compose up --build
-```
+| Metric | Value |
+|--------|-------|
+| Events processed | 145,000+ |
+| Cache hit rate | 97% |
+| Total LLM calls | 354 |
+| LLM errors | 3 |
+| Total OpenAI spend | ~$17 lifetime |
+| False alarm emails | 0 |
+| Real escalations caught | 1 (.env credential exposure) |
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker socket path |
-| `DATA_DIR` | `/var/lib/observer` | Pattern store persistence |
 | `LLM_URL` | `https://api.openai.com` | LLM API endpoint (OpenAI-compatible) |
-| `LLM_MODEL` | `gpt-5-mini-2025-08-07` | Model for classification |
+| `LLM_MODEL` | `gpt-5-nano-2025-08-07` | Model for classification |
 | `LLM_API_KEY` | | API key for the LLM provider |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker socket path |
+| `DATA_DIR` | `/data` | Pattern store + SQLite persistence |
 | `EXCLUDE_CONTAINERS` | | Comma-separated container names to skip |
 | `RESEND_API_KEY` | | Resend API key for email alerts |
 | `ALERT_EMAIL_TO` | | Alert recipient email address |
 | `REC_ENABLED` | `false` | Enable Response Evidence Capture |
-| `REC_NS_CONTAINER` | | Container name pattern for namespace capture (e.g. `captain-nginx`) |
-| `REC_INTERFACE` | | Network interface to capture on (empty = all) |
-| `REC_VXLAN_PORT` | auto-detect | VXLAN port override (default: detected from Docker Swarm API) |
+| `REC_NS_CONTAINER` | | Container name for namespace capture (e.g. `captain-nginx`) |
+| `JOURNALD_EXCLUDE_UNITS` | | Additional systemd units to suppress |
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │  Observer (single Go binary)            │
-                    │                                         │
-  Docker API ──────▶│  Watcher ──▶ Normalizer ──▶ Pattern    │
-  (container logs)  │                             Store      │
-                    │                              │          │
-                    │                     miss?    │          │
-                    │                              ▼          │
-                    │                          LLM Client ───▶│──▶ OpenAI / Ollama / etc.
-                    │                              │          │
-                    │                     learn    │          │
-                    │                              ▼          │
-                    │              ┌─── Coordinator ───┐      │
-                    │              │  (forensic huddle) │      │
-                    │              │  holds 2-5s for    │      │
-  AF_PACKET ───────▶│  REC ────▶  │  evidence before   │──────▶ Email / Webhook / SMS
-  (namespace sniff) │  Sniffer    │  dispatching       │      │
-                    │              └────────────────────┘      │
-                    └─────────────────────────────────────────┘
+                    ┌─────────────────────────────────────────────┐
+                    │  Observer (single Go binary)                │
+                    │                                             │
+  Journald ────────▶│  Journald     ┌──────────┐                 │
+  (sshd, sudo,      │  Watcher  ──▶│           │                 │
+   kernel)           │              │ Normalize │                 │
+                    │              │     │      │                 │
+  Docker API ──────▶│  Docker   ──▶│  Policy   │                 │
+  (container logs)  │  Watcher     │  Engine   │                 │
+                    │              │     │      │                 │
+                    │              │  Pattern   │                 │
+                    │              │  Store     │                 │
+                    │              │     │      │                 │
+                    │              │  LLM ──────│──▶ OpenAI      │
+                    │              │     │      │                 │
+                    │              │ Coordinator│                 │
+  AF_PACKET ───────▶│  REC ───────▶│  (evidence │──▶ Email alert │
+  (namespace sniff) │  Sniffer     │   huddle)  │                │
+                    │              └──────────┘                 │
+                    └─────────────────────────────────────────────┘
 ```
 
-### Pipeline Detail
+### Pipeline Layers
 
-1. **Watcher** streams container logs via Docker socket
-2. **Normalizer** strips variable content (timestamps, IPs, PIDs) for stable hashing. Source-specific normalizers for nginx, sshd, postgres. Generic fallback for everything else.
-3. **Pattern Store** — 4-bucket model (allow/deny/alert/suppress), 4-tier matching (hash → prefix → regex → contains). Nanosecond lookups.
-4. **LLM Client** — OpenAI-compatible API. Intent × outcome classification. Learns patterns from verdicts. Reconciles contradictory fields.
+1. **Deterministic filters** — Stack traces, failed HTTP probes, SSH brute force. Regex-free structural detection. Never touches the LLM.
+2. **Policy engine** — SSH logins, user creation, privilege escalation, authorized_keys. Identity-based decisions with trusted IP allowlist.
+3. **Pattern store** — 4-bucket model (allow/malicious/alert/suppress), 4-tier matching (hash → prefix → regex → contains). Nanosecond lookups.
+4. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Learns patterns from verdicts. Bounded retry queue for backpressure.
 5. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Captures HTTP responses, redacts secrets, correlates with alerts.
-6. **Coordinator** — Groups alerts from multiple containers into one investigation. Holds for 2-5 seconds to collect evidence. Downgrades false alarms. Dispatches one accurate finding.
-7. **Re-Classification Cache** — Keyed on redacted body hash. Same response body = same conclusion. Zero LLM cost on repeat.
+6. **Coordinator** — Groups alerts, holds for evidence (2-5s), downgrades false alarms, dispatches findings. Email only on confirmed credential exposure.
+7. **Catch-all suppression** — Learns server fingerprints (host, status, body size). Auto-downgrades repeated identical responses across different attack paths.
 
-### Seeded Deny Patterns
+## Dashboard
 
-Observer ships with curated attack indicators:
+Observer includes a web dashboard at `http://your-server:9090` showing:
 
-- Shell injection: `rm -rf /`, `chmod 777`, reverse shells (`nc -e`, `bash -i >& /dev/tcp`)
-- Path traversal: `../../etc/passwd`, `/etc/shadow`
-- SQL injection: `UNION SELECT`, `DROP TABLE`
-- Command injection: `; ls -la`, `&& cat /etc`
-- Remote code execution: `curl | sh`, `wget | sh`, `base64 -d | bash`
-- Reconnaissance: `phpinfo()`, `.bash_history`, `authorized_keys`
+- **Overview** — Security outcomes (escalations, blocked, downgraded, needs review) and system health
+- **Events** — Every security event with AI classification, evidence, confirm/correct buttons
+- **Internals** — LLM decision audit trail, pattern store stats, REC metrics
+- **Settings** — Trusted IP management, active policy rules
 
-These trigger instant deny verdicts. The LLM handles everything else.
+Access is protected by a randomly generated key stored at `/etc/vaultguardian/dashboard.key`.
 
 ## Project Structure
 
 ```
-├── main.go                           # Pipeline wiring, coordinator, cache
+├── main.go                           # Pipeline wiring, coordinator, retry queue
+├── seeds.go                          # Curated malicious pattern seeds
+├── resultrouter.go                   # Shared classification outcome handler
+├── config.go                         # Environment variable configuration
+├── install.sh                        # One-command installer
 ├── internal/
-│   ├── coordinator/
-│   │   └── coordinator.go            # Forensic huddle — hold alerts for evidence
-│   ├── rec/
-│   │   ├── sniffer.go                # AF_PACKET raw socket HTTP capture
-│   │   ├── nsenter.go                # Network namespace capture via setns
-│   │   ├── vxlan.go                  # VXLAN decapsulation (RFC 7348)
-│   │   ├── redaction.go              # Structural redaction (HTML/JSON/dotenv/passwd)
-│   │   ├── buffer.go                 # Multi-constraint ring buffer
-│   │   ├── collector.go              # Evidence collector interface + live/noop
-│   │   ├── types.go                  # Evidence, confidence, format types
-│   │   ├── capability.go             # CAP_NET_RAW check
-│   │   ├── bpf.go                    # BPF kernel filter (reference stub)
-│   │   └── vxlan_test.go             # VXLAN decap tests
-│   ├── analyzer/
-│   │   └── analyzer.go               # Normalize → match → classify → learn
-│   ├── normalizer/
-│   │   ├── normalizer.go             # Registry with fuzzy service matching
-│   │   ├── nginx.go                  # Nginx access + error log normalizer
-│   │   ├── generic.go                # Fallback: timestamps, IPs, UUIDs
-│   │   ├── docker.go                 # Docker framing strip
-│   │   ├── sshd.go                   # SSH auth log normalizer
-│   │   ├── postgres.go               # PostgreSQL log normalizer
-│   │   ├── syslog.go                 # Syslog envelope normalizer
-│   │   ├── hints.go                  # LLM normalization hint collector
-│   │   └── normalizer_test.go        # 28 normalizer tests
-│   ├── patternstore/
-│   │   └── store.go                  # 4-bucket, 4-tier pattern matching
-│   ├── llm/
-│   │   └── client.go                 # LLM client + re-classification
-│   ├── notifier/
-│   │   ├── notifier.go               # Alert dispatch
-│   │   ├── email.go                  # Resend email alerts
-│   │   ├── webhook.go                # Webhook alerts
-│   │   ├── sms.go                    # Twilio SMS
-│   │   ├── apns.go                   # Apple push notifications
-│   │   ├── fcm.go                    # Firebase push notifications
-│   │   └── config.go                 # Notification config loader
-│   ├── watcher/
-│   │   └── watcher.go                # Docker socket log streaming
-│   └── event/
-│       └── event.go                  # Canonical event model
+│   ├── analyzer/                     # Normalize → match → classify → learn
+│   ├── api/                          # Dashboard REST API + static files
+│   ├── coordinator/                  # Evidence huddle + catch-all suppression
+│   ├── event/                        # Canonical event model
+│   ├── llm/                          # LLM client, Tier 1 + Tier 2 prompts
+│   ├── normalizer/                   # Source-specific log normalization
+│   │   ├── nginx.go                  # Nginx access + error logs
+│   │   ├── sshd.go                   # SSH auth logs
+│   │   ├── postgres.go               # PostgreSQL logs
+│   │   ├── syslog.go                 # Syslog envelope
+│   │   ├── docker.go                 # Docker framing
+│   │   └── generic.go                # Fallback normalizer
+│   ├── notifier/                     # Email (Resend), webhook, SMS, push
+│   ├── patternstore/                 # 4-bucket, 4-tier pattern matching
+│   ├── policy/                       # Deterministic pre-LLM policy engine
+│   ├── rec/                          # Response Evidence Capture (AF_PACKET)
+│   ├── store/                        # SQLite persistence (findings, decisions)
+│   └── watcher/                      # Docker + journald log streaming
 ├── Dockerfile
 ├── docker-compose.yml
-├── go.mod
-└── go.sum
+├── go.mod / go.sum
+└── README.md
 ```
 
-## Testing
+## Build from Source
 
 ```bash
-# Run all tests
-go test ./internal/... -v
+# Clone
+git clone https://github.com/VaultGuardian/observer.git
+cd observer
 
-# VXLAN decapsulation tests only
-go test ./internal/rec/ -run TestDecapVXLAN -v
+# Test
+go test ./...
 
-# Normalizer tests only
-go test ./internal/normalizer/ -v
-```
-
-## Build & Deploy
-
-```bash
 # Build for Linux
 GOOS=linux GOARCH=amd64 go build -o observer .
-
-# Release via GitHub
-gh release create v0.X ./observer --title "Observer v0.X" --notes "description"
-
-# Deploy
-gh release download v0.X --repo YourOrg/logwatch --pattern "observer"
-sudo mv observer /usr/local/bin/observer
-sudo chmod +x /usr/local/bin/observer
-sudo systemctl restart observer
 ```
 
-## Roadmap
+## Contributing
 
-- [x] Docker container log watching
-- [x] LLM classification with pattern learning
-- [x] Intent × outcome classification (recon_failed vs recon_success)
-- [x] Response Evidence Capture (namespace + VXLAN)
-- [x] Structural redaction (HTML/JSON/dotenv/passwd)
-- [x] Evidence-aware re-classification
-- [x] Re-classification caching
-- [x] Forensic huddle coordinator
-- [ ] Journald watcher (SSH, systemd, host-level events)
-- [ ] Integration configs (YAML service definitions)
-- [ ] LLM circuit breaker (degraded-mode alerting)
-- [ ] BPF kernel filtering (CPU optimization)
-- [ ] Admin API for pattern management
-- [ ] Web dashboard
+Observer's normalizers are the primary contribution path. Each normalizer teaches Observer to recognize a specific service's log format, improving hash-hit rates and reducing LLM calls.
+
+Observer works with everything out of the box via the generic normalizer. Service-specific normalizers make it faster and cheaper.
+
+To add a normalizer:
+1. Create `internal/normalizer/yourservice.go` implementing the `Normalizer` interface
+2. Register it in `normalizer.go`
+3. Add tests in `normalizer_test.go`
 
 ## Open Core
 
-Observer's core engine is open source. The detection pipeline, evidence capture, re-classification, and local deployment are free and unrestricted.
+Observer's detection engine is open source. The full pipeline — classification, evidence capture, re-classification, pattern learning, policy engine, and local deployment — is free and unrestricted.
 
-Future commercial add-ons (fleet management, centralized dashboard, long-term retention, team workflows) will be separate.
+Future commercial offerings (fleet dashboard at [app.vaultguardian.io](https://app.vaultguardian.io), multi-server management, long-term retention, team workflows) are separate.
 
 ## License
 
@@ -278,4 +229,4 @@ TBD
 
 ---
 
-*Part of the [VaultGuardian](https://vaultguardian.io) ecosystem. Observer detects the act. [DEC-1](https://vaultguardian.io) stops the data from leaving.*
+*Part of the [VaultGuardian](https://vaultguardian.io) ecosystem. Observer detects the intrusion. [DEC-1](https://vaultguardian.io) stops the data from leaving.*

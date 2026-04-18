@@ -24,16 +24,16 @@ type Verdict struct {
 	// Reason: human-readable explanation
 	Reason string `json:"reason"`
 
-	// Action: "allow", "deny", "suppress", "alert"
+	// Action: "allow", "malicious", "suppress", "alert"
 	//   allow    → whitelist as known-good
-	//   deny     → blacklist as known-bad, alert immediately
+	//   malicious    → blacklist as known-bad, alert immediately
 	//   suppress → known-noise, don't alert, don't re-analyze
 	//   alert    → suspicious but don't learn a permanent pattern yet
 	Action string `json:"action"`
 
 	// PatternType: "prefix", "regex", "contains", or "" (no pattern learned).
 	// Only returned when Action is "allow" or "suppress".
-	// Deny patterns are suggested but not auto-promoted.
+	// Malicious patterns are suggested but not auto-promoted.
 	PatternType string `json:"pattern_type,omitempty"`
 
 	// Pattern: the actual match string/expression.
@@ -112,7 +112,7 @@ Respond ONLY with a JSON object in this exact format:
   "classification": "safe" | "suspicious" | "malicious" | "noise" | "recon_failed" | "recon_success",
   "confidence": 0.0 to 1.0,
   "reason": "brief explanation",
-  "action": "allow" | "deny" | "suppress" | "alert",
+  "action": "allow" | "malicious" | "suppress" | "alert",
   "pattern_type": "prefix" | "regex" | "contains" | "",
   "pattern": "the pattern string or empty",
   "source_hint": "service name guess",
@@ -130,7 +130,7 @@ INTENT × OUTCOME IS EVERYTHING. The request path tells you what the attacker WA
 - "recon_failed" + "suppress": Attacker probed and GOT NOTHING (error response codes on suspicious paths)
 - "recon_success" + "alert": Attacker probed something sensitive and GOT A REAL RESPONSE (200 on /.env, /.git, /config, etc.) — this is URGENT
 - "suspicious" + "alert": Unusual activity that is NOT a simple failed probe (unexpected auth, abnormal response sizes, legitimate paths with abnormal behavior)
-- "malicious" + "deny": Confirmed attack payloads in the request itself, regardless of status code (SQL injection, shell injection, PHP wrappers, encoded exploits)
+- "malicious" + "malicious": Confirmed attack payloads in the request itself, regardless of status code (SQL injection, shell injection, PHP wrappers, encoded exploits)
 
 KEY RULES:
 - ALWAYS look at the HTTP status code
@@ -160,7 +160,7 @@ DO NOT contradict yourself:
 
 Status 200 is the ONLY ambiguous case:
 - Status 200 on a sensitive path (.env, .git, /config, /admin, /wp-admin) = recon_success + alert. The server served SOMETHING. We need evidence to know what.
-- Status 200 on a normal path with attack payload in query = malicious + deny. The payload is the attack, regardless of what the server returned.
+- Status 200 on a normal path with attack payload in query = malicious + malicious. The payload is the attack, regardless of what the server returned.
 
 NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
@@ -198,7 +198,7 @@ OTHER SYSTEM LOG RULES:
 IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases. Do NOT hedge with 0.60-0.75 on failed SSH — you will poison the pattern cache with wrong classifications that persist forever.
 
 PATTERN RULES:
-- Only return a pattern when action is "allow" or "suppress". Never for "alert" or "deny".
+- Only return a pattern when action is "allow" or "suppress". Never for "alert" or "malicious".
 - PREFER "prefix" — fastest and safest.
 - Use "regex" only when variable content is in the MIDDLE. Always anchor with ^. Be specific.
 - Use "contains" only as last resort. Minimum 10 characters.
@@ -309,9 +309,9 @@ CRITICAL JSON RULES:
 		}
 	}
 
-	// Sanitize: don't trust deny patterns from the LLM.
+	// Sanitize: don't trust malicious patterns from the LLM.
 	// They can be suggested but should not be auto-learned.
-	if verdict.Action == "deny" {
+	if verdict.Action == "malicious" {
 		verdict.PatternType = ""
 		verdict.Pattern = ""
 	}
@@ -323,7 +323,7 @@ CRITICAL JSON RULES:
 		verdict.Pattern = ""
 	}
 
-	// Consistency check: if the LLM says classification=safe but action=deny/alert,
+	// Consistency check: if the LLM says classification=safe but action=malicious/alert,
 	// or classification=malicious but action=allow, override the action to match
 	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
 	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
@@ -361,10 +361,10 @@ func reconcileClassificationAction(classification, action, reason string) string
 			return "alert"
 		}
 	case "malicious":
-		if action != "deny" {
-			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to deny",
+		if action != "malicious" {
+			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to malicious",
 				classification, action)
-			return "deny"
+			return "malicious"
 		}
 	}
 	return action
@@ -425,7 +425,7 @@ type ReclassifyVerdict struct {
 
 // ReclassifyWithEvidence asks the LLM to re-evaluate a verdict given captured
 // response evidence. Only called when:
-//   1. Initial verdict was deny/alert (suspicious/malicious)
+//   1. Initial verdict was malicious/alert (suspicious/malicious)
 //   2. REC captured the response with high correlation confidence
 //   3. Redaction passed (SafeBodyPreview is populated)
 //
@@ -451,7 +451,7 @@ Respond ONLY with a JSON object:
   "classification": "safe" | "suspicious" | "malicious" | "recon_failed" | "recon_success",
   "confidence": 0.0 to 1.0,
   "reason": "brief explanation of what the response evidence shows",
-  "action": "allow" | "deny" | "suppress" | "alert"
+  "action": "allow" | "malicious" | "suppress" | "alert"
 }
 
 RULES:
@@ -463,10 +463,10 @@ RULES:
 - A 403/404 with a large body could be a custom error page — check the content.
 
 ESCALATION RULES — when to UPGRADE severity:
-- If the response body contains KEY=VALUE pairs with credentials (passwords, API keys, secret keys, tokens) → classify as "malicious" + "deny". This is confirmed credential exposure.
-- If the response body contains /etc/passwd or /etc/shadow formatted output → "malicious" + "deny". System file exfiltration confirmed.
-- If the response body contains SQL query results, database dumps, or table data → "malicious" + "deny". Data exfiltration confirmed.
-- If the response body contains JSON with user records, emails, or PII → "malicious" + "deny". Data breach confirmed.
+- If the response body contains KEY=VALUE pairs with credentials (passwords, API keys, secret keys, tokens) → classify as "malicious" + "malicious". This is confirmed credential exposure.
+- If the response body contains /etc/passwd or /etc/shadow formatted output → "malicious" + "malicious". System file exfiltration confirmed.
+- If the response body contains SQL query results, database dumps, or table data → "malicious" + "malicious". Data exfiltration confirmed.
+- If the response body contains JSON with user records, emails, or PII → "malicious" + "malicious". Data breach confirmed.
 
 DOWNGRADE RULES — when to REDUCE severity:
 - Generic HTML page (framework welcome page, admin login, redirect landing) → "recon_failed" + "suppress"

@@ -62,7 +62,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[observer] Failed to init pattern store: %v", err)
 	}
-	seedDenyPatterns(patterns)
+	seedMaliciousPatterns(patterns)
 	log.Printf("[observer] Pattern store initialized (%d scopes)", patterns.ScopeCount())
 
 	// ------- Init SQLite findings store -------
@@ -357,7 +357,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				HTTPPath:          alert.HTTPPath,
 				HTTPStatus:        alert.StatusCode,
 				ResponseBytes:     alert.ResponseBytes,
-				Verdict:           "deny",
+				Verdict:           "malicious",
 				Classification:    "malicious",
 				Reason:            alert.EscalateReason,
 				MatchedVia:        alert.MatchedVia,
@@ -419,7 +419,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 //     "attack failed" (403/404/405/410), downgrade immediately.
 //     No body preview required. No LLM call required.
 //     These events are already known to contain attack payloads (they're in
-//     the coordinator because they were classified as deny/alert). A 404 on
+//     the coordinator because they were classified as malicious/alert). A 404 on
 //     a SQL injection means the server rejected/ignored the payload. Period.
 //
 //   Path 2 — Body-aware re-classification:
@@ -531,7 +531,7 @@ func makeEvidenceCheckCallback(
 		// Determine classification
 		classification := pending.Classification
 		if classification == "" {
-			if pending.Verdict == "deny" {
+			if pending.Verdict == "malicious" {
 				classification = "malicious"
 			} else {
 				classification = "suspicious"
@@ -932,7 +932,7 @@ func routePolicyOutcome(
 			SourceType:     evt.SourceType,
 			SourceName:     evt.SourceName,
 			SourceIP:       pr.SourceIP,
-			Verdict:        "deny",
+			Verdict:        "malicious",
 			Classification: "policy_escalated",
 			Confidence:     1.0,
 			Reason:         pr.Reason,
@@ -1084,9 +1084,9 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d",
 				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned,
 				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops)
-			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d deny=%d alert=%d suppress=%d misses=%d",
+			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d malicious=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
-				pStats.DenyHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
+				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
 			if collector.Enabled() {
 				rStats := collector.Stats()
 				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d",
@@ -1120,7 +1120,7 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				LLMCalls:        aStats.LLMCalls,
 				LLMErrors:       aStats.LLMErrors,
 				PatternsLearned: aStats.PatternsLearned,
-				DenyCount:       pStats.DenyHits,
+				MaliciousCount:       pStats.MaliciousHits,
 				AlertCount:      pStats.AlertHits,
 				SuppressCount:   pStats.SuppressHits,
 			})

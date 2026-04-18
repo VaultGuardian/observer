@@ -189,7 +189,7 @@ func (s *Store) migrate() error {
 				llm_calls INTEGER,
 				llm_errors INTEGER,
 				patterns_learned INTEGER,
-				deny_count INTEGER,
+				malicious_count INTEGER,
 				alert_count INTEGER,
 				suppress_count INTEGER
 			);
@@ -330,7 +330,7 @@ func (s *Store) migrate() error {
 // Retention (design team agreed, 2026-03-24):
 //   - allow/suppress: 7 days (high volume, low value)
 //   - recon/downgrade: 90 days (useful for trend analysis)
-//   - deny/alert/malicious: never auto-pruned (security record)
+//   - malicious/alert/malicious: never auto-pruned (security record)
 //   - pipeline_stats: 90 days
 func (s *Store) Prune(ctx context.Context) error {
 	cutoff7d := time.Now().AddDate(0, 0, -7).Format(time.RFC3339)

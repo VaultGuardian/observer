@@ -2,7 +2,7 @@ package main
 
 import "github.com/vaultguardian/observer/internal/patternstore"
 
-// denySeeds defines curated attack indicators seeded into the global deny list.
+// maliciousSeeds defines curated attack indicators seeded into the global malicious list.
 // These are manually chosen, not learned — they apply to all sources.
 // The pattern store uses substring matching for seeded patterns.
 //
@@ -15,7 +15,7 @@ import "github.com/vaultguardian/observer/internal/patternstore"
 //   Rationale: Seeds bypass LLM classification, evidence check, and coordinator
 //   downgrade. With 97%+ cache hit rates, seeds save one LLM call worth fractions
 //   of a penny but prevent the system from correctly suppressing failed probes.
-var denySeeds = []struct {
+var maliciousSeeds = []struct {
 	Pattern string
 	Reason  string
 }{
@@ -32,9 +32,9 @@ var denySeeds = []struct {
 	{"rm -rf /", "Destructive filesystem command"},
 }
 
-// seedDenyPatterns loads curated attack indicators into the pattern store.
-func seedDenyPatterns(store *patternstore.Store) {
-	for _, s := range denySeeds {
-		store.SeedDenyPattern(s.Pattern, s.Reason)
+// seedMaliciousPatterns loads curated attack indicators into the pattern store.
+func seedMaliciousPatterns(store *patternstore.Store) {
+	for _, s := range maliciousSeeds {
+		store.SeedMaliciousPattern(s.Pattern, s.Reason)
 	}
 }

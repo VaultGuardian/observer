@@ -74,7 +74,7 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 		// Done — pattern learned or noise confirmed
 		return
 
-	case patternstore.VerdictDeny, patternstore.VerdictAlert:
+	case patternstore.VerdictMalicious, patternstore.VerdictAlert:
 		r.routeAlert(evt, result, line)
 
 	case patternstore.VerdictUnknown:
@@ -84,7 +84,7 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 	}
 }
 
-// routeAlert handles deny/alert verdicts: recon routing, HTTP coordinator path,
+// routeAlert handles malicious/alert verdicts: recon routing, HTTP coordinator path,
 // and non-HTTP direct-to-findings path.
 func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisResult, line watcher.LogLine) {
 	method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)

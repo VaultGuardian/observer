@@ -63,7 +63,7 @@ type LLMDecision struct {
 
 	// What Observer did with it
 	PatternLearned bool   `json:"pattern_learned"`
-	PatternBucket  string `json:"pattern_bucket,omitempty"` // allow, deny, alert, suppress
+	PatternBucket  string `json:"pattern_bucket,omitempty"` // allow, malicious, alert, suppress
 	CacheKey       string `json:"cache_key,omitempty"`      // pattern value (tier1) or body hash (tier2)
 	FinalVerdict   string `json:"final_verdict,omitempty"`
 	Escalated      bool   `json:"escalated"`

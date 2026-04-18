@@ -25,7 +25,7 @@ type Finding struct {
 	UserAgent     string `json:"user_agent,omitempty"`
 
 	// Classification
-	Verdict        string  `json:"verdict"`        // allow, deny, alert, suppress, recon, unknown
+	Verdict        string  `json:"verdict"`        // allow, malicious, alert, suppress, recon, unknown
 	Classification string  `json:"classification"` // safe, malicious, recon_failed, recon_success, noise
 	Confidence     float64 `json:"confidence"`
 	Reason         string  `json:"reason"`
@@ -79,7 +79,7 @@ type PipelineStats struct {
 	LLMCalls        int64     `json:"llm_calls"`
 	LLMErrors       int64     `json:"llm_errors"`
 	PatternsLearned int64     `json:"patterns_learned"`
-	DenyCount       int64     `json:"deny_count"`
+	MaliciousCount       int64     `json:"malicious_count"`
 	AlertCount      int64     `json:"alert_count"`
 	SuppressCount   int64     `json:"suppress_count"`
 }

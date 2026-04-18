@@ -232,7 +232,7 @@ func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) Analys
 		a.stats.LLMErrors.Add(1)
 		log.Printf("[analyzer] LLM error for %s: %v", evt.ScopeKey(), err)
 
-		// On LLM failure, return unknown — don't auto-allow or auto-deny
+		// On LLM failure, return unknown — don't auto-allow or auto-malicious
 		return AnalysisResult{
 			Event:   evt,
 			Verdict: patternstore.VerdictUnknown,
@@ -288,15 +288,15 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine)
 	}
 
-	// For deny, learn the hash but NOT patterns (conservative trust model)
-	if v == patternstore.VerdictDeny {
+	// For malicious, learn the hash but NOT patterns (conservative trust model)
+	if v == patternstore.VerdictMalicious {
 		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine)
 		return false
 	}
 
 	// For alert, learn the exact hash so identical suspicious lines get instant
 	// alerts without burning another LLM call. Stored as VerdictAlert — semantically
-	// distinct from VerdictDeny (suspicious vs confirmed-bad). Hash-only, no patterns,
+	// distinct from VerdictMalicious (suspicious vs confirmed-bad). Hash-only, no patterns,
 	// no generalization. The conservative trust model is preserved.
 	if verdict.Action == "alert" {
 		a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine)
@@ -396,8 +396,8 @@ func mapActionToVerdict(action string) patternstore.Verdict {
 	switch action {
 	case "allow":
 		return patternstore.VerdictAllow
-	case "deny":
-		return patternstore.VerdictDeny
+	case "malicious":
+		return patternstore.VerdictMalicious
 	case "alert":
 		return patternstore.VerdictAlert
 	case "suppress":

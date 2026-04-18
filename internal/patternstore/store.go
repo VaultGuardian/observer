@@ -17,7 +17,7 @@ type Verdict string
 
 const (
 	VerdictAllow    Verdict = "allow"    // Known-good, skip silently
-	VerdictDeny     Verdict = "deny"     // Known-bad, alert with high severity
+	VerdictMalicious     Verdict = "malicious"     // Known-bad, alert with high severity
 	VerdictAlert    Verdict = "alert"    // Suspicious, alert with lower severity, exact-hash memoized
 	VerdictSuppress Verdict = "suppress" // Known-noise, don't alert, don't send to LLM
 	VerdictUnknown  Verdict = "unknown"  // No match — forward to LLM
@@ -62,7 +62,7 @@ type LearnedPattern struct {
 	compiled *regexp.Regexp
 }
 
-// PatternBucket holds patterns for one verdict type (allow, deny, or suppress)
+// PatternBucket holds patterns for one verdict type (allow, malicious, or suppress)
 // scoped to a single source key.
 type PatternBucket struct {
 	Hashes   map[string]*LearnedPattern `json:"hashes,omitempty"`   // hash → pattern
@@ -74,7 +74,7 @@ type PatternBucket struct {
 // ScopeEntry holds all four buckets for a single source scope key.
 type ScopeEntry struct {
 	Allow    PatternBucket `json:"allow"`
-	Deny     PatternBucket `json:"deny"`
+	Malicious PatternBucket `json:"malicious"`
 	Alert    PatternBucket `json:"alert"`
 	Suppress PatternBucket `json:"suppress"`
 }
@@ -113,7 +113,7 @@ type Stats struct {
 	PrefixHits   atomic.Int64
 	RegexHits    atomic.Int64
 	ContainsHits atomic.Int64
-	DenyHits     atomic.Int64
+	MaliciousHits     atomic.Int64
 	AlertHits    atomic.Int64
 	SuppressHits atomic.Int64
 	Misses       atomic.Int64
@@ -127,7 +127,7 @@ type StatsSnapshot struct {
 	PrefixHits   int64 `json:"prefix_hits"`
 	RegexHits    int64 `json:"regex_hits"`
 	ContainsHits int64 `json:"contains_hits"`
-	DenyHits     int64 `json:"deny_hits"`
+	MaliciousHits     int64 `json:"malicious_hits"`
 	AlertHits    int64 `json:"alert_hits"`
 	SuppressHits int64 `json:"suppress_hits"`
 	Misses       int64 `json:"misses"`
@@ -142,7 +142,7 @@ func NewStore(dataDir string) (*Store, error) {
 		dataDir: dataDir,
 	}
 	initBucket(&s.global.Allow)
-	initBucket(&s.global.Deny)
+	initBucket(&s.global.Malicious)
 	initBucket(&s.global.Alert)
 	initBucket(&s.global.Suppress)
 
@@ -160,7 +160,7 @@ func initBucket(b *PatternBucket) {
 }
 
 // Match checks an event against all pattern tiers.
-// Order: deny first (safety), then allow, then suppress.
+// Order: malicious first (safety), then allow, then suppress.
 // Within each verdict: source-scoped first, then global.
 // Within each scope: hash → prefix → regex → contains.
 func (s *Store) Match(scopeKey, hash, normalizedLine string) *MatchResult {
@@ -170,8 +170,8 @@ func (s *Store) Match(scopeKey, hash, normalizedLine string) *MatchResult {
 	s.stats.TotalChecked.Add(1)
 
 	// --- DENY first (safety: known-bad takes priority) ---
-	if r := s.matchBucket(scopeKey, hash, normalizedLine, VerdictDeny); r != nil {
-		s.stats.DenyHits.Add(1)
+	if r := s.matchBucket(scopeKey, hash, normalizedLine, VerdictMalicious); r != nil {
+		s.stats.MaliciousHits.Add(1)
 		s.trackTierHit(r.Tier)
 		return r
 	}
@@ -233,8 +233,8 @@ func (s *Store) getBucket(scope *ScopeEntry, v Verdict) *PatternBucket {
 	switch v {
 	case VerdictAllow:
 		return &scope.Allow
-	case VerdictDeny:
-		return &scope.Deny
+	case VerdictMalicious:
+		return &scope.Malicious
 	case VerdictAlert:
 		return &scope.Alert
 	case VerdictSuppress:
@@ -366,22 +366,22 @@ func (s *Store) getOrCreateScope(key string) *ScopeEntry {
 	}
 	scope := &ScopeEntry{}
 	initBucket(&scope.Allow)
-	initBucket(&scope.Deny)
+	initBucket(&scope.Malicious)
 	initBucket(&scope.Alert)
 	initBucket(&scope.Suppress)
 	s.scopes[key] = scope
 	return scope
 }
 
-// SeedDenyPattern adds a seeded (manually curated) deny pattern.
+// SeedMaliciousPattern adds a seeded (manually curated) malicious pattern.
 // Seeded patterns use the "seeded" source tag to distinguish from learned.
 // Skips if a pattern with the same value already exists (prevents duplication on restart).
-func (s *Store) SeedDenyPattern(pattern, reason string) {
+func (s *Store) SeedMaliciousPattern(pattern, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if this exact pattern already exists in global deny contains
-	for _, existing := range s.global.Deny.Contains {
+	// Check if this exact pattern already exists in global malicious contains
+	for _, existing := range s.global.Malicious.Contains {
 		if existing.Value == pattern {
 			return // Already seeded, skip
 		}
@@ -395,11 +395,11 @@ func (s *Store) SeedDenyPattern(pattern, reason string) {
 		CreatedAt: time.Now(),
 	}
 
-	// Seeded deny patterns go into the global scope
+	// Seeded malicious patterns go into the global scope
 	// so they apply to ALL sources.
 	// For short seeded patterns, bypass the contains minimum length check
 	// since these are manually curated and intentional.
-	s.global.Deny.Contains = append(s.global.Deny.Contains, &p)
+	s.global.Malicious.Contains = append(s.global.Malicious.Contains, &p)
 	s.stats.PatternCount.Add(1)
 }
 
@@ -411,7 +411,7 @@ func (s *Store) GetStats() StatsSnapshot {
 		PrefixHits:   s.stats.PrefixHits.Load(),
 		RegexHits:    s.stats.RegexHits.Load(),
 		ContainsHits: s.stats.ContainsHits.Load(),
-		DenyHits:     s.stats.DenyHits.Load(),
+		MaliciousHits:     s.stats.MaliciousHits.Load(),
 		AlertHits:    s.stats.AlertHits.Load(),
 		SuppressHits: s.stats.SuppressHits.Load(),
 		Misses:       s.stats.Misses.Load(),
@@ -434,7 +434,7 @@ func (s *Store) ScopeCount() int {
 type ScopeSummary struct {
 	ScopeKey     string        `json:"scope_key"`
 	AllowCount   int           `json:"allow_count"`
-	DenyCount    int           `json:"deny_count"`
+	MaliciousCount    int           `json:"malicious_count"`
 	AlertCount   int           `json:"alert_count"`
 	SuppressCount int          `json:"suppress_count"`
 }
@@ -450,7 +450,7 @@ func (s *Store) ListScopes() []ScopeSummary {
 	summaries = append(summaries, ScopeSummary{
 		ScopeKey:      "__global__",
 		AllowCount:    bucketSize(&s.global.Allow),
-		DenyCount:     bucketSize(&s.global.Deny),
+		MaliciousCount:     bucketSize(&s.global.Malicious),
 		AlertCount:    bucketSize(&s.global.Alert),
 		SuppressCount: bucketSize(&s.global.Suppress),
 	})
@@ -459,7 +459,7 @@ func (s *Store) ListScopes() []ScopeSummary {
 		summaries = append(summaries, ScopeSummary{
 			ScopeKey:      key,
 			AllowCount:    bucketSize(&scope.Allow),
-			DenyCount:     bucketSize(&scope.Deny),
+			MaliciousCount:     bucketSize(&scope.Malicious),
 			AlertCount:    bucketSize(&scope.Alert),
 			SuppressCount: bucketSize(&scope.Suppress),
 		})
@@ -548,8 +548,8 @@ func (s *Store) getBucketReadOnly(scope *ScopeEntry, v Verdict) *PatternBucket {
 	switch v {
 	case VerdictAllow:
 		return &scope.Allow
-	case VerdictDeny:
-		return &scope.Deny
+	case VerdictMalicious:
+		return &scope.Malicious
 	case VerdictAlert:
 		return &scope.Alert
 	case VerdictSuppress:
@@ -611,17 +611,17 @@ func (s *Store) load() error {
 	if persisted.Global != nil {
 		s.global = persisted.Global
 		initBucket(&s.global.Allow)
-		initBucket(&s.global.Deny)
+		initBucket(&s.global.Malicious)
 		initBucket(&s.global.Alert)
 		initBucket(&s.global.Suppress)
 		// Deduplicate contains patterns (seeds were duplicated on every restart
 		// in earlier versions). Keep only the first occurrence of each value.
-		s.global.Deny.Contains = deduplicateContains(s.global.Deny.Contains)
+		s.global.Malicious.Contains = deduplicateContains(s.global.Malicious.Contains)
 	}
 
 	for key, scope := range persisted.Scopes {
 		initBucket(&scope.Allow)
-		initBucket(&scope.Deny)
+		initBucket(&scope.Malicious)
 		initBucket(&scope.Alert)
 		initBucket(&scope.Suppress)
 		s.scopes[key] = scope
@@ -646,7 +646,7 @@ func deduplicateContains(patterns []*LearnedPattern) []*LearnedPattern {
 		}
 	}
 	if len(result) < len(patterns) {
-		log.Printf("[patternstore] Deduplicated global deny contains: %d → %d patterns", len(patterns), len(result))
+		log.Printf("[patternstore] Deduplicated global malicious contains: %d → %d patterns", len(patterns), len(result))
 	}
 	return result
 }
@@ -670,12 +670,12 @@ func (s *Store) recompileAll() {
 
 	for _, scope := range s.scopes {
 		recompileBucket(&scope.Allow)
-		recompileBucket(&scope.Deny)
+		recompileBucket(&scope.Malicious)
 		recompileBucket(&scope.Alert)
 		recompileBucket(&scope.Suppress)
 	}
 	recompileBucket(&s.global.Allow)
-	recompileBucket(&s.global.Deny)
+	recompileBucket(&s.global.Malicious)
 	recompileBucket(&s.global.Alert)
 	recompileBucket(&s.global.Suppress)
 }
