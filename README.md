@@ -225,7 +225,7 @@ Future commercial offerings (fleet dashboard at [app.vaultguardian.io](https://a
 
 ## License
 
-TBD
+AGPL-3.0
 
 ---
 
