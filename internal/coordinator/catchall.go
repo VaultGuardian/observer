@@ -1,3 +1,4 @@
+// internal/coordinator/catchall.go
 package coordinator
 
 import (
@@ -12,24 +13,15 @@ import (
 // Catch-All Tracker — Structural Inference + One-Time Verification Gate
 // =============================================================================
 //
-// ARCHITECTURE (design consensus, 2026-03-31):
-//   Structural inference NOMINATES catch-all candidates.
-//   One-time active verification CONFIRMS them before permanent suppression.
-//   Verified fingerprints PERSIST to SQLite across restarts.
+// Fix 2 (v1.0 hardening): Fingerprint key changed from ResponseBytes to
+// BodyPreviewHash (SHA-256). Prevents "accordion padding" attack where
+// attacker varies query params to change response size and trick the
+// catch-all into auto-downgrading real data exfiltration.
 //
-//   "Don't assume, verify." — Observer's core principle.
+// The body hash is already computed per response by the sniffer. The
+// catch-all tracker just needs to key on it instead of byte count.
 //
-//   State machine per fingerprint:
-//     candidate → pending_verification → verified (suppress forever)
-//                                      → rejected (keep alerting)
-//
-//   the design review: structural inference identifies WHICH responses to verify.
-//   code review: one-time verify closes the safety gap.
-//   the team: verification uses existing redaction + re-classification pipeline.
-//
-// COST:
-//   One HTTP request + one LLM call per fingerprint LIFETIME.
-//   At current scanner rates: ~3-5 verify requests per week total.
+// the design review mandate: "Body hash, not body size. Non-negotiable."
 
 const (
 	DefaultCatchAllThreshold = 5
@@ -37,7 +29,6 @@ const (
 	maxPathsPerFingerprint   = 10
 )
 
-// catchAllState represents the lifecycle of a fingerprint.
 type catchAllState string
 
 const (
@@ -47,31 +38,40 @@ const (
 	StateRejected            catchAllState = "rejected"
 )
 
-// CatchAllFingerprint is the key: (host, method, status, responseBytes).
+// CatchAllFingerprint is the key: (host, method, status, bodyPreviewHash).
+//
+// Fix 2: ResponseBytes replaced with BodyPreviewHash (SHA-256).
+// An attacker can vary response size by padding but cannot forge
+// the SHA-256 hash of the redacted body preview.
+//
 // Method is included per code review's safety recommendation — POST fingerprints
 // must not auto-suppress based on GET verification results.
 type CatchAllFingerprint struct {
-	Host          string
-	Method        string
-	StatusCode    int
-	ResponseBytes int64
+	Host            string
+	Method          string
+	StatusCode      int
+	BodyPreviewHash string // SHA-256 of response body preview — replaces ResponseBytes
 }
 
 func (f CatchAllFingerprint) String() string {
-	return fmt.Sprintf("%s/%s/%d/%d", f.Host, f.Method, f.StatusCode, f.ResponseBytes)
+	hash := f.BodyPreviewHash
+	if len(hash) > 16 {
+		hash = hash[:16]
+	}
+	return fmt.Sprintf("%s/%s/%d/%s", f.Host, f.Method, f.StatusCode, hash)
 }
 
 // VerifyRequest is passed to the VerifyFunc when a fingerprint needs confirmation.
 type VerifyRequest struct {
 	Fingerprint CatchAllFingerprint
-	SamplePath  string // one of the paths that triggered this fingerprint
+	SamplePath  string
 }
 
 // VerifyResult is returned by the VerifyFunc after active verification.
 type VerifyResult struct {
-	Confirmed   bool   // true if response matched AND LLM confirmed benign
-	Reason      string // human-readable explanation
-	ContentType string // observed content-type
+	Confirmed   bool
+	Reason      string
+	ContentType string
 	BodyHash    string // hash of redacted body for persistence
 }
 
@@ -81,18 +81,18 @@ type VerifyFunc func(req VerifyRequest) *VerifyResult
 
 // catchAllEntry tracks the state of one fingerprint.
 type catchAllEntry struct {
-	Paths        map[string]bool // distinct paths seen (capped at maxPathsPerFingerprint)
-	TotalPaths   int             // total distinct paths seen (uncapped count)
+	Paths        map[string]bool
+	TotalPaths   int
 	FirstSeen    time.Time
 	LastSeen     time.Time
 	State        catchAllState
-	Suppressed   int64  // how many alerts auto-downgraded by this fingerprint
-	VerifyReason string // reason from verification (benign or rejected)
-	ContentType  string // from verification
-	BodyHash     string // from verification
+	Suppressed   int64
+	VerifyReason string
+	ContentType  string
+	BodyHash     string
 }
 
-// CatchAllTracker accumulates (host, method, status, bytes) evidence, verifies
+// CatchAllTracker accumulates (host, method, status, bodyHash) evidence, verifies
 // candidates, and suppresses confirmed catch-all patterns. Thread-safe.
 type CatchAllTracker struct {
 	mu        sync.Mutex
@@ -113,34 +113,30 @@ func NewCatchAllTracker(threshold int, verify VerifyFunc) *CatchAllTracker {
 	}
 }
 
-// Check tests whether a (host, method, status, bytes, path) combination is a known
-// verified catch-all. Returns true + reason if the alert should be auto-downgraded.
+// Check tests whether a (host, method, status, bodyPreviewHash, path) combination
+// is a known verified catch-all. Returns true + reason if the alert should be
+// auto-downgraded.
 //
-// Side effects:
-//   - Records the path for the fingerprint
-//   - If threshold crossed, triggers async verification (returns false until verified)
-func (t *CatchAllTracker) Check(host, method string, statusCode int, responseBytes int64, path string) (isCatchAll bool, reason string) {
-	if host == "" || responseBytes <= 0 {
+// Fix 2: bodyPreviewHash parameter replaces responseBytes.
+func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreviewHash string, path string) (isCatchAll bool, reason string) {
+	if host == "" || bodyPreviewHash == "" {
 		return false, ""
 	}
 
 	// Only auto-suppress GET/HEAD fingerprints in v1.
-	// POST/PUT/PATCH/DELETE are tracked but not eligible for promotion.
-	// (code review safety recommendation, 2026-03-31)
 	methodUpper := strings.ToUpper(method)
 	eligible := methodUpper == "GET" || methodUpper == "HEAD"
 
-	// Strip query string — distinct routes, not distinct parameters.
-	// ( audit, 2026-03-31)
+	// Strip query string
 	if idx := strings.IndexByte(path, '?'); idx >= 0 {
 		path = path[:idx]
 	}
 
 	fp := CatchAllFingerprint{
-		Host:          host,
-		Method:        methodUpper,
-		StatusCode:    statusCode,
-		ResponseBytes: responseBytes,
+		Host:            host,
+		Method:          methodUpper,
+		StatusCode:      statusCode,
+		BodyPreviewHash: bodyPreviewHash,
 	}
 
 	t.mu.Lock()
@@ -174,31 +170,27 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, responseByt
 
 	switch entry.State {
 	case StateCandidate:
-		// Check if we just crossed the threshold
 		if eligible && entry.TotalPaths >= t.threshold && t.verify != nil {
 			entry.State = StatePendingVerification
 			samplePath := firstPath(entry.Paths)
 
-			log.Printf("[catchall] Threshold crossed — requesting verification: host=%s method=%s status=%d bytes=%d paths=%d sample=%s",
-				host, methodUpper, statusCode, responseBytes, entry.TotalPaths, samplePath)
+			log.Printf("[catchall] Threshold crossed — requesting verification: host=%s method=%s status=%d hash=%.16s paths=%d sample=%s",
+				host, methodUpper, statusCode, bodyPreviewHash, entry.TotalPaths, samplePath)
 
-			// Async verification — don't block the coordinator
 			go t.runVerification(fp, samplePath)
 		}
 		return false, ""
 
 	case StatePendingVerification:
-		// Still verifying — let alerts through normally
 		return false, ""
 
 	case StateVerified:
 		entry.Suppressed++
-		reason = fmt.Sprintf("Verified catch-all: %d distinct paths on %s all returned identical %s %d/%d-byte response — %s",
-			entry.TotalPaths, host, methodUpper, statusCode, responseBytes, entry.VerifyReason)
+		reason = fmt.Sprintf("Verified catch-all: %d distinct paths on %s all returned identical %s %d response (body hash %.16s) — %s",
+			entry.TotalPaths, host, methodUpper, statusCode, bodyPreviewHash, entry.VerifyReason)
 		return true, reason
 
 	case StateRejected:
-		// Verification said this is NOT benign — keep alerting
 		return false, ""
 	}
 
@@ -217,7 +209,7 @@ func (t *CatchAllTracker) runVerification(fp CatchAllFingerprint, samplePath str
 
 	entry, ok := t.entries[fp]
 	if !ok || entry.State != StatePendingVerification {
-		return // entry was evicted or state changed while we were verifying
+		return
 	}
 
 	if result != nil && result.Confirmed {
@@ -226,8 +218,8 @@ func (t *CatchAllTracker) runVerification(fp CatchAllFingerprint, samplePath str
 		entry.ContentType = result.ContentType
 		entry.BodyHash = result.BodyHash
 
-		log.Printf("[catchall] VERIFIED catch-all: host=%s method=%s status=%d bytes=%d reason=%s",
-			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes, truncateReason(result.Reason, 100))
+		log.Printf("[catchall] VERIFIED catch-all: host=%s method=%s status=%d hash=%.16s reason=%s",
+			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash, truncateReason(result.Reason, 100))
 	} else {
 		entry.State = StateRejected
 		reason := "verification failed or returned sensitive content"
@@ -236,14 +228,12 @@ func (t *CatchAllTracker) runVerification(fp CatchAllFingerprint, samplePath str
 		}
 		entry.VerifyReason = reason
 
-		log.Printf("[catchall] REJECTED catch-all: host=%s method=%s status=%d bytes=%d reason=%s",
-			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes, truncateReason(reason, 100))
+		log.Printf("[catchall] REJECTED catch-all: host=%s method=%s status=%d hash=%.16s reason=%s",
+			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash, truncateReason(reason, 100))
 	}
 }
 
 // SeedVerified injects known-good catch-alls from the database on startup.
-// These were previously verified by active verification and persisted.
-// No re-verification needed — trust the database.
 func (t *CatchAllTracker) SeedVerified(fps []CatchAllFingerprint, reasons []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -267,12 +257,11 @@ func (t *CatchAllTracker) SeedVerified(fps []CatchAllFingerprint, reasons []stri
 	}
 
 	if seeded > 0 {
-		log.Printf("[catchall] Pre-warmed %d verified catch-all fingerprints from database", seeded)
+		log.Printf("[catchall] Pre-warmed %d verified catch-all fingerprints from database (v2, body hash keyed)", seeded)
 	}
 }
 
 // VerifiedCatchAll holds metadata for a verified fingerprint.
-// Used for persistence to SQLite.
 type VerifiedCatchAll struct {
 	Fingerprint  CatchAllFingerprint
 	VerifyReason string
@@ -282,7 +271,6 @@ type VerifiedCatchAll struct {
 }
 
 // GetNewlyVerified returns all verified fingerprints that need to be persisted.
-// Called after verification completes to save to SQLite.
 func (t *CatchAllTracker) GetNewlyVerified() []VerifiedCatchAll {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -330,7 +318,7 @@ func (t *CatchAllTracker) evictOldest() {
 	first := true
 	for fp, entry := range t.entries {
 		if entry.State == StateVerified {
-			continue // don't evict active catch-alls
+			continue
 		}
 		if first || entry.LastSeen.Before(oldestTime) {
 			oldestFP = fp

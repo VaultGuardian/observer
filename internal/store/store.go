@@ -1,3 +1,4 @@
+// internal/store/store.go
 package store
 
 import (
@@ -22,8 +23,9 @@ import (
 //   - Pure Go driver (modernc.org/sqlite) — no CGO, single binary preserved
 //   - Package-level convenience via global, struct-backed internally
 type Store struct {
-	db   *sql.DB
-	path string
+	db          *sql.DB
+	path        string
+	asyncWriter *FindingsWriter // Fix 3: async writer for high-volume findings
 }
 
 // Init opens (or creates) the SQLite database at dataDir/observer.db,
@@ -69,8 +71,11 @@ func Init(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// Close closes the database connection.
+// Close closes the database connection and stops the async writer.
 func (s *Store) Close() error {
+	if s.asyncWriter != nil {
+		s.asyncWriter.Stop()
+	}
 	if s.db != nil {
 		return s.db.Close()
 	}
@@ -81,6 +86,42 @@ func (s *Store) Close() error {
 // Use sparingly — prefer the typed methods.
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+// StartAsyncWriter creates and starts the background findings writer.
+// Fix 3: under DDoS scanner flood, synchronous INSERTs for recon_failed
+// events choke the pipeline. The async writer batches INSERTs and drops
+// only recon/noise if the channel is full.
+func (s *Store) StartAsyncWriter(ctx context.Context, bufSize int) {
+	if bufSize <= 0 {
+		bufSize = 5000
+	}
+	s.asyncWriter = NewFindingsWriter(s, bufSize)
+	go s.asyncWriter.Run(ctx)
+	log.Printf("[store] Async findings writer started (buffer=%d)", bufSize)
+}
+
+// SubmitFinding sends a finding to the async writer for batched INSERT.
+// If the async writer isn't running, falls back to synchronous INSERT.
+//
+// Priority rules (Fix 3, the team mandate):
+//   - Recon/allow/suppress findings: dropped if channel full (DDoS safety valve)
+//   - Malicious/alert/policy/escalated/downgraded: NEVER dropped, blocks if needed
+func (s *Store) SubmitFinding(f *Finding) {
+	if s.asyncWriter == nil {
+		// Fallback to sync
+		s.RecordFinding(context.Background(), f)
+		return
+	}
+	s.asyncWriter.Submit(f)
+}
+
+// AsyncWriterStats returns the async writer's drop count for telemetry.
+func (s *Store) AsyncWriterStats() int64 {
+	if s.asyncWriter == nil {
+		return 0
+	}
+	return s.asyncWriter.Dropped()
 }
 
 // migrate runs all schema migrations. Uses a simple version table
@@ -305,6 +346,39 @@ func (s *Store) migrate() error {
 
 			CREATE INDEX IF NOT EXISTS idx_trusted_ips_address ON trusted_ips(ip_address);
 			CREATE INDEX IF NOT EXISTS idx_trusted_ips_cidr ON trusted_ips(cidr);`,
+		},
+		// =====================================================================
+		// v1.0 HARDENING MIGRATIONS
+		// =====================================================================
+		{
+			version: 8,
+			desc:    "Fix 4: resolution lifecycle columns on findings",
+			sql: `ALTER TABLE findings ADD COLUMN resolution_status TEXT DEFAULT '';
+			ALTER TABLE findings ADD COLUMN resolved_at TEXT DEFAULT '';
+			ALTER TABLE findings ADD COLUMN resolution_method TEXT DEFAULT '';
+			ALTER TABLE findings ADD COLUMN previous_verdict TEXT DEFAULT '';
+
+			CREATE INDEX IF NOT EXISTS idx_findings_resolution ON findings(resolution_status);`,
+		},
+		{
+			version: 9,
+			desc:    "Fix 2: catchall_verified_v2 with body_preview_hash instead of response_bytes",
+			sql: `CREATE TABLE IF NOT EXISTS catchall_verified_v2 (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				host TEXT NOT NULL,
+				http_method TEXT NOT NULL,
+				http_status INTEGER NOT NULL,
+				body_preview_hash TEXT NOT NULL,
+				verified_at TEXT NOT NULL,
+				sample_path TEXT,
+				content_type TEXT,
+				body_hash TEXT,
+				verification_verdict TEXT NOT NULL,
+				verification_reason TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+				UNIQUE(host, http_method, http_status, body_preview_hash)
+			);`,
 		},
 	}
 

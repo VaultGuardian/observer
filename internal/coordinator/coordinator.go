@@ -1,3 +1,4 @@
+// internal/coordinator/coordinator.go
 package coordinator
 
 import (
@@ -13,92 +14,56 @@ import (
 //
 // WHY THIS EXISTS:
 //   On Docker Swarm, a single HTTP request produces log lines from both
-//   nginx and the backend container. Two problems:
-//
-//   1. Nginx fires instantly (cached hash hit, nanoseconds). The backend
-//      arrives 10-120 seconds later (queued behind LLM semaphore). By then
-//      the investigation is dispatched and deleted → duplicate email.
-//
-//   2. REC captures evidence (status code, body) but the evidence check
-//      throws it away if the body preview is empty → missed downgrade.
+//   nginx and the backend container. The coordinator deduplicates and
+//   holds alerts for evidence collection.
 //
 // HOW IT WORKS:
-//   Two data structures:
-//
 //   PENDING — active investigations with evidence timers.
-//     - Sibling logs join the same huddle (nginx + backend = one finding)
-//     - REC evidence can downgrade the alert during the window
-//     - Two-phase timer: evidence sprint (2s) → finalize (5s)
-//
 //   GRAVEYARD — recently finalized outcomes (TTL 300s).
-//     - Every investigation writes its outcome here on completion
-//     - Late-arriving siblings check the graveyard before creating new investigations
-//     - If a sibling finds a graveyard entry, it dies silently
-//     - Stores ALL outcomes: alerted, downgraded, suppressed
-//
-//   AI DESIGN DECISION (2026-03-25):
-//     the team, code review, and / independently agreed on this
-//     architecture. The graveyard must store all finalized states, not just
-//     "emails sent" — otherwise a downgraded nginx finding gets forgotten
-//     and the late backend sibling reopens the case.
 
 const (
-	DefaultEvidenceWindow  = 2 * time.Second
-	DefaultFinalizeWindow  = 5 * time.Second
-	DefaultGraveyardTTL    = 300 * time.Second // 5 minutes — covers worst-case LLM queue delays
+	DefaultEvidenceWindow    = 2 * time.Second
+	DefaultFinalizeWindow    = 5 * time.Second
+	DefaultGraveyardTTL      = 300 * time.Second
 	maxPendingInvestigations = 100
 )
 
 // DispatchFunc is called when a pending alert is finalized.
-// The coordinator calls this with the final alert decision.
 type DispatchFunc func(alert FinalAlert)
 
 // EvidenceCheckFunc is called by the coordinator to look up and
-// re-classify evidence for a pending alert. Returns:
-//   - downgraded=true if evidence shows the attack failed (severity reduced)
-//   - escalated=true if evidence confirms real exposure (severity increased)
-//   - reason explaining the decision
-//   - newSeverity is the LLM's updated classification (only meaningful when escalated)
+// re-classify evidence for a pending alert.
 type EvidenceCheckFunc func(pending *PendingAlert) (downgraded bool, escalated bool, reason string, newSeverity string)
 
 // FinalAlert is what the coordinator emits when an investigation concludes.
 type FinalAlert struct {
-	// The primary event that triggered the investigation
 	EventID       string
 	ScopeKey      string
-	SourceType    string // "docker", "journal", etc. — for findings recording
+	SourceType    string
 	Reason        string
 	MatchedVia    string
 	Hash          string
 	Line          string
-	Verdict       string // "malicious", "alert"
-	Severity      string // "malicious", "suspicious"
+	Verdict       string
+	Severity      string
 
-	// HTTP metadata (from normalized + raw line parsing)
 	Host          string
 	StatusCode    int
 	ResponseBytes int64
 	HTTPMethod    string
 	HTTPPath      string
 
-	// Evidence fields (may be empty if no evidence arrived)
-	EvidenceJournal string // ForJournal() output
-	Evidence        interface{} // *rec.Evidence — kept as interface to avoid import cycle
+	EvidenceJournal string
+	Evidence        interface{}
 
-	// Outcome
-	Downgraded     bool
+	Downgraded      bool
 	DowngradeReason string
 	Escalated       bool
 	EscalateReason  string
 
-	// All events that joined this investigation
 	EventCount     int
-
-	// Event timestamp (emitted by source, not processing time)
 	Timestamp      time.Time
-
-	// For the dispatch function to use
-	BuildAlert     func() interface{} // returns notifier.Alert — kept as interface to avoid import cycle
+	BuildAlert     func() interface{}
 }
 
 // PendingAlert represents an ongoing investigation.
@@ -106,10 +71,9 @@ type PendingAlert struct {
 	Key            string
 	CreatedAt      time.Time
 
-	// Primary event info (from the first log that triggered)
 	EventID        string
 	ScopeKey       string
-	SourceType     string // "docker", "journal", etc.
+	SourceType     string
 	Reason         string
 	MatchedVia     string
 	Hash           string
@@ -118,52 +82,50 @@ type PendingAlert struct {
 	Severity       string
 	Classification string
 
-	// HTTP metadata (parsed from normalized line + raw line)
 	Host           string
 	StatusCode     int
 	ResponseBytes  int64
 	HTTPMethod     string
 	HTTPPath       string
 
-	// Evidence lookup context
+	// Fix 2: Body preview hash for catch-all matching.
+	// Populated when REC has evidence at routing time.
+	BodyPreviewHash string
+
 	NormalizedLine string
 	SourceName     string
 	Timestamp      time.Time
 
-	// Builder function — creates the notifier.Alert when we're ready to dispatch
 	BuildAlert     func() interface{}
 
-	// Evidence result (populated when evidence check succeeds)
-	EvidenceResult  interface{} // *rec.Evidence
+	EvidenceResult  interface{}
 	EvidenceJournal string
 
-	// State
-	EventCount     int
-	Downgraded     bool
+	EventCount      int
+	Downgraded      bool
 	DowngradeReason string
 	Escalated       bool
 	EscalateReason  string
-	Resolved       bool
-	Dispatched     bool
+	Resolved        bool
+	Dispatched      bool
 }
 
-// FinalizedOutcome is a tombstone left in the graveyard after an investigation
-// completes. Late-arriving siblings check this before creating new investigations.
+// FinalizedOutcome is a tombstone left in the graveyard.
 type FinalizedOutcome struct {
-	Outcome       string    // "alerted", "downgraded", "suppressed", "evicted", "escalated"
-	Reason        string    // downgrade reason or alert reason
+	Outcome       string
+	Reason        string
 	FinalizedAt   time.Time
-	EventCount    int       // how many events were in the original investigation
-	EvidenceBased bool      // true if downgrade was based on response body evidence
+	EventCount    int
+	EvidenceBased bool
 }
 
 // Coordinator manages pending alert investigations and the graveyard.
 type Coordinator struct {
 	mu              sync.Mutex
-	pending         map[string]*PendingAlert      // correlationKey → active investigation
-	graveyard       map[string]*FinalizedOutcome   // correlationKey → recently finalized outcome
-	catchAll        *CatchAllTracker               // structural inference for catch-all responses
-	selfSuppress    *SelfSuppressor                // token registry for verify request self-identification
+	pending         map[string]*PendingAlert
+	graveyard       map[string]*FinalizedOutcome
+	catchAll        *CatchAllTracker
+	selfSuppress    *SelfSuppressor
 	evidenceWindow  time.Duration
 	finalizeWindow  time.Duration
 	graveyardTTL    time.Duration
@@ -177,10 +139,10 @@ type Config struct {
 	EvidenceWindow    time.Duration
 	FinalizeWindow    time.Duration
 	GraveyardTTL      time.Duration
-	CatchAllThreshold int // distinct paths before marking as catch-all (default 5)
+	CatchAllThreshold int
 }
 
-// DefaultConfig returns sensible defaults agreed by the AI design team.
+// DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
 		EvidenceWindow:    DefaultEvidenceWindow,
@@ -191,9 +153,6 @@ func DefaultConfig() Config {
 }
 
 // New creates a Coordinator.
-//   - dispatch is called when an alert is finalized (send email, log, etc.)
-//   - evidenceCheck is called to attempt REC lookup + re-classification
-//   - verifyFunc is called once per fingerprint lifetime to confirm catch-all is benign
 func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck EvidenceCheckFunc, verifyFunc VerifyFunc, selfSuppress *SelfSuppressor) *Coordinator {
 	if cfg.EvidenceWindow == 0 {
 		cfg.EvidenceWindow = DefaultEvidenceWindow
@@ -217,14 +176,12 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 		ctx:            ctx,
 	}
 
-	// Background goroutine to clean expired graveyard entries
 	go c.graveyardCleanup()
 
 	return c
 }
 
 // Process submits an event to the coordinator.
-// Check order: active investigation → graveyard → create new.
 func (c *Coordinator) Process(key string, alert *PendingAlert) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -251,21 +208,9 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		return
 	}
 
-	// --- Check 2: Graveyard — was this recently finalized? ---
+	// --- Check 2: Graveyard ---
 	if tomb, ok := c.graveyard[key]; ok {
-		// Evidence-based downgrades use a SHORT graveyard TTL (30 seconds).
-		// This deduplicates the nginx+backend sibling pair (arrives within seconds)
-		// but allows re-evaluation if the response body changes.
-		//
-		// WHY: If /.env was downgraded because it returned a framework page,
-		// but the app is redeployed and now /.env returns real credentials,
-		// the graveyard must NOT suppress the new (dangerous) request.
-		// 30 seconds is enough to catch siblings, short enough to re-evaluate.
-		//
-		// Non-evidence outcomes (alerted, escalated, transport downgrades)
-		// use the full 300-second TTL since they don't depend on response body.
 		if tomb.EvidenceBased && time.Since(tomb.FinalizedAt) > 30*time.Second {
-			// Evidence-based tombstone expired — allow fresh investigation
 			delete(c.graveyard, key)
 		} else {
 			log.Printf("[coordinator] Late sibling suppressed via graveyard: key=%s source=%s outcome=%s original_events=%d age=%s",
@@ -276,36 +221,38 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 	}
 
 	// --- Check 3: Catch-all structural inference ---
-	// If we've seen enough distinct paths return the same (host, method, status, bytes),
-	// and the fingerprint has been actively verified as benign, auto-downgrade.
-	if isCatchAll, reason := c.catchAll.Check(alert.Host, alert.HTTPMethod, alert.StatusCode, alert.ResponseBytes, extractPath(key)); isCatchAll {
-		log.Printf("[coordinator] Catch-all suppressed: key=%s host=%s status=%d bytes=%d source=%s",
-			key, alert.Host, alert.StatusCode, alert.ResponseBytes, alert.ScopeKey)
+	// Fix 2: Uses BodyPreviewHash instead of ResponseBytes.
+	// If BodyPreviewHash is empty (evidence not yet captured), skip catch-all check —
+	// the coordinator will re-evaluate when evidence arrives.
+	if alert.BodyPreviewHash != "" {
+		if isCatchAll, reason := c.catchAll.Check(alert.Host, alert.HTTPMethod, alert.StatusCode, alert.BodyPreviewHash, extractPath(key)); isCatchAll {
+			log.Printf("[coordinator] Catch-all suppressed: key=%s host=%s status=%d hash=%.16s source=%s",
+				key, alert.Host, alert.StatusCode, alert.BodyPreviewHash, alert.ScopeKey)
 
-		c.recordFinalized(key, "downgraded", reason, 1, false)
-		// Dispatch as downgraded — goes to SQLite, no email
-		go c.dispatch(FinalAlert{
-			EventID:         alert.EventID,
-			ScopeKey:        alert.ScopeKey,
-			SourceType:      alert.SourceType,
-			Reason:          alert.Reason,
-			MatchedVia:      alert.MatchedVia,
-			Hash:            alert.Hash,
-			Line:            alert.Line,
-			Verdict:         alert.Verdict,
-			Severity:        alert.Severity,
-			Host:            alert.Host,
-			StatusCode:      alert.StatusCode,
-			ResponseBytes:   alert.ResponseBytes,
-			HTTPMethod:      alert.HTTPMethod,
-			HTTPPath:        alert.HTTPPath,
-			Downgraded:      true,
-			DowngradeReason: reason,
-			EventCount:      1,
-			Timestamp:       alert.Timestamp,
-			BuildAlert:      alert.BuildAlert,
-		})
-		return
+			c.recordFinalized(key, "downgraded", reason, 1, false)
+			go c.dispatch(FinalAlert{
+				EventID:         alert.EventID,
+				ScopeKey:        alert.ScopeKey,
+				SourceType:      alert.SourceType,
+				Reason:          alert.Reason,
+				MatchedVia:      alert.MatchedVia,
+				Hash:            alert.Hash,
+				Line:            alert.Line,
+				Verdict:         alert.Verdict,
+				Severity:        alert.Severity,
+				Host:            alert.Host,
+				StatusCode:      alert.StatusCode,
+				ResponseBytes:   alert.ResponseBytes,
+				HTTPMethod:      alert.HTTPMethod,
+				HTTPPath:        alert.HTTPPath,
+				Downgraded:      true,
+				DowngradeReason: reason,
+				EventCount:      1,
+				Timestamp:       alert.Timestamp,
+				BuildAlert:      alert.BuildAlert,
+			})
+			return
+		}
 	}
 
 	// --- Check 4: Create new investigation ---
@@ -357,7 +304,7 @@ func (c *Coordinator) investigationLoop(key string) {
 	}
 
 finalize:
-	// --- Phase 2: Finalize (up to 5 seconds total) ---
+	// --- Phase 2: Finalize ---
 	if c.tryEvidenceCheck(key) {
 		return
 	}
@@ -381,7 +328,6 @@ finalize:
 	}
 
 dispatch:
-	// Timer expired — dispatch with whatever we have
 	c.mu.Lock()
 	pending, ok := c.pending[key]
 	if !ok || pending.Dispatched {
@@ -418,7 +364,7 @@ dispatch:
 }
 
 // tryEvidenceCheck calls the evidence check function and resolves the
-// investigation if evidence downgrades or escalates the alert. Returns true if resolved.
+// investigation if evidence downgrades or escalates the alert.
 func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	c.mu.Lock()
 	pending, ok := c.pending[key]
@@ -452,7 +398,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		c.dispatch(FinalAlert{
 			EventID:         pending.EventID,
 			ScopeKey:        pending.ScopeKey,
-		SourceType:      pending.SourceType,
+			SourceType:      pending.SourceType,
 			Reason:          pending.Reason,
 			MatchedVia:      pending.MatchedVia,
 			Hash:            pending.Hash,
@@ -481,7 +427,6 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		pending.Escalated = true
 		pending.EscalateReason = reason
 		pending.Dispatched = true
-		// Upgrade severity — evidence confirmed this is worse than initially thought
 		originalSeverity := pending.Severity
 		if newSeverity != "" {
 			pending.Severity = newSeverity
@@ -489,7 +434,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		if pending.Severity == "malicious" {
 			pending.Verdict = "malicious"
 		}
-		pending.Reason = reason // replace original reason with evidence-backed reason
+		pending.Reason = reason
 		delete(c.pending, key)
 		c.recordFinalized(key, "escalated", reason, pending.EventCount, false)
 
@@ -499,7 +444,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		c.dispatch(FinalAlert{
 			EventID:         pending.EventID,
 			ScopeKey:        pending.ScopeKey,
-		SourceType:      pending.SourceType,
+			SourceType:      pending.SourceType,
 			Reason:          reason,
 			MatchedVia:      pending.MatchedVia,
 			Hash:            pending.Hash,
@@ -524,6 +469,20 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	}
 
 	return false
+}
+
+// =============================================================================
+// Fix 1: VIP Push Resolution
+// =============================================================================
+
+// TryResolveVIP is called by the VIP push callback when evidence for a
+// malicious event arrives. It triggers an immediate evidence check for the
+// given correlation key, bypassing the polling cycle.
+//
+// Safe to call even if the investigation doesn't exist or is already resolved.
+func (c *Coordinator) TryResolveVIP(correlationKey string) {
+	log.Printf("[coordinator:vip] Push notification for key=%s — attempting immediate evidence check", correlationKey)
+	c.tryEvidenceCheck(correlationKey)
 }
 
 // forceDispatch sends an alert that was evicted from the coordinator.
@@ -553,12 +512,9 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 }
 
 // =============================================================================
-// Graveyard — Recently Finalized Outcomes
+// Graveyard
 // =============================================================================
 
-// recordFinalized writes a tombstone to the graveyard. Must be called with mu held.
-// evidenceBased should be true when the downgrade was based on response body evidence —
-// these tombstones get a shorter TTL (30s) to allow re-evaluation if the body changes.
 func (c *Coordinator) recordFinalized(key, outcome, reason string, eventCount int, evidenceBased bool) {
 	c.graveyard[key] = &FinalizedOutcome{
 		Outcome:       outcome,
@@ -569,7 +525,6 @@ func (c *Coordinator) recordFinalized(key, outcome, reason string, eventCount in
 	}
 }
 
-// graveyardCleanup periodically removes expired tombstones.
 func (c *Coordinator) graveyardCleanup() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -597,10 +552,7 @@ func truncateStr(s string, max int) string {
 	return s[:max] + "..."
 }
 
-// extractPath pulls the path component from a coordinator correlation key.
-// Key format: "METHOD|/path?query|STATUS"
 func extractPath(key string) string {
-	// Find first and last pipe
 	first := -1
 	last := -1
 	for i, c := range key {
@@ -629,8 +581,7 @@ func (c *Coordinator) CatchAllStats() (total, candidates, pending, verified, rej
 	return c.catchAll.Stats()
 }
 
-// SelfSuppressor returns the self-suppression token registry for use
-// by the log handler to identify Observer's own verify requests.
+// SelfSuppressor returns the self-suppression token registry.
 func (c *Coordinator) SelfSuppressor() *SelfSuppressor {
 	return c.selfSuppress
 }

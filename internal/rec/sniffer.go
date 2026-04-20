@@ -1,3 +1,4 @@
+// internal/rec/sniffer.go
 package rec
 
 import (
@@ -18,7 +19,6 @@ import (
 // Stream Tracking — Pair HTTP requests with responses
 // =============================================================================
 
-// streamKey identifies one direction of a TCP connection.
 type streamKey struct {
 	srcIP   [4]byte
 	srcPort uint16
@@ -26,7 +26,6 @@ type streamKey struct {
 	dstPort uint16
 }
 
-// reverse returns the opposite direction of this stream.
 func (sk streamKey) reverse() streamKey {
 	return streamKey{
 		srcIP: sk.dstIP, srcPort: sk.dstPort,
@@ -34,7 +33,6 @@ func (sk streamKey) reverse() streamKey {
 	}
 }
 
-// pendingRequest is a request we saw on the wire, waiting for its response.
 type pendingRequest struct {
 	method    string
 	path      string // raw path including query string — SACRED
@@ -50,126 +48,51 @@ type pendingRequest struct {
 // WHAT THIS IS:
 //   Best-effort, single-segment HTTP sniffing on plaintext traffic behind
 //   a reverse proxy. Pure Go stdlib, zero external dependencies, no CGO.
-//   Suitable for low-traffic servers (e.g. CapRover boxes) where most HTTP
-//   transactions fit in a single TCP segment.
-//
-//   Supports VXLAN-encapsulated traffic (Docker Swarm, Kubernetes Flannel,
-//   etc.) — automatically detects and unwraps VXLAN tunnels to reach the
-//   inner plaintext HTTP. No configuration needed on standard setups.
-//
-// WHAT THIS IS NOT:
-//   Reliable transaction reconstruction. Not forensic-grade. Not suitable
-//   for high-throughput environments or compliance evidence without caveats.
 //
 // HOW IT WORKS (v0.22 — SPECULATIVE PARSE):
 //   1. Opens an AF_PACKET raw socket (requires CAP_NET_RAW)
 //   2. Reads ethernet frames, parses IPv4 headers manually
-//   3. For TCP: checks payload prefix speculatively:
-//      - Starts with HTTP method (GET, POST, etc.) → try handleRequest()
-//      - Starts with "HTTP/" → try handleResponse()
-//      - Neither → skip (not HTTP, no cost)
-//      NO PORT GATE. The payload decides, not the port number.
-//   4. For UDP: detects VXLAN (dst port 4789), unwraps inner Ethernet frame,
-//      and recurses back to step 2 with a depth guard (max 2 levels)
+//   3. For TCP: checks payload prefix speculatively
+//   4. For UDP: detects VXLAN, unwraps inner frame, recurses
 //   5. Uses stdlib net/http to parse HTTP request/response from TCP payload
 //   6. Tracks request→response pairing via FIFO queue per TCP stream
 //   7. Inserts completed transactions into the ring buffer
-//
-// WHY SPECULATIVE PARSE (design consensus, 2026-03-30):
-//   The AF_PACKET socket already receives ALL IPv4 packets — no BPF filter.
-//   The previous port gate (s.ports[dstPort]) was a userspace `if` statement
-//   that threw away packets the kernel already delivered. Services on ports
-//   outside the configured list (3000, 19999, etc.) were invisible despite
-//   their traffic being right there in the buffer.
-//
-//   Speculative parse tries to parse any TCP payload that looks like HTTP.
-//   If it parses → great, we learned something. If not → skip, zero cost.
-//   The port list is retained as metadata for telemetry (which ports are
-//   producing successful parses) but NOT as a correctness gate.
-//
-// KNOWN LIMITATIONS (be honest about these):
-//
-//   1. SINGLE-SEGMENT PARSING: If HTTP headers span multiple TCP segments,
-//      the request or response is silently skipped. In practice, headers
-//      almost always fit in one segment (MSS ~1460, headers usually <500).
-//
-//   2. BODY PREVIEW ONLY: Body capture is limited to what fits in the TCP
-//      segment after headers. BodyPreviewHash covers only this partial
-//      content, NOT the full response body. Don't treat it as forensic.
-//
-//   3. REQUEST CAPTURE FAILURES: If the request packet is missed (dropped,
-//      partial, or arrived before sniffer started), the response is inserted
-//      WITHOUT method/path/host/user-agent. This makes it unmatchable by
-//      the correlator. EXPECT A SIGNIFICANT MISS RATE in real traffic,
-//      especially right after startup or during traffic bursts.
-//
-//   4. IPv4 ONLY: No IPv6 support (EtherType 0x0800 filter). Fine for
-//      Docker bridge networks which are typically IPv4.
-//
-//   5. NO SOURCE CONTAINER RESOLUTION: We see IP addresses on the wire,
-//      not container names. IP→container mapping is not implemented in
-//      Phase 1. The SourceContainer field on CapturedResponse is left
-//      empty by the sniffer.
-//
-//   6. CPU COST: Every IPv4 packet hits userspace parsing. No BPF
-//      filter yet. Acceptable on low-traffic boxes, problematic at scale.
-//      BPF port filtering is a Phase 2 optimization — port knowledge
-//      learned from successful speculative parses will seed the BPF filter.
-//
-//   7. ENCRYPTED OVERLAYS: If Docker Swarm overlay networks are created
-//      with --opt encrypted, IPsec encrypts the VXLAN payload. VXLAN
-//      unwrapping still works mechanically, but the inner frame is
-//      ciphertext — no HTTP will be parsed. REC honestly reports zero
-//      HTTP in this case.
+//   8. Fix 1: Fires onCapture callback for VIP lane push matching
 
 type sniffer struct {
 	buffer    *RingBuffer
-	iface     string // empty = capture on all interfaces
+	iface     string
 	maxBody   int
-	vxlanPort uint16 // VXLAN destination port (default 4789, from Docker API or config)
+	vxlanPort uint16
 
-	// Known ports — retained as metadata for telemetry, NOT a correctness gate.
-	// Populated from config at startup. Successful speculative parses on new
-	// ports get logged so operators can see what's active.
 	knownPorts map[int]bool
 
-	// FIFO queue of pending requests per TCP stream direction.
-	// Nginx uses HTTP keep-alive on upstream connections, so multiple
-	// requests can be in-flight on the same TCP connection simultaneously.
-	// A single-pointer map would cause Request B to overwrite Request A
-	// when both are on the same connection. FIFO ordering is correct
-	// for HTTP/1.1 without multiplexing (strictly sequential).
-	// ('s keep-alive bug catch.)
 	pending map[streamKey][]*pendingRequest
 	mu      sync.Mutex
 
-	// --- Core counters (same meaning as before) ---
+	// Fix 1: Called after each successful response capture.
+	// The collector uses this to check VIP pins for push matching.
+	// Set by the liveCollector before readLoop starts.
+	onCapture func(CapturedResponse)
+
+	// --- Core counters ---
 	packetCount   int64
-	httpReqCount  int64 // HTTP requests successfully parsed (not just prefix-hit)
-	httpRespCount int64 // HTTP responses successfully parsed (not just prefix-hit)
-	pairMissCount int64 // responses where request was never seen
-	vxlanCount    int64 // VXLAN packets successfully unwrapped
-	vxlanHTTPReq  int64 // HTTP requests found inside VXLAN tunnels
-	vxlanHTTPResp int64 // HTTP responses found inside VXLAN tunnels
+	httpReqCount  int64
+	httpRespCount int64
+	pairMissCount int64
+	vxlanCount    int64
+	vxlanHTTPReq  int64
+	vxlanHTTPResp int64
 
-	// --- Speculative parse telemetry (new in v0.22) ---
-	// These counters make soak tests decisive. After a soak, you can see:
-	//   "port 3000: 450 req prefix hits, 448 parsed, 2 failed" → parser works
-	//   "port 9000: 0 prefix hits" → service doesn't speak plaintext HTTP here
-	//   "port 80: 200 resp prefix hits, 0 parsed" → parser limitation (multi-segment?)
-	reqPrefixHits  int64 // payloads that looked like HTTP requests (prefix matched)
-	reqParseFails  int64 // prefix matched but stdlib parse failed
-	respPrefixHits int64 // payloads that looked like HTTP responses (prefix matched)
-	respParseFails int64 // prefix matched but stdlib parse failed
+	// --- Speculative parse telemetry ---
+	reqPrefixHits  int64
+	reqParseFails  int64
+	respPrefixHits int64
+	respParseFails int64
 
-	// Per-port success tracking. Maps port number → successful parse count.
-	// Protected by mu. Used for telemetry logging, not filtering.
 	portReqHits  map[int]int64
 	portRespHits map[int]int64
 
-	// verbose controls per-packet logging. When false (default), only pair
-	// misses, parse failures, and periodic stats are logged. When true, every
-	// REQ and RESP paired line is printed. Use REC_VERBOSE=true for debugging.
 	verbose bool
 }
 
@@ -195,16 +118,7 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxla
 }
 
 // openSocket opens the AF_PACKET raw socket and binds to the interface.
-// Runs SYNCHRONOUSLY in Start() — if it fails, Start() returns the error
-// and running stays false.
 func (s *sniffer) openSocket() (int, error) {
-	// ETH_P_ALL (0x0003) captures BOTH incoming AND outgoing packets.
-	// ETH_P_IP (0x0800) only captures incoming — the kernel's dev_queue_xmit()
-	// path for outgoing packets only delivers to ETH_P_ALL handlers.
-	// In namespace capture mode, nginx's outgoing proxy requests to backends
-	// are outgoing packets on the overlay interface — invisible with ETH_P_IP.
-	// processFrame() already filters for IPv4 at the EtherType check, so
-	// non-IPv4 packets are dropped immediately with zero cost.
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(0x0003)))
 	if err != nil {
 		return -1, fmt.Errorf("opening raw socket: %w (do you have CAP_NET_RAW?)", err)
@@ -230,7 +144,6 @@ func (s *sniffer) openSocket() (int, error) {
 }
 
 // readLoop processes packets until ctx is cancelled.
-// Runs in a goroutine — the socket is already open and verified.
 func (s *sniffer) readLoop(ctx context.Context, fd int) {
 	defer syscall.Close(fd)
 
@@ -275,29 +188,12 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 }
 
 // processFrame parses an ethernet frame and routes HTTP traffic to handlers.
-// The depth parameter guards against VXLAN-in-VXLAN recursion (max 2 levels).
-//
-// VXLAN detection is always-on, no-op when absent:
-//   1. Try VXLAN decap first. If it succeeds, recurse with inner frame.
-//   2. If not VXLAN, proceed with normal Ethernet → IPv4 → TCP → HTTP.
-//
-// SPECULATIVE PARSE (v0.22):
-//   No port gate. Every TCP payload with data is checked by prefix:
-//   - Looks like HTTP request? → try handleRequest()
-//   - Looks like HTTP response? → try handleResponse()
-//   - Neither? → skip (not HTTP, fast path)
-//
-// This handles both Swarm (VXLAN-encapsulated HTTP) and plain docker-compose
-// (direct TCP HTTP) transparently, with zero configuration.
 func (s *sniffer) processFrame(frame []byte, depth int) {
 	if depth > maxDecapDepth {
-		return // guard against pathological tunnel-in-tunnel
+		return
 	}
 
-	// --- Try VXLAN decapsulation first (always-on, no-op when absent) ---
-	// decapVXLAN returns errNotVXLAN in constant time for non-VXLAN packets.
-	// On Swarm: unwraps the inner Ethernet frame and recurses.
-	// On docker-compose: fails fast, falls through to normal TCP parsing.
+	// --- Try VXLAN decapsulation first ---
 	if result, err := decapVXLAN(frame, s.vxlanPort); err == nil {
 		s.vxlanCount++
 		s.processFrame(result.InnerFrame, depth+1)
@@ -309,7 +205,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 		return
 	}
 	etherType := binary.BigEndian.Uint16(frame[12:14])
-	if etherType != 0x0800 { // IPv4 only (no IPv6 in Phase 1)
+	if etherType != 0x0800 {
 		return
 	}
 	ipData := frame[14:]
@@ -324,7 +220,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 	if len(ipData) < ihl {
 		return
 	}
-	if ipData[9] != 6 { // TCP only (UDP is handled by VXLAN path above)
+	if ipData[9] != 6 { // TCP only
 		return
 	}
 
@@ -350,14 +246,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 
 	key := streamKey{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 
-	// --- Speculative parse: let the payload decide, not the port ---
-	//
-	// Try request first (more common on the inbound side of a proxy),
-	// then response. If neither prefix matches, skip — not HTTP.
-	// handleRequest/handleResponse return true only on successful parse,
-	// not just prefix match. This keeps httpReqCount/httpRespCount meaning
-	// "successfully parsed" (same semantics as before).
-
+	// --- Speculative parse ---
 	if looksLikeHTTPRequest(payload) {
 		s.reqPrefixHits++
 		if s.handleRequest(key, payload, int(dstPort)) {
@@ -380,22 +269,18 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 }
 
 // handleRequest tries to parse an HTTP request from a single TCP segment.
-// Returns true if the request was successfully parsed, false otherwise.
 func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool {
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(payload)))
 	if err != nil {
 		s.reqParseFails++
-		return false // partial headers, TLS, or garbage — skip
+		return false
 	}
 	defer req.Body.Close()
 
 	s.mu.Lock()
-	// FIFO append — HTTP/1.1 keep-alive means multiple requests on same
-	// TCP connection. We queue them in order and pop from front when the
-	// response arrives. ('s keep-alive bug catch.)
 	s.pending[key] = append(s.pending[key], &pendingRequest{
 		method:    req.Method,
-		path:      req.RequestURI, // raw path with query string — SACRED
+		path:      req.RequestURI,
 		host:      req.Host,
 		userAgent: req.UserAgent(),
 		timestamp: time.Now(),
@@ -415,7 +300,8 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool
 }
 
 // handleResponse tries to parse an HTTP response from a single TCP segment.
-// Returns true if the response was successfully parsed, false otherwise.
+// Fix 1: After inserting into the ring buffer, fires the onCapture callback
+// so the VIP lane can check for push matches.
 func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) bool {
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
 	if err != nil {
@@ -425,8 +311,6 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 	defer resp.Body.Close()
 
 	// Pop the oldest pending request on the reverse stream (FIFO).
-	// HTTP/1.1 without multiplexing is strictly sequential, so the first
-	// queued request matches the first response. ('s fix.)
 	reverseKey := key.reverse()
 
 	s.mu.Lock()
@@ -436,18 +320,14 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 		pending = queue[0]
 		s.pending[reverseKey] = queue[1:]
 		if len(s.pending[reverseKey]) == 0 {
-			delete(s.pending, reverseKey) // clean up empty slices
+			delete(s.pending, reverseKey)
 		}
 	}
 	s.portRespHits[srcPort]++
 	s.mu.Unlock()
 
-	// Read body preview — whatever fits in this single TCP segment after headers.
-	// This is PARTIAL content, not the full body.
+	// Read body preview
 	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
-
-	// Hash the PREVIEW, not the full body.
-	// This is explicitly a preview hash — see BodyPreviewHash on TransportEvidence.
 	bodyPreviewHash := HashBody(bodyPreview)
 
 	contentLength := resp.ContentLength
@@ -462,18 +342,9 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 		ContentLength:   contentLength,
 		BodyPreview:     bodyPreview,
 		BodyPreviewHash: bodyPreviewHash,
-		// NOTE: SourceContainer is NOT populated by the sniffer.
-		// We see IP addresses on the wire, not container names.
-		// IP→container resolution is not implemented in Phase 1.
-		// SourceContainer is left empty — the ring buffer's Lookup()
-		// skips the container filter when empty on either side.
 	}
 
 	// Attach request fields if we saw the matching request.
-	// If request capture failed (missed packet, partial headers, sniffer
-	// started after request was sent), these stay empty and the response
-	// becomes unmatchable by the correlator. This is expected — see
-	// "REQUEST CAPTURE FAILURES" in the sniffer doc comment.
 	if pending != nil {
 		captured.Method = pending.method
 		captured.Path = pending.path
@@ -498,11 +369,18 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 
 	s.buffer.Insert(captured)
 	s.httpRespCount++
+
+	// Fix 1: Fire VIP lane callback.
+	// The collector checks VIP pins for immediate push resolution.
+	// Non-blocking — this must not slow down the packet capture loop.
+	if s.onCapture != nil {
+		s.onCapture(captured)
+	}
+
 	return true
 }
 
 // cleanupLoop removes stale pending requests every 30 seconds.
-// Iterates through FIFO queues and removes entries older than 30s.
 func (s *sniffer) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -515,15 +393,14 @@ func (s *sniffer) cleanupLoop(ctx context.Context) {
 			s.mu.Lock()
 			cutoff := time.Now().Add(-30 * time.Second)
 			for key, queue := range s.pending {
-				// Remove stale entries from front of queue (oldest first)
 				i := 0
 				for i < len(queue) && queue[i].timestamp.Before(cutoff) {
 					i++
 				}
 				if i == len(queue) {
-					delete(s.pending, key) // entire queue is stale
+					delete(s.pending, key)
 				} else if i > 0 {
-					s.pending[key] = queue[i:] // trim stale prefix
+					s.pending[key] = queue[i:]
 				}
 			}
 			s.mu.Unlock()
@@ -532,7 +409,6 @@ func (s *sniffer) cleanupLoop(ctx context.Context) {
 }
 
 // logPortStats logs which ports had successful HTTP parses.
-// Called on shutdown for visibility into what the speculative parse found.
 func (s *sniffer) logPortStats() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -585,10 +461,6 @@ func looksLikeHTTPRequest(payload []byte) bool {
 	return false
 }
 
-// looksLikeHTTPResponse checks if a payload starts with an HTTP response line.
-// This is the response-side equivalent of looksLikeHTTPRequest().
-// Previously this check was inline in handleResponse; now it's the routing
-// decision for speculative parse.
 func looksLikeHTTPResponse(payload []byte) bool {
 	return len(payload) >= 5 && bytes.HasPrefix(payload, []byte("HTTP/"))
 }

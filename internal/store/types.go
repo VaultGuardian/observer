@@ -1,3 +1,4 @@
+// internal/store/types.go
 package store
 
 import "time"
@@ -8,6 +9,14 @@ import "time"
 //
 // This is the "what happened" store. The pattern store remembers HOW to
 // classify; this remembers WHAT was classified and WHAT the outcome was.
+//
+// RESOLUTION LIFECYCLE (v1.0 hardening, Fix 4):
+//   Malicious HTTP findings now track resolution state:
+//     - NULL/""          = legacy finding or non-HTTP (no resolution tracking)
+//     - "pending"        = malicious HTTP, evidence lookup in progress
+//     - "resolved"       = evidence arrived, finding downgraded or escalated
+//     - "evidence_unavailable" = bounded window expired, evidence never arrived
+//   Resolution is append-only: original verdict is preserved in PreviousVerdict.
 type Finding struct {
 	// Event identity
 	EventID    string    `json:"event_id"`
@@ -51,6 +60,13 @@ type Finding struct {
 
 	// Notification
 	Notified bool `json:"notified"` // was an email/alert sent?
+
+	// Resolution lifecycle (v1.0 hardening, Fix 4)
+	// Append-only: never silently rewrite findings. Show the transition.
+	ResolutionStatus string     `json:"resolution_status,omitempty"` // pending, resolved, evidence_unavailable
+	ResolvedAt       *time.Time `json:"resolved_at,omitempty"`
+	ResolutionMethod string     `json:"resolution_method,omitempty"` // rec_evidence, catchall, timeout, manual, vip_push
+	PreviousVerdict  string     `json:"previous_verdict,omitempty"`
 }
 
 // ScannerSession groups probes from the same source IP that hit the same
@@ -79,7 +95,7 @@ type PipelineStats struct {
 	LLMCalls        int64     `json:"llm_calls"`
 	LLMErrors       int64     `json:"llm_errors"`
 	PatternsLearned int64     `json:"patterns_learned"`
-	MaliciousCount       int64     `json:"malicious_count"`
+	MaliciousCount  int64     `json:"malicious_count"`
 	AlertCount      int64     `json:"alert_count"`
 	SuppressCount   int64     `json:"suppress_count"`
 }

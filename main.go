@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -31,16 +32,10 @@ import (
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
-	// Pipeline drop counter — tracked as first-class metric, not just a warning log.
-	// code review review: "under pressure you can silently lose security-relevant events
-	// unless you track and expose this as a first-class metric."
 	var pipelineDrops atomic.Int64
 	log.Println("[observer] VaultGuardian Observer starting...")
 
-	// --- pprof profiling endpoint (localhost only) ---
-	// CPU:        go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
-	// Memory:     go tool pprof http://localhost:6060/debug/pprof/heap
-	// Goroutines: curl http://localhost:6060/debug/pprof/goroutine?debug=2
+	// --- pprof ---
 	go func() {
 		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
 			log.Printf("[observer] pprof server failed: %v", err)
@@ -49,7 +44,6 @@ func main() {
 
 	cfg := LoadConfig()
 
-	// ------- Ensure data dir exists -------
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		log.Fatalf("[observer] Failed to create data dir: %v", err)
 	}
@@ -72,14 +66,10 @@ func main() {
 	}
 	defer db.Close()
 
-	// ------- Init Policy Engine (deterministic pre-LLM layer) -------
+	// ------- Init Policy Engine -------
 	policyEngine := policy.New(db)
 
 	llmClient := llm.NewClient(cfg.LLMURL, cfg.LLMModel, cfg.LLMAPIKey, cfg.Tier1Effort, cfg.Tier2Effort)
-
-	// Global LLM scheduler — shared across T1 classify, T2 evidence, catch-all verify.
-	// code review code review (April 2026): without unified scheduling, T2 and catch-all
-	// calls run unbounded while T1 is throttled. One scheduler, three acquire modes.
 	llmScheduler := NewLLMScheduler(cfg.MaxConcurrentLLM)
 
 	a := analyzer.New(normReg, patterns, llmClient, llmScheduler)
@@ -98,7 +88,7 @@ func main() {
 		log.Println("[observer] No notification channels configured — alerts will be logged to stdout only")
 	}
 
-	// ------- Init Response Evidence Capture (opt-in) -------
+	// ------- Init Response Evidence Capture -------
 	recCfg := rec.DefaultCollectorConfig()
 	recCfg.Enabled = cfg.RECEnabled
 	recCfg.DockerSocket = cfg.DockerSocket
@@ -125,6 +115,9 @@ func main() {
 		log.Printf("[observer] REC failed to start: %v (continuing without evidence capture)", err)
 	}
 
+	// ------- Fix 3: Start async findings writer -------
+	db.StartAsyncWriter(ctx, 5000)
+
 	// ------- Start Dashboard API -------
 	apiServer, err := api.NewServer(
 		api.ServerConfig{
@@ -143,7 +136,7 @@ func main() {
 		}()
 	}
 
-	// ------- LLM health check (non-blocking) -------
+	// ------- LLM health check -------
 	go func() {
 		for {
 			if err := llmClient.HealthCheck(ctx); err != nil {
@@ -160,7 +153,6 @@ func main() {
 	reclassCache := newReclassCache()
 
 	// ------- Self-Suppression Token Registry -------
-	// Created here so both the coordinator and verify callback can reference it.
 	selfSuppress := coordinator.NewSelfSuppressor()
 
 	// ------- Alert Coordinator -------
@@ -173,28 +165,25 @@ func main() {
 		selfSuppress,
 	)
 
+	// ------- Fix 1: Wire VIP push callback -------
+	// When VIP evidence matches a malicious event, the collector fires this
+	// callback. The coordinator immediately re-checks evidence for that
+	// investigation, bypassing the polling cycle.
+	collector.SetVIPCallback(func(correlationKey string) {
+		alertCoordinator.TryResolveVIP(correlationKey)
+	})
+
 	// ------- Seed verified catch-alls from database -------
 	seedCatchAllsFromDB(db, alertCoordinator)
 
 	// ------- Ingestion Pipeline -------
-	// Decouples watcher goroutines from the analysis pipeline.
-	// code review code review (April 2026): synchronous ingestion means watcher
-	// throughput is coupled to LLM call latency. A burst of unknown lines
-	// stalls the per-container stream. Bounded channel provides backpressure
-	// without blocking the watcher.
 	const pipelineBufferSize = 1000
 	pipeline := make(chan watcher.LogLine, pipelineBufferSize)
 
-	// Retry queue for deferred Tier 1 classifications.
-	// When LLM slots are full, events land here instead of being dropped.
-	// Retry workers do blocking acquire — events may be delayed, never lost.
-	// code review + the team consensus: "Observer may delay, but should not abandon."
 	const retryQueueSize = 500
 	retryQueue := make(chan *retryEvent, retryQueueSize)
 	var retryQueueDrops atomic.Int64
 
-	// Shared result router — one function for post-classification routing.
-	// Both primary pipeline and retry workers use this. No duplication, no drift.
 	router := &resultRouter{
 		cfg:              cfg,
 		db:               db,
@@ -204,7 +193,6 @@ func main() {
 
 	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops, policyEngine, dispatch)
 
-	// Worker pool: enough goroutines to keep LLM slots fed without over-subscribing.
 	numWorkers := cfg.MaxConcurrentLLM * 2
 	if numWorkers < 4 {
 		numWorkers = 4
@@ -217,8 +205,6 @@ func main() {
 		}()
 	}
 
-	// Retry workers: drain deferred events with blocking LLM acquire.
-	// Fewer than primary workers — retries are background, not latency-sensitive.
 	numRetryWorkers := 2
 	for i := 0; i < numRetryWorkers; i++ {
 		go func() {
@@ -235,8 +221,10 @@ func main() {
 	// ------- Periodic persistence + stats -------
 	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, &pipelineDrops, &retryQueueDrops)
 
-	// Ingestion handler: lightweight, just pushes to channel.
-	// Non-blocking: if pipeline is full, drop the line rather than stall the watcher.
+	// ------- Fix 4: Evidence reconciler goroutine -------
+	go runReconciler(ctx, db)
+
+	// Ingestion handler
 	ingestionHandler := func(line watcher.LogLine) {
 		select {
 		case pipeline <- line:
@@ -247,9 +235,6 @@ func main() {
 	}
 
 	// ------- Start watching -------
-
-	// Docker watcher: only start if the socket exists.
-	// Runs in a goroutine so journald watcher can run concurrently.
 	if _, err := os.Stat(cfg.DockerSocket); err == nil {
 		w := watcher.New(cfg.DockerSocket, ingestionHandler)
 		w.SetSelfID(cfg.SelfID)
@@ -263,8 +248,6 @@ func main() {
 		log.Printf("[observer] Docker socket %s not found — skipping container watcher", cfg.DockerSocket)
 	}
 
-	// Journald watcher: streams sshd, systemd, kernel logs from the system journal.
-	// Pushes into the same pipeline channel as Docker — same workers, same LLM, same pattern store.
 	if cfg.JournaldEnabled {
 		jw := watcher.NewJournaldWatcher(ingestionHandler, cfg.ExcludeUnits, "")
 		go func() {
@@ -275,7 +258,6 @@ func main() {
 		}()
 	}
 
-	// Block until shutdown signal.
 	<-ctx.Done()
 
 	// ------- Shutdown -------
@@ -292,8 +274,6 @@ func main() {
 // Coordinator Callbacks
 // =============================================================================
 
-// makeDispatchCallback creates the function called when a coordinator
-// investigation concludes — either dispatching or suppressing the alert.
 func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordinator.DispatchFunc {
 	return func(alert coordinator.FinalAlert) {
 		if alert.Downgraded {
@@ -303,28 +283,33 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
-			// Record downgraded finding to SQLite
-			db.RecordFinding(context.Background(), &store.Finding{
-				EventID:         alert.EventID,
-				Timestamp:       alert.Timestamp,
-				SourceType:      alert.SourceType,
-				SourceName:      alert.ScopeKey,
-				DestHost:        alert.Host,
-				HTTPMethod:      alert.HTTPMethod,
-				HTTPPath:        alert.HTTPPath,
-				HTTPStatus:      alert.StatusCode,
-				ResponseBytes:   alert.ResponseBytes,
-				Verdict:         "downgraded",
-				Classification:  alert.Severity,
-				Reason:          alert.Reason,
-				MatchedVia:      alert.MatchedVia,
-				RawLine:         alert.Line,
-				NormalizedHash:  alert.Hash,
-				CoordinatorKey:  alert.ScopeKey,
+			// Fix 4: Set resolution status on downgraded findings
+			now := time.Now()
+			db.SubmitFinding(&store.Finding{
+				EventID:           alert.EventID,
+				Timestamp:         alert.Timestamp,
+				SourceType:        alert.SourceType,
+				SourceName:        alert.ScopeKey,
+				DestHost:          alert.Host,
+				HTTPMethod:        alert.HTTPMethod,
+				HTTPPath:          alert.HTTPPath,
+				HTTPStatus:        alert.StatusCode,
+				ResponseBytes:     alert.ResponseBytes,
+				Verdict:           "downgraded",
+				Classification:    alert.Severity,
+				Reason:            alert.Reason,
+				MatchedVia:        alert.MatchedVia,
+				RawLine:           alert.Line,
+				NormalizedHash:    alert.Hash,
+				CoordinatorKey:    alert.ScopeKey,
 				CoordinatorEvents: alert.EventCount,
-				Downgraded:      true,
-				DowngradeReason: alert.DowngradeReason,
-				Notified:        false,
+				Downgraded:        true,
+				DowngradeReason:   alert.DowngradeReason,
+				Notified:          false,
+				ResolutionStatus:  "resolved",
+				ResolvedAt:        &now,
+				ResolutionMethod:  "rec_evidence",
+				PreviousVerdict:   alert.Verdict,
 			})
 			return
 		}
@@ -336,18 +321,16 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				alert.EventID, alert.ScopeKey, alert.EscalateReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
-			// Send alert at escalated severity
 			if alert.BuildAlert != nil {
 				if builtAlert, ok := alert.BuildAlert().(notifier.Alert); ok {
-					// Override to malicious — evidence confirmed real exposure
 					builtAlert.Severity = notifier.SeverityMalicious
 					builtAlert.Reason = alert.EscalateReason
 					dispatch.Dispatch(context.Background(), builtAlert)
 				}
 			}
 
-			// Record escalated finding to SQLite
-			db.RecordFinding(context.Background(), &store.Finding{
+			now := time.Now()
+			db.SubmitFinding(&store.Finding{
 				EventID:           alert.EventID,
 				Timestamp:         alert.Timestamp,
 				SourceType:        alert.SourceType,
@@ -366,6 +349,10 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				CoordinatorKey:    alert.ScopeKey,
 				CoordinatorEvents: alert.EventCount,
 				Notified:          true,
+				ResolutionStatus:  "resolved",
+				ResolvedAt:        &now,
+				ResolutionMethod:  "rec_evidence",
+				PreviousVerdict:   "alert",
 			})
 			return
 		}
@@ -382,29 +369,27 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			severity, alert.EventID, alert.ScopeKey, alert.Reason,
 			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
-		// NO EMAIL — only escalated alerts (evidence-confirmed exposure) send email.
-		// Everything else is logged to SQLite for dashboard review.
-
-		// Record finding to SQLite (not notified — review on dashboard)
-		db.RecordFinding(context.Background(), &store.Finding{
-			EventID:         alert.EventID,
-			Timestamp:       alert.Timestamp,
-			SourceType:      alert.SourceType,
-			SourceName:      alert.ScopeKey,
-			DestHost:        alert.Host,
-			HTTPMethod:      alert.HTTPMethod,
-			HTTPPath:        alert.HTTPPath,
-			HTTPStatus:      alert.StatusCode,
-			ResponseBytes:   alert.ResponseBytes,
-			Verdict:         alert.Verdict,
-			Classification:  alert.Severity,
-			Reason:          alert.Reason,
-			MatchedVia:      alert.MatchedVia,
-			RawLine:         alert.Line,
-			NormalizedHash:  alert.Hash,
-			CoordinatorKey:  alert.ScopeKey,
+		// Fix 4: Non-resolved findings get "pending" resolution status
+		db.SubmitFinding(&store.Finding{
+			EventID:           alert.EventID,
+			Timestamp:         alert.Timestamp,
+			SourceType:        alert.SourceType,
+			SourceName:        alert.ScopeKey,
+			DestHost:          alert.Host,
+			HTTPMethod:        alert.HTTPMethod,
+			HTTPPath:          alert.HTTPPath,
+			HTTPStatus:        alert.StatusCode,
+			ResponseBytes:     alert.ResponseBytes,
+			Verdict:           alert.Verdict,
+			Classification:    alert.Severity,
+			Reason:            alert.Reason,
+			MatchedVia:        alert.MatchedVia,
+			RawLine:           alert.Line,
+			NormalizedHash:    alert.Hash,
+			CoordinatorKey:    alert.ScopeKey,
 			CoordinatorEvents: alert.EventCount,
-			Notified:        false,
+			Notified:          false,
+			ResolutionStatus:  "pending",
 		})
 	}
 }
@@ -413,26 +398,8 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 // coordinator to check if REC evidence can downgrade a pending alert.
 //
 // Two downgrade paths (design consensus, 2026-03-25):
-//
-//   Path 1 — Transport-only downgrade:
-//     If REC captured the HTTP response and the status code is conclusively
-//     "attack failed" (403/404/405/410), downgrade immediately.
-//     No body preview required. No LLM call required.
-//     These events are already known to contain attack payloads (they're in
-//     the coordinator because they were classified as malicious/alert). A 404 on
-//     a SQL injection means the server rejected/ignored the payload. Period.
-//
-//   Path 2 — Body-aware re-classification:
-//     For ambiguous status codes (200, 3xx, 5xx), the status alone doesn't
-//     tell us if the attack succeeded. Check SafeBodyPreview and call the
-//     LLM to inspect the actual response content.
-//
-// Status code tiers (design team agreed):
-//   403, 404, 405, 410 → auto-downgrade (attack failed)
-//   400                → ambiguous in v1, may add later
-//   401                → surface discovery, not a failed probe
-//   200, 3xx           → ambiguous, need body inspection
-//   5xx                → suspicious, never auto-downgrade
+//   Path 1 — Transport-only downgrade (403/404/405/410)
+//   Path 2 — Body-aware re-classification (200, 3xx, 5xx)
 func makeEvidenceCheckCallback(
 	collector rec.EvidenceCollector,
 	llmClient *llm.Client,
@@ -442,14 +409,8 @@ func makeEvidenceCheckCallback(
 	scheduler *LLMScheduler,
 	ctx context.Context,
 ) coordinator.EvidenceCheckFunc {
-	// Status codes where transport alone proves the attack failed.
-	// Only applies to payload-bearing events (which is all events
-	// that reach the coordinator — clean probes are suppressed upstream).
 	transportDowngradeCodes := map[int]bool{
-		403: true, // Forbidden — server blocked the request
-		404: true, // Not found — resource doesn't exist
-		405: true, // Method not allowed — server rejected the method
-		410: true, // Gone — resource permanently removed
+		403: true, 404: true, 405: true, 410: true,
 	}
 
 	return func(pending *coordinator.PendingAlert) (bool, bool, string, string) {
@@ -472,12 +433,9 @@ func makeEvidenceCheckCallback(
 		})
 
 		// --- Path 1: Transport-only downgrade ---
-		// If REC captured transport metadata and the status code is conclusive,
-		// downgrade immediately. Don't need the body to know a 404 failed.
 		if evidence != nil && evidence.Transport != nil {
 			code := evidence.Transport.StatusCode
 			if transportDowngradeCodes[code] {
-				// Update evidence info for logging
 				pending.EvidenceResult = evidence
 				pending.EvidenceJournal = evidence.ForJournal()
 
@@ -488,7 +446,7 @@ func makeEvidenceCheckCallback(
 			}
 		}
 
-		// --- Diagnostic: log why we can't downgrade yet ---
+		// --- Diagnostic logging ---
 		if evidence == nil || evidence.Transport == nil {
 			evStatus := "nil"
 			evCandidates := 0
@@ -510,8 +468,6 @@ func makeEvidenceCheckCallback(
 		}
 
 		// --- Path 2: Body-aware re-classification ---
-		// Status code is ambiguous (200, 3xx, 5xx). Need body to determine
-		// if the attack actually succeeded.
 		if evidence.SafeBodyPreview == "" {
 			log.Printf("[coordinator] Evidence check: transport available (HTTP %d) but ambiguous status, no body preview — key=%s candidates=%d format=%s",
 				evidence.Transport.StatusCode, pending.Key, evidence.CandidateCount,
@@ -524,11 +480,9 @@ func makeEvidenceCheckCallback(
 			return false, false, "", ""
 		}
 
-		// Update pending with evidence info for logging
 		pending.EvidenceResult = evidence
 		pending.EvidenceJournal = evidence.ForJournal()
 
-		// Determine classification
 		classification := pending.Classification
 		if classification == "" {
 			if pending.Verdict == "malicious" {
@@ -538,7 +492,6 @@ func makeEvidenceCheckCallback(
 			}
 		}
 
-		// Check re-classification cache
 		bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
 		if cached, ok := cache.get(bodyHash); ok {
 			if cached.downgraded {
@@ -551,7 +504,6 @@ func makeEvidenceCheckCallback(
 			return cached.downgraded, cached.escalated, cached.reason, cached.newSeverity
 		}
 
-		// Cache miss — call LLM (blocking acquire: T2 evidence is high priority)
 		release, ok := scheduler.AcquireBlocking(ctx)
 		if !ok {
 			log.Printf("[reclassify] Context cancelled waiting for LLM slot")
@@ -567,7 +519,7 @@ func makeEvidenceCheckCallback(
 			evidence.Transport.ContentLength,
 			evidence.SafeBodyPreview,
 		)
-		release() // free LLM slot immediately after call completes
+		release()
 		if err != nil {
 			log.Printf("[reclassify] Error: %v — not changing verdict", err)
 			return false, false, "", ""
@@ -575,7 +527,6 @@ func makeEvidenceCheckCallback(
 
 		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
 
-		// Record LLM decision to audit trail (Tier 2: reclassification with evidence)
 		db.RecordLLMDecision(context.Background(), &store.LLMDecision{
 			EventID:          pending.EventID,
 			Timestamp:        time.Now(),
@@ -618,24 +569,6 @@ func makeEvidenceCheckCallback(
 // Catch-All Verification Callback
 // =============================================================================
 
-// makeVerifyCallback creates the function called once per fingerprint lifetime
-// when the catch-all tracker wants to confirm a candidate is benign.
-//
-// ARCHITECTURE (design consensus, 2026-03-31):
-//   Structural inference NOMINATES, active verify CONFIRMS.
-//   One HTTP request + one LLM call per fingerprint lifetime.
-//
-// FLOW:
-//   1. GET the sample path via HTTP first, then HTTPS if HTTP doesn't match
-//   2. Compare status + body length against expected fingerprint values
-//   3. Feed body through redaction → LLM re-classification
-//   4. If LLM says benign → confirmed, persist to SQLite
-//   5. If LLM says sensitive → rejected, keep alerting
-//
-// SELF-SUPPRESSION:
-//   Uses cryptographic token in User-Agent. The log handler checks tokens
-//   against the SelfSuppressor registry and drops matching lines.
-//   the design review mandate: no static strings an attacker can copy.
 func makeVerifyCallback(
 	db *store.Store,
 	llmClient *llm.Client,
@@ -645,11 +578,10 @@ func makeVerifyCallback(
 	ctx context.Context,
 ) coordinator.VerifyFunc {
 
-	// HTTP client with short timeout — localhost should respond in ms
 	httpClient := &http.Client{
 		Timeout: 2 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse // don't follow redirects — we want to see the 302
+			return http.ErrUseLastResponse
 		},
 	}
 	httpsClient := &http.Client{
@@ -658,7 +590,7 @@ func makeVerifyCallback(
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // self-signed certs
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
@@ -669,16 +601,11 @@ func makeVerifyCallback(
 			return &coordinator.VerifyResult{Confirmed: false, Reason: "no sample path available"}
 		}
 
-		log.Printf("[verify] Starting verification: host=%s method=%s status=%d bytes=%d path=%s",
-			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes, path)
+		log.Printf("[verify] Starting verification: host=%s method=%s status=%d hash=%.16s path=%s",
+			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash, path)
 
-		// Generate self-suppression token — unique per verify request.
-		// The log handler will match this token and silently drop the log line.
-		// the design review mandate: cryptographic randomness, not a static string.
 		userAgent, _ := selfSuppress.GenerateToken()
 
-		// Try HTTP first (port 80), then HTTPS (port 443)
-		// The logged response could be from either — match against expected values
 		schemes := []struct {
 			scheme string
 			client *http.Client
@@ -688,11 +615,6 @@ func makeVerifyCallback(
 		}
 
 		for _, s := range schemes {
-			// SECURITY: Always verify through localhost — never use attacker-controlled
-			// host as network destination. nginx routes based on Host header, so we
-			// connect to 127.0.0.1 and set Host to the observed value.
-			// Without this, an attacker who sends requests with a custom Host header
-			// could trick Observer into making outbound requests to arbitrary servers (SSRF).
 			url := fmt.Sprintf("%s://127.0.0.1%s", s.scheme, path)
 
 			httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -709,80 +631,72 @@ func makeVerifyCallback(
 				continue
 			}
 
-			// Read body (capped at 4KB like REC)
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 
 			bodyLen := int64(len(body))
-			statusMatch := resp.StatusCode == fp.StatusCode
-			sizeMatch := bodyLen == fp.ResponseBytes
+			contentType := resp.Header.Get("Content-Type")
 
-			log.Printf("[verify] %s response: status=%d (want %d) body=%d bytes (want %d) match=%v",
-				s.scheme, resp.StatusCode, fp.StatusCode, bodyLen, fp.ResponseBytes, statusMatch && sizeMatch)
+			// Fix 2: Match by body hash, not response bytes.
+			bodyHash := rec.HashBody(body)
 
-			if !statusMatch || !sizeMatch {
-				continue // try next scheme
+			if resp.StatusCode != fp.StatusCode {
+				log.Printf("[verify] Status mismatch: expected=%d got=%d (scheme=%s)",
+					fp.StatusCode, resp.StatusCode, s.scheme)
+				continue
 			}
 
-			// Status + size match — now verify the body is benign
-			contentType := resp.Header.Get("Content-Type")
+			// Fix 2: Compare body preview hash instead of response bytes
+			if bodyHash != fp.BodyPreviewHash {
+				log.Printf("[verify] Body hash mismatch: expected=%.16s got=%.16s (scheme=%s)",
+					fp.BodyPreviewHash, bodyHash, s.scheme)
+				continue
+			}
+
+			log.Printf("[verify] Response matched: scheme=%s status=%d bytes=%d hash=%.16s",
+				s.scheme, resp.StatusCode, bodyLen, bodyHash)
 
 			// Redact the body using existing REC pipeline
 			disclosure := rec.ClassifyAndRedact(body, contentType)
 			safePreview := disclosure.RedactedPreview()
 
 			if safePreview == "" {
-				// Redaction couldn't produce a preview — still classify as benign
-				// if the body is very small (redirect pages, error templates)
 				if bodyLen <= 200 {
-					safePreview = string(body) // small enough to use raw
-				} else {
-					log.Printf("[verify] Redaction produced empty preview, format=%s — skipping LLM", disclosure.Format)
-					// For unknown formats, trust the size match alone if body is small-ish
-					if bodyLen <= 2048 {
-						reason := fmt.Sprintf("Verified: %s %d response (%d bytes), format=%s, consistent across %d+ paths",
-							s.scheme, resp.StatusCode, bodyLen, disclosure.Format, coordinator.DefaultCatchAllThreshold)
-						result := &coordinator.VerifyResult{
-							Confirmed:   true,
-							Reason:      reason,
-							ContentType: contentType,
-							BodyHash:    rec.HashBody(body),
-						}
-						persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
-						return result
+					safePreview = string(body)
+				} else if bodyLen <= 2048 {
+					reason := fmt.Sprintf("Verified: %s %d response (%d bytes), format=%s, body hash %.16s, consistent across %d+ paths",
+						s.scheme, resp.StatusCode, bodyLen, disclosure.Format, bodyHash, coordinator.DefaultCatchAllThreshold)
+					result := &coordinator.VerifyResult{
+						Confirmed:   true,
+						Reason:      reason,
+						ContentType: contentType,
+						BodyHash:    bodyHash,
 					}
+					persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
+					return result
+				} else {
 					return &coordinator.VerifyResult{Confirmed: false, Reason: "redaction failed on large body — cannot verify safety"}
 				}
 			}
 
-			// Ask LLM: is this response benign?
-			// Blocking acquire: catch-all verify fires once per fingerprint LIFETIME
-			// (~3-5/week). If we drop it, the fingerprint is permanently rejected
-			// with no retry mechanism. Worth waiting for a slot.
-			release, ok := scheduler.AcquireBlocking(ctx)
-			if !ok {
-				log.Printf("[verify] Context cancelled waiting for LLM slot")
-				return &coordinator.VerifyResult{Confirmed: false, Reason: "context cancelled"}
+			// LLM re-classification
+			release, acquired := scheduler.AcquireBlocking(ctx)
+			if !acquired {
+				return &coordinator.VerifyResult{Confirmed: false, Reason: "context cancelled waiting for LLM slot"}
 			}
-			reclass, err := llmClient.ReclassifyWithEvidence(
-				ctx,
-				"suspicious",                    // original classification
-				"Catch-all verification probe",  // original reason
-				fmt.Sprintf("GET %s → %d", path, resp.StatusCode), // synthetic log line
-				resp.StatusCode,
-				contentType,
-				bodyLen,
-				safePreview,
+			reclass, err := llmClient.ReclassifyWithEvidence(ctx,
+				"suspicious",
+				"Catch-all verification probe",
+				fmt.Sprintf("GET %s → %d", path, resp.StatusCode),
+				resp.StatusCode, contentType, bodyLen, safePreview,
 			)
-			release() // free LLM slot immediately
+			release()
+
 			if err != nil {
 				log.Printf("[verify] LLM error: %v — not confirming", err)
 				return &coordinator.VerifyResult{Confirmed: false, Reason: fmt.Sprintf("LLM error: %v", err)}
 			}
 
-			bodyHash := rec.HashBody(body)
-
-			// Record LLM decision to audit trail (Tier 3: catch-all verification)
 			db.RecordLLMDecision(context.Background(), &store.LLMDecision{
 				Timestamp:        time.Now(),
 				Tier:             "catchall_verify",
@@ -819,23 +733,26 @@ func makeVerifyCallback(
 				return result
 			}
 
-			// LLM said NOT benign — reject this fingerprint
 			reason := fmt.Sprintf("LLM rejected: %s (classification=%s)", reclass.Reason, reclass.Classification)
 			log.Printf("[verify] LLM rejected catch-all: %s", reason)
 			return &coordinator.VerifyResult{Confirmed: false, Reason: reason}
 		}
 
-		return &coordinator.VerifyResult{Confirmed: false, Reason: "no scheme matched expected status+size"}
+		return &coordinator.VerifyResult{
+			Confirmed: false,
+			Reason:    "all verification attempts failed (both HTTP and HTTPS)",
+		}
 	}
 }
 
-// persistVerifiedCatchAll saves a confirmed catch-all to SQLite for restart persistence.
+// persistVerifiedCatchAll saves a confirmed catch-all to SQLite.
+// Fix 2: Uses BodyPreviewHash instead of ResponseBytes.
 func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinator.CatchAllFingerprint, path string, result *coordinator.VerifyResult, contentType string) {
 	err := db.SaveVerifiedCatchAll(ctx, &store.CatchAllRule{
 		Host:                fp.Host,
 		HTTPMethod:          fp.Method,
 		HTTPStatus:          fp.StatusCode,
-		ResponseBytes:       fp.ResponseBytes,
+		BodyPreviewHash:     fp.BodyPreviewHash,
 		VerifiedAt:          time.Now(),
 		SamplePath:          path,
 		ContentType:         contentType,
@@ -846,13 +763,13 @@ func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinato
 	if err != nil {
 		log.Printf("[verify] Failed to persist verified catch-all: %v", err)
 	} else {
-		log.Printf("[verify] Persisted verified catch-all: host=%s method=%s status=%d bytes=%d",
-			fp.Host, fp.Method, fp.StatusCode, fp.ResponseBytes)
+		log.Printf("[verify] Persisted verified catch-all: host=%s method=%s status=%d hash=%.16s",
+			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash)
 	}
 }
 
-// seedCatchAllsFromDB loads previously verified catch-all fingerprints from SQLite
-// and pre-warms the tracker. Zero learning period for known catch-alls.
+// seedCatchAllsFromDB loads previously verified catch-all fingerprints.
+// Fix 2: Seeds with BodyPreviewHash instead of ResponseBytes.
 func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 	rules, err := db.LoadVerifiedCatchAlls(context.Background())
 	if err != nil {
@@ -867,10 +784,10 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 	reasons := make([]string, len(rules))
 	for i, r := range rules {
 		fps[i] = coordinator.CatchAllFingerprint{
-			Host:          r.Host,
-			Method:        r.HTTPMethod,
-			StatusCode:    r.HTTPStatus,
-			ResponseBytes: r.ResponseBytes,
+			Host:            r.Host,
+			Method:          r.HTTPMethod,
+			StatusCode:      r.HTTPStatus,
+			BodyPreviewHash: r.BodyPreviewHash,
 		}
 		reasons[i] = r.VerificationReason
 	}
@@ -879,33 +796,20 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 }
 
 // =============================================================================
-// Policy Engine Outcome Handler
+// Policy Outcome Routing
 // =============================================================================
 
-// routePolicyOutcome handles the result of a policy engine match.
-// This is the "one road to the database and inbox" for policy matches.
-// Uses the same notifier.Dispatcher as coordinator escalations — no bypass lanes.
-//
-// AI Committee mandate (April 2026): do not duplicate dispatch/store logic.
-// All paths to email and SQLite must go through shared functions.
-func routePolicyOutcome(
-	evt *event.Event,
-	pr policy.Result,
-	dispatch *notifier.Dispatcher,
-	db *store.Store,
-) {
+func routePolicyOutcome(evt *event.Event, pr policy.Result, dispatch *notifier.Dispatcher, db *store.Store) {
 	switch pr.Action {
 	case "allow":
-		// Trusted — suppress silently. No finding recorded to avoid
-		// flooding the dashboard with "Drew logged in from home" entries.
-		return
-
-	case "alert":
-		// Record finding for dashboard review, no email.
-		log.Printf("[POLICY] EventID=%s rule=%s action=alert ip=%s user=%s reason=%s",
+		log.Printf("[POLICY:ALLOW] EventID=%s rule=%s ip=%s user=%s reason=%s",
 			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
 
-		db.RecordFinding(context.Background(), &store.Finding{
+	case "alert":
+		log.Printf("[POLICY:ALERT] EventID=%s rule=%s ip=%s user=%s reason=%s",
+			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
+
+		db.SubmitFinding(&store.Finding{
 			EventID:        evt.ID,
 			Timestamp:      evt.Timestamp,
 			SourceType:     evt.SourceType,
@@ -913,7 +817,7 @@ func routePolicyOutcome(
 			SourceIP:       pr.SourceIP,
 			Verdict:        "alert",
 			Classification: "policy_alert",
-			Confidence:     1.0, // deterministic = 100% confidence
+			Confidence:     1.0,
 			Reason:         pr.Reason,
 			MatchedVia:     "policy:" + pr.RuleID,
 			RawLine:        evt.Line,
@@ -921,12 +825,10 @@ func routePolicyOutcome(
 		})
 
 	case "escalate":
-		// Record finding AND send email immediately.
-		// This is the "someone is inside your server" path.
 		log.Printf("[POLICY:ESCALATE] EventID=%s rule=%s ip=%s user=%s reason=%s",
 			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
 
-		db.RecordFinding(context.Background(), &store.Finding{
+		db.SubmitFinding(&store.Finding{
 			EventID:        evt.ID,
 			Timestamp:      evt.Timestamp,
 			SourceType:     evt.SourceType,
@@ -941,8 +843,6 @@ func routePolicyOutcome(
 			Notified:       true,
 		})
 
-		// Send alert through the same dispatcher as HTTP escalations.
-		// SeverityMalicious routes to all configured channels.
 		alert := notifier.Alert{
 			EventID:        evt.ID,
 			Severity:       notifier.SeverityMalicious,
@@ -963,8 +863,6 @@ func routePolicyOutcome(
 // Log Handler
 // =============================================================================
 
-// makeLogHandler creates the core pipeline handler that processes each log line.
-// retryEvent holds a deferred event for the retry queue.
 type retryEvent struct {
 	evt  *event.Event
 	line watcher.LogLine
@@ -987,17 +885,10 @@ func makeLogHandler(
 			return
 		}
 
-		// Self-suppression: skip log lines generated by Observer's own
-		// catch-all verify requests. Uses cryptographic tokens — not a
-		// static User-Agent that an attacker could spoof.
-		// (the design review security mandate, 2026-03-31)
 		if alertCoordinator.SelfSuppressor().IsSelfVerify(line.Line) {
 			return
 		}
 
-		// Resolve source identity. Journald and future watchers set
-		// SourceType/SourceName directly. Docker watcher uses the legacy
-		// ContainerID/ContainerName fields.
 		sourceType := line.SourceType
 		sourceName := line.SourceName
 		metadata := line.Metadata
@@ -1020,13 +911,7 @@ func makeLogHandler(
 			Metadata:    metadata,
 		}
 
-		// =====================================================
-		// POLICY ENGINE — deterministic pre-LLM layer (v0.34)
-		// Runs AFTER event creation, BEFORE analyzer/LLM.
-		// Short-circuits for host-state events where the log
-		// line IS the evidence (SSH login, useradd, etc.)
-		// Committee consensus: policy is identity, not inference.
-		// =====================================================
+		// Policy engine — deterministic pre-LLM layer
 		if pr := policyEngine.Evaluate(evt); pr.Matched {
 			routePolicyOutcome(evt, pr, dispatch, db)
 			return
@@ -1034,9 +919,6 @@ func makeLogHandler(
 
 		result := a.Analyze(context.Background(), evt)
 
-		// Deferred classification: LLM was busy, push to retry queue.
-		// Retry workers will do a blocking acquire and classify later.
-		// Much better than dropping — one-off attacks still get classified.
 		if result.Source == "backpressure" {
 			select {
 			case retryQueue <- &retryEvent{evt: evt, line: line}:
@@ -1048,10 +930,58 @@ func makeLogHandler(
 			return
 		}
 
-		// Route the classification result — shared with retry workers.
-		// One function, one truth: LLM audit trail, recon routing,
-		// HTTP coordinator path, non-HTTP direct-to-findings.
 		router.Route(evt, &result, line, "classify")
+	}
+}
+
+// =============================================================================
+// Fix 4: Evidence Reconciler
+// =============================================================================
+//
+// Background goroutine that finalizes stale malicious HTTP findings as
+// "evidence_unavailable" after a bounded window. Never auto-downgrades —
+// just stamps the terminal state so the dashboard can distinguish
+// "confirmed malicious, outcome unknown" from "evidence attempted but missed."
+//
+// Runs every 60 seconds. Processes findings older than 15 minutes.
+// Append-only: preserves original verdict, adds resolution metadata.
+
+func runReconciler(ctx context.Context, db *store.Store) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("[reconciler] Evidence reconciler started (window=15m, interval=60s)")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[reconciler] Shutting down")
+			return
+		case <-ticker.C:
+			findings, err := db.QueryUnresolvedMalicious(ctx, 15*time.Minute, 50)
+			if err != nil {
+				log.Printf("[reconciler] Query error: %v", err)
+				continue
+			}
+
+			if len(findings) == 0 {
+				continue
+			}
+
+			finalized := 0
+			for _, f := range findings {
+				err := db.UpdateFindingResolution(ctx, f.EventID, "evidence_unavailable", "timeout", "")
+				if err != nil {
+					log.Printf("[reconciler] Failed to finalize %s: %v", f.EventID, err)
+					continue
+				}
+				finalized++
+			}
+
+			if finalized > 0 {
+				log.Printf("[reconciler] Finalized %d findings as evidence_unavailable", finalized)
+			}
+		}
 	}
 }
 
@@ -1081,37 +1011,35 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			llmTotal, llmDropped := scheduler.Stats()
 			drops := pipelineDrops.Load()
 			retryDrops := retryQueueDrops.Load()
-			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d",
+			asyncDrops := db.AsyncWriterStats() // Fix 3: async writer drops
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d async_drops=%d",
 				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned,
-				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops)
+				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops, asyncDrops)
 			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d malicious=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
 			if collector.Enabled() {
 				rStats := collector.Stats()
-				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d",
+				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
 					rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
 					rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
-					rStats.BufferEntries, rStats.BufferBytes)
+					rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
 				log.Printf("[observer] REC parse: req_prefix=%d req_fail=%d resp_prefix=%d resp_fail=%d",
 					rStats.ReqPrefixHits, rStats.ReqParseFails, rStats.RespPrefixHits, rStats.RespParseFails)
 			}
 
-			// Catch-all tracker stats
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()
 			if caTotal > 0 {
 				log.Printf("[observer] CatchAll: fingerprints=%d candidates=%d pending=%d verified=%d rejected=%d suppressed=%d",
 					caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed)
 			}
 
-			// Policy engine stats
 			policyMatches, policyEscalations, policyAllows, policyAlerts := policyEngine.Stats()
 			if policyMatches > 0 {
 				log.Printf("[observer] Policy: matches=%d escalations=%d allows=%d alerts=%d",
 					policyMatches, policyEscalations, policyAllows, policyAlerts)
 			}
 
-			// Record pipeline stats to SQLite
 			db.RecordPipelineStats(ctx, &store.PipelineStats{
 				Timestamp:       time.Now(),
 				Processed:       aStats.TotalProcessed,
@@ -1120,7 +1048,7 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				LLMCalls:        aStats.LLMCalls,
 				LLMErrors:       aStats.LLMErrors,
 				PatternsLearned: aStats.PatternsLearned,
-				MaliciousCount:       pStats.MaliciousHits,
+				MaliciousCount:  pStats.MaliciousHits,
 				AlertCount:      pStats.AlertHits,
 				SuppressCount:   pStats.SuppressHits,
 			})

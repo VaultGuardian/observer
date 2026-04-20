@@ -1,3 +1,4 @@
+// resultrouter.go
 package main
 
 import (
@@ -19,11 +20,6 @@ import (
 // resultRouter handles post-classification routing for ALL analysis results.
 // Both the primary pipeline workers and retry workers call Route().
 // One function, one truth, no drift.
-//
-// code review code review (April 2026): the retry worker had its own copy of
-// post-classification routing that drifted from the primary path.
-// Two confirmed bugs: non-HTTP alerts silently dropped on retry,
-// and retried HTTP alerts missing ResponseBytes.
 type resultRouter struct {
 	cfg              Config
 	db               *store.Store
@@ -34,8 +30,6 @@ type resultRouter struct {
 // Route processes a classification result: records LLM decision to audit trail,
 // handles recon_failed, routes alerts through coordinator (HTTP) or directly
 // to findings (non-HTTP). Called by both primary and retry workers.
-//
-// tier is "classify" for primary pipeline, "classify_retry" for retry workers.
 func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, line watcher.LogLine, tier string) {
 	// --- Record LLM decision to audit trail ---
 	if result.Source == "llm" && result.LLMVerdict != nil {
@@ -71,7 +65,6 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 	// --- Route based on verdict ---
 	switch result.Verdict {
 	case patternstore.VerdictAllow, patternstore.VerdictSuppress:
-		// Done — pattern learned or noise confirmed
 		return
 
 	case patternstore.VerdictMalicious, patternstore.VerdictAlert:
@@ -84,23 +77,19 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 	}
 }
 
-// routeAlert handles malicious/alert verdicts: recon routing, HTTP coordinator path,
-// and non-HTTP direct-to-findings path.
+// routeAlert handles malicious/alert verdicts.
 func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisResult, line watcher.LogLine) {
 	method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
 	isHTTP := method != ""
 
-	// --- Recon routing: log + store, no email ---
-	// recon_failed = probe found nothing. Telemetry only.
-	// recon_success = probe got a 200. Must flow through coordinator
-	// for evidence check — if the response contains credentials,
-	// T2 reclassify will escalate to malicious and send email.
+	// --- Recon routing ---
 	if result.LLMClassification == "recon_failed" {
 		log.Printf("[RECON] EventID=%s Source=%s Classification=%s Reason=%s MatchedVia=%s Line=%s",
 			evt.ID, evt.ScopeKey(), result.LLMClassification, result.Reason, result.Source,
 			truncate(evt.Line, 200))
 
-		r.db.RecordFinding(context.Background(), &store.Finding{
+		// Fix 3: Use async writer for recon (droppable under DDoS)
+		r.db.SubmitFinding(&store.Finding{
 			EventID:        evt.ID,
 			Timestamp:      evt.Timestamp,
 			SourceType:     evt.SourceType,
@@ -134,6 +123,23 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// --- HTTP alerts: route through coordinator for evidence huddle ---
 	if isHTTP && r.collector.Enabled() {
 		correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
+
+		// Fix 1: Pin VIP evidence for malicious events.
+		// The collector stores match criteria in a protected map that
+		// CANNOT be evicted by traffic floods. When a matching response
+		// arrives, the VIP callback fires immediately.
+		if result.Verdict == patternstore.VerdictMalicious {
+			r.collector.PinVIP(evt.ID, correlationKey, rec.LookupRequest{
+				Method:          method,
+				Path:            path,
+				Host:            host,
+				SourceContainer: evt.SourceName,
+				StatusCode:      statusCode,
+				Timestamp:       evt.Timestamp,
+				Window:          5 * time.Second,
+				ExpectedBytes:   respBytes,
+			})
+		}
 
 		// Capture variables for closure
 		evtCopy := evt
@@ -182,24 +188,25 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			ResponseBytes:  respBytes,
 			HTTPMethod:     method,
 			HTTPPath:       path,
-			NormalizedLine: evt.NormalizedLine,
-			SourceName:     evt.SourceName,
-			Timestamp:      evt.Timestamp,
-			BuildAlert:     alertBuilder,
+			// Fix 2: BodyPreviewHash for catch-all matching.
+			// Empty at routing time — populated when evidence arrives.
+			// Catch-all Check skips when empty.
+			BodyPreviewHash: "",
+			NormalizedLine:  evt.NormalizedLine,
+			SourceName:      evt.SourceName,
+			Timestamp:       evt.Timestamp,
+			BuildAlert:      alertBuilder,
 		})
 		return
 	}
 
-	// --- Non-HTTP alerts (sshd, sudo, kernel, etc.): direct to findings ---
-	// No coordinator huddle, no evidence capture — these aren't HTTP requests.
-	// Log and record to SQLite for dashboard review.
+	// --- Non-HTTP alerts: direct to findings ---
 	log.Printf("[ALERT] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s Line=%s",
 		evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 		truncate(evt.Line, 200))
 
-	// NO EMAIL — only escalated alerts (evidence-confirmed exposure) send email.
-	// Non-HTTP alerts are logged to SQLite for dashboard review.
-	r.db.RecordFinding(context.Background(), &store.Finding{
+	// Fix 3: Use async writer for non-HTTP alerts (non-droppable — blocks if full)
+	r.db.SubmitFinding(&store.Finding{
 		EventID:        evt.ID,
 		Timestamp:      evt.Timestamp,
 		SourceType:     evt.SourceType,

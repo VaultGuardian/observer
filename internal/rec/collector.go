@@ -1,9 +1,11 @@
+// internal/rec/collector.go
 package rec
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -35,6 +37,19 @@ type EvidenceCollector interface {
 	// Stats returns a snapshot of REC telemetry counters.
 	// Safe to call from any goroutine. Returns zero stats if disabled.
 	Stats() RECStats
+
+	// --- Fix 1: VIP Lane for Malicious Evidence ---
+
+	// PinVIP registers interest in evidence for a malicious event.
+	// When a captured response matches the criteria, it's stored in a
+	// protected VIP map that CANNOT be evicted by traffic floods.
+	// The push callback (if set) fires immediately on match.
+	PinVIP(eventID string, correlationKey string, req LookupRequest)
+
+	// SetVIPCallback registers the push notification function.
+	// Called from main.go with a function that has access to the coordinator.
+	// Fires with the correlation key when VIP evidence is matched.
+	SetVIPCallback(fn func(correlationKey string))
 }
 
 // DefaultCorrelationWindow is the agreed-upon L7 heuristic window.
@@ -120,8 +135,10 @@ func NewCollector(cfg CollectorConfig) EvidenceCollector {
 	}
 
 	return &liveCollector{
-		config: cfg,
-		buffer: NewRingBuffer(cfg.Buffer),
+		config:      cfg,
+		buffer:      NewRingBuffer(cfg.Buffer),
+		vipPins:     make(map[string]*vipPin),
+		vipEvidence: make(map[string]CapturedResponse),
 	}
 }
 
@@ -133,7 +150,11 @@ type noOpCollector struct {
 	reason EvidenceStatus
 }
 
-func (n *noOpCollector) Start(ctx context.Context) error { return nil }
+func (n *noOpCollector) Start(ctx context.Context) error                            { return nil }
+func (n *noOpCollector) Enabled() bool                                              { return false }
+func (n *noOpCollector) Stats() RECStats                                            { return RECStats{} }
+func (n *noOpCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {}
+func (n *noOpCollector) SetVIPCallback(fn func(correlationKey string))               {}
 
 func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 	return &Evidence{
@@ -142,9 +163,34 @@ func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 	}
 }
 
-func (n *noOpCollector) Enabled() bool { return false }
+// =============================================================================
+// Fix 1: VIP Lane Data Structures
+// =============================================================================
+//
+// When the classifier flags a request as malicious, we pin its tracking
+// metadata in a separate high-priority map that CANNOT be evicted by
+// traffic floods. The ring buffer has 1000 entries and 30s TTL — an
+// attacker flooding 50K garbage requests evicts malicious evidence before
+// the coordinator can look it up.
+//
+// The VIP lane solves both problems:
+//   1. Anti-eviction: VIP evidence has its own map (120s TTL, max 200 entries)
+//   2. Push notification: when a response matches VIP criteria, a callback
+//      fires immediately so the coordinator can re-check without waiting
+//      for the next poll cycle.
 
-func (n *noOpCollector) Stats() RECStats { return RECStats{} }
+const (
+	vipMaxEntries = 200           // max pending VIP pins
+	vipTTL        = 120 * time.Second // 120s > coordinator's 5s window — catches late evidence
+)
+
+// vipPin holds the criteria for a pending VIP match.
+type vipPin struct {
+	eventID        string
+	correlationKey string // coordinator key for push callback
+	criteria       LookupRequest
+	createdAt      time.Time
+}
 
 // =============================================================================
 // Live Collector
@@ -170,6 +216,13 @@ type liveCollector struct {
 	buffer  *RingBuffer
 	sniffer *sniffer      // stored for stats access
 	running atomic.Bool   // atomic — Start() and Lookup() can race (code review's fix)
+
+	// Fix 1: VIP lane for malicious evidence
+	vipMu        sync.Mutex
+	vipPins      map[string]*vipPin         // eventID → pending match criteria
+	vipEvidence  map[string]CapturedResponse // eventID → matched response (protected)
+	onVIPMatch   func(correlationKey string)  // push callback → coordinator
+	vipMatches   int64                        // telemetry counter
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
@@ -191,6 +244,12 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	iface := lc.config.Interface
 
 	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose)
+
+	// Fix 1: Wire sniffer capture callback for VIP lane.
+	// Every successfully parsed response fires this callback.
+	// The callback checks VIP pins and resolves matches immediately.
+	s.onCapture = lc.handleCapturedResponse
+
 	lc.sniffer = s
 
 	// --- Decide capture mode: namespace or host ---
@@ -240,6 +299,9 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// Launch cleanup goroutine for stale pending requests
 	go s.cleanupLoop(ctx)
 
+	// Fix 1: Launch VIP cleanup goroutine (expire stale pins)
+	go lc.vipCleanupLoop(ctx)
+
 	ifaceDesc := iface
 	if ifaceDesc == "" {
 		ifaceDesc = "(all interfaces)"
@@ -258,6 +320,8 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	return nil
 }
 
+// Lookup performs L7 heuristic correlation.
+// Fix 1: Checks VIP-protected evidence first, then falls back to ring buffer.
 func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 	if !lc.running.Load() {
 		return &Evidence{
@@ -266,36 +330,23 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
-	if req.Window == 0 {
-		req.Window = DefaultCorrelationWindow
-	}
+	// --- Fix 1: Check VIP evidence first ---
+	// VIP evidence is protected from eviction. If there's a match,
+	// use it — the coordinator already knows this is high-priority.
+	candidates := lc.lookupVIPEvidence(req)
 
-	// Ring buffer handles all hard filtering:
-	// Method + Path + StatusCode + Host + SourceContainer + time window.
-	candidates := lc.buffer.Lookup(req)
+	// --- Standard ring buffer lookup ---
+	bufferCandidates := lc.buffer.Lookup(req)
+	candidates = append(candidates, bufferCandidates...)
 
 	if len(candidates) == 0 {
 		return &Evidence{
 			Status:                EvidenceNotAvailableNoMatch,
 			CorrelationConfidence: ConfidenceNone,
-			CandidateCount:        0,
 		}
 	}
 
-	// Pick the best candidate using a tiered approach:
-	//
-	// 1. Byte-count tiebreaker (Option D, design consensus):
-	//    If the caller provided ExpectedBytes from the access log, prefer the
-	//    candidate whose ContentLength is closest. This disambiguates orphans
-	//    when hashes differ (e.g., API response vs HTML page at the same time).
-	//    Uses tolerance, not exact match — nginx bytes include headers + compression.
-	//
-	// 2. Timestamp proximity (existing behavior):
-	//    Among remaining ties, prefer the closest timestamp.
-	//
-	// 3. UserAgent tie-breaker (code review's improvement):
-	//    Final tie-breaker when timestamp is equal.
-
+	// --- Score and select best candidate (existing logic) ---
 	best := candidates[0]
 	bestScore := candidateScore(best, req)
 	for _, c := range candidates[1:] {
@@ -311,20 +362,6 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 	}
 
 	// === CLONE CHECK (Option A, design consensus) ===
-	// If ALL candidates share the same BodyPreviewHash + ContentLength + ContentType,
-	// they are structurally identical responses. It doesn't matter which one we
-	// matched — the evidence is the same. Promote to HIGH confidence.
-	//
-	// This is NOT "lowering standards" — it's recognizing that 4 identical answers
-	// is as good as 1 answer. The dual-gate stays strict; this earns HIGH honestly.
-	//
-	// code review refinement: check ContentLength + ContentType too, not just hash.
-	// Since BodyPreviewHash is computed from a truncated preview (2KB), two
-	// responses could share the same preview prefix but differ later. Adding
-	// ContentLength confirms full-body equivalence.
-	//
-	// AI DESIGN DECISION (2026-03-25): the team, code review, and /
-	// independently agreed on A+D. the design review originated the clone check concept.
 	corrConf := ConfidenceHigh
 	if len(candidates) > 1 {
 		allClones := true
@@ -339,7 +376,6 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 
 		if allClones && refHash != "" {
-			// All candidates are structurally identical — HIGH confidence earned
 			corrConf = ConfidenceHigh
 			log.Printf("[rec] Clone check: %d identical candidates (hash=%.16s len=%d type=%s) → HIGH confidence",
 				len(candidates), refHash, refLen, refType)
@@ -348,12 +384,10 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
-	// Detect orphan match (response had no paired request — common on
-	// namespace capture where the inbound request is TLS-encrypted and
-	// the outbound proxy request is an outgoing packet AF_PACKET misses).
+	// Detect orphan match
 	isOrphan := best.Method == ""
 
-	// Build transport evidence (Layer 1 — always included)
+	// Build transport evidence (Layer 1)
 	captureMode := "single_segment_preview"
 	if isOrphan {
 		captureMode = "single_segment_preview_orphan"
@@ -371,12 +405,7 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 	// Build disclosure analysis (Layer 2)
 	disclosure := classifyAndRedact(best.BodyPreview, best.ContentType)
 
-	// === DUAL-GATE RULE: Evaluate once at construction, populate exported field ===
-	// Body preview is ONLY exposed when BOTH gates pass:
-	//   Gate 1: CorrelationConfidence == High (correct transaction matched)
-	//   Gate 2: RedactionConfidence  == High (secrets properly stripped)
-	// This is enforced HERE, not via a getter. The field is exported for JSON
-	// serialization. If either gate fails, SafeBodyPreview stays empty. Period.
+	// === DUAL-GATE RULE ===
 	safePreview := ""
 	if corrConf == ConfidenceHigh &&
 		disclosure != nil &&
@@ -421,7 +450,158 @@ func (lc *liveCollector) Stats() RECStats {
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()
 	}
+	stats.VIPMatches = lc.vipMatches
 	return stats
+}
+
+// =============================================================================
+// Fix 1: VIP Lane Methods
+// =============================================================================
+
+// PinVIP registers interest in evidence for a malicious event.
+// Called from resultrouter.go when a malicious HTTP verdict is routed to coordinator.
+func (lc *liveCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+
+	// Enforce max entries — evict oldest if full
+	if len(lc.vipPins) >= vipMaxEntries {
+		var oldestID string
+		var oldestTime time.Time
+		for id, pin := range lc.vipPins {
+			if oldestID == "" || pin.createdAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = pin.createdAt
+			}
+		}
+		if oldestID != "" {
+			delete(lc.vipPins, oldestID)
+		}
+	}
+
+	lc.vipPins[eventID] = &vipPin{
+		eventID:        eventID,
+		correlationKey: correlationKey,
+		criteria:       req,
+		createdAt:      time.Now(),
+	}
+
+	log.Printf("[rec:vip] Pinned evidence for %s: method=%s path=%s host=%s status=%d",
+		eventID, req.Method, req.Path, req.Host, req.StatusCode)
+}
+
+// SetVIPCallback registers the push notification callback.
+// Called from main.go after coordinator is created.
+func (lc *liveCollector) SetVIPCallback(fn func(correlationKey string)) {
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+	lc.onVIPMatch = fn
+}
+
+// handleCapturedResponse is called by the sniffer on every successfully
+// parsed HTTP response. Checks VIP pins for a match.
+func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+
+	for eventID, pin := range lc.vipPins {
+		if matchesVIP(resp, pin.criteria) {
+			// Store in protected VIP evidence map
+			lc.vipEvidence[eventID] = resp
+			correlationKey := pin.correlationKey
+			delete(lc.vipPins, eventID)
+			lc.vipMatches++
+
+			log.Printf("[rec:vip] Evidence matched for %s: status=%d method=%s path=%s",
+				eventID, resp.StatusCode, resp.Method, resp.Path)
+
+			// Fire push callback (non-blocking)
+			if lc.onVIPMatch != nil {
+				go lc.onVIPMatch(correlationKey)
+			}
+			return
+		}
+	}
+}
+
+// matchesVIP checks if a captured response matches VIP pin criteria.
+// Uses the same hard filters as ring buffer Lookup:
+//   - Method + Path (if response has request info — orphans skip this)
+//   - StatusCode (hard filter)
+//   - Host (hard filter if both sides have it)
+//   - Time window
+func matchesVIP(resp CapturedResponse, req LookupRequest) bool {
+	window := req.Window
+	if window == 0 {
+		window = 5 * time.Second // wider window for VIP — evidence may arrive late
+	}
+
+	// Time window
+	windowStart := req.Timestamp.Add(-window)
+	windowEnd := req.Timestamp.Add(window)
+	if resp.Timestamp.Before(windowStart) || resp.Timestamp.After(windowEnd) {
+		return false
+	}
+
+	// Method + Path (if response has request info)
+	if resp.Method != "" {
+		if resp.Method != req.Method || resp.Path != req.Path {
+			return false
+		}
+	}
+
+	// Status code hard filter
+	if req.StatusCode > 0 && resp.StatusCode != req.StatusCode {
+		return false
+	}
+
+	// Host hard filter
+	if req.Host != "" && resp.Host != "" && resp.Host != req.Host {
+		return false
+	}
+
+	return true
+}
+
+// lookupVIPEvidence returns VIP-protected candidates matching the request.
+func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse {
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+
+	var candidates []CapturedResponse
+	for _, resp := range lc.vipEvidence {
+		if matchesVIP(resp, req) {
+			candidates = append(candidates, resp)
+		}
+	}
+	return candidates
+}
+
+// vipCleanupLoop removes expired VIP pins and evidence periodically.
+func (lc *liveCollector) vipCleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lc.vipMu.Lock()
+			cutoff := time.Now().Add(-vipTTL)
+			for id, pin := range lc.vipPins {
+				if pin.createdAt.Before(cutoff) {
+					delete(lc.vipPins, id)
+				}
+			}
+			for id, resp := range lc.vipEvidence {
+				if resp.Timestamp.Before(cutoff) {
+					delete(lc.vipEvidence, id)
+				}
+			}
+			lc.vipMu.Unlock()
+		}
+	}
 }
 
 // =============================================================================
@@ -437,15 +617,6 @@ func absDuration(d time.Duration) time.Duration {
 
 // candidateScore computes a ranking score for an orphan candidate.
 // Lower score = better match. Combines byte-count proximity and timestamp proximity.
-//
-// If ExpectedBytes is provided (from the access log), byte-count proximity
-// dominates: a candidate matching the expected response size is strongly
-// preferred over one that doesn't. This disambiguates orphans when multiple
-// responses have different sizes (e.g., 34KB Laravel page vs 500-byte JSON error).
-//
-// Byte-count matching uses a tolerance of 20% or 2KB (whichever is larger)
-// because nginx logs "bytes sent" (includes headers, may reflect compression)
-// while ContentLength is from the response header. They won't match exactly.
 func candidateScore(c CapturedResponse, req LookupRequest) time.Duration {
 	timeDelta := absDuration(c.Timestamp.Sub(req.Timestamp))
 
@@ -462,10 +633,8 @@ func candidateScore(c CapturedResponse, req LookupRequest) time.Duration {
 		}
 
 		if bytesDiff > tolerance {
-			// Way off — penalize by adding 1 hour to make timestamp irrelevant
 			timeDelta += time.Hour
 		}
-		// Within tolerance — just use timestamp as tiebreaker
 	}
 
 	return timeDelta
@@ -501,7 +670,6 @@ func FormatEvidence(e *Evidence) string {
 	if e.SafeBodyPreview != "" {
 		out += fmt.Sprintf("  Body (redacted):\n    %s\n", e.SafeBodyPreview)
 	} else if e.HasEvidence() {
-		// Explain WHY the preview is missing (code review #9)
 		if e.CorrelationConfidence != ConfidenceHigh {
 			out += "  Body Preview: withheld (low correlation confidence)\n"
 		} else if e.Disclosure != nil && e.Disclosure.RedactionConfidence != ConfidenceHigh {
