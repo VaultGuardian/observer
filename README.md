@@ -9,6 +9,22 @@ Observer watches your Docker container logs and host system events (sshd, sudo, 
 
 Most security tools scream "SQL injection detected!" when a bot sprays your server. Observer captures the server's response, reads it, and tells you "the app returned its welcome page and ignored the payload." One accurate finding instead of fifty false alarms.
 
+## See It In Action
+
+A real attack caught in production — an IoT botnet tried to exploit a Netgear router vulnerability to download and execute malware:
+
+![Observer downgrade example](docs/images/downgrade-netgear.png)
+
+Here's what happened, step by step:
+
+1. **The attack:** An attacker sent `GET /setup.cgi?cmd=rm+-rf+/tmp/*;wget+malware;sh+netgear` — a real remote code execution attempt trying to wipe `/tmp`, download a Mozi botnet binary, and execute it.
+2. **Tier 1 classification:** Observer's AI read the log line and said "this is malicious — command execution via setup.cgi, 0.78 confidence." No pattern was learned (malicious verdicts never auto-learn broad patterns, by design).
+3. **Coordinator held for evidence:** Instead of alerting immediately, Observer waited 2-5 seconds and asked the packet sniffer "what did the server actually send back?"
+4. **REC delivered the response:** The sniffer had captured the raw HTTP response from inside the nginx namespace — status 404.
+5. **Downgraded:** The server returned a 404. The attack failed. The payload was rejected. Observer logged it and moved on. No email, no false alarm.
+
+That's one email saved. Multiply by the thousands of attacks every public server receives daily.
+
 ## Install
 
 One command on any Linux server with Docker:
@@ -26,7 +42,7 @@ vaultguardian status          # Service status + recent logs
 vaultguardian logs            # Tail logs
 vaultguardian stats           # Pipeline performance
 vaultguardian update          # Update to latest release
-vaultguardian update v0.35    # Update to specific version
+vaultguardian update v0.36    # Update to specific version
 vaultguardian restart         # Restart observer
 vaultguardian version         # Current + available versions
 vaultguardian uninstall       # Remove observer
@@ -36,7 +52,7 @@ vaultguardian uninstall       # Remove observer
 
 ```
 Log line arrives (Docker container or journald)
-  → Deterministic filters (stack traces, failed HTTP probes)
+  → Deterministic filters (stack traces, failed HTTP probes, SSH brute force)
   → Policy engine (SSH logins, user creation, privilege escalation)
   → Pattern store (nanosecond hash/prefix/regex/contains lookup)
     → Known-good? Skip silently.
@@ -50,6 +66,7 @@ If alert-worthy:
   → Re-classify with evidence: "Did the attack succeed or get ignored?"
   → Downgraded? Log it, don't email.
   → Confirmed credential exposure? Email immediately.
+  → Evidence not captured? Mark as "evidence unavailable" — honest, not silent.
 ```
 
 ## What It Catches
@@ -82,19 +99,21 @@ If alert-worthy:
 - **Low noise by design.** Failed scanners suppressed. SSH brute force invisible. Duplicate alerts grouped. False alarms downgraded with evidence.
 - **Single binary, no dependencies.** One Go binary, one systemd service. No Docker-in-Docker, no sidecar, no cloud requirement.
 - **Trusted IP allowlist.** Known IPs (your office, VPN) bypass SSH alerts. Unknown IP logs in → instant email.
+- **Adversarial-hardened.** VIP evidence lane prevents traffic flood eviction. Catch-all fingerprinting uses body hashes, not sizes. Async writes prevent DDoS-induced pipeline stalls.
 
 ## Production Numbers
 
-Real production stats from a server running Observer for 30 days:
+Real production stats from servers running Observer:
 
 | Metric | Value |
 |--------|-------|
-| Events processed | 145,000+ |
-| Cache hit rate | 97% |
-| Total LLM calls | 354 |
-| LLM errors | 3 |
+| Events processed | 174,000+ |
+| Cache hit rate | 97.5% |
+| Total LLM calls | 517 |
+| LLM errors | 4 |
 | Total OpenAI spend | ~$17 lifetime |
 | False alarm emails | 0 |
+| Attacks downgraded (emails saved) | 29 |
 | Real escalations caught | 1 (.env credential exposure) |
 
 ## Configuration
@@ -135,6 +154,8 @@ Real production stats from a server running Observer for 30 days:
   AF_PACKET ───────▶│  REC ───────▶│  (evidence │──▶ Email alert │
   (namespace sniff) │  Sniffer     │   huddle)  │                │
                     │              └──────────┘                 │
+                    │                                             │
+                    │  REST API (:9090) ──▶ Dashboard connection  │
                     └─────────────────────────────────────────────┘
 ```
 
@@ -144,32 +165,64 @@ Real production stats from a server running Observer for 30 days:
 2. **Policy engine** — SSH logins, user creation, privilege escalation, authorized_keys. Identity-based decisions with trusted IP allowlist.
 3. **Pattern store** — 4-bucket model (allow/malicious/alert/suppress), 4-tier matching (hash → prefix → regex → contains). Nanosecond lookups.
 4. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Learns patterns from verdicts. Bounded retry queue for backpressure.
-5. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Captures HTTP responses, redacts secrets, correlates with alerts.
+5. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Captures HTTP responses, redacts secrets, correlates with alerts. VIP lane protects malicious evidence from traffic flood eviction.
 6. **Coordinator** — Groups alerts, holds for evidence (2-5s), downgrades false alarms, dispatches findings. Email only on confirmed credential exposure.
-7. **Catch-all suppression** — Learns server fingerprints (host, status, body size). Auto-downgrades repeated identical responses across different attack paths.
+7. **Catch-all suppression** — Learns server response fingerprints (host, status, body hash). Auto-downgrades repeated identical responses across different attack paths.
+8. **Evidence reconciler** — Background process finalizes unresolved findings. Marks as "evidence unavailable" after 15 minutes if evidence was never captured.
 
-## Dashboard
+### Security Outcomes
 
-Observer includes a web dashboard at `http://your-server:9090` showing:
+| Outcome | Meaning |
+|---------|---------|
+| **Escalated** | Evidence confirmed real credential/data exposure. Email sent. |
+| **Malicious** | Confirmed attack payload. Evidence not captured or inconclusive. Logged for awareness. |
+| **Downgraded** | Attack confirmed failed via evidence. Email saved. |
+| **Suspicious** | Unusual activity, unresolved. Dashboard review. |
+| **Recon** | Probe logged for trend analysis. |
 
-- **Overview** — Security outcomes (escalations, blocked, downgraded, needs review) and system health
-- **Events** — Every security event with AI classification, evidence, confirm/correct buttons
-- **Internals** — LLM decision audit trail, pattern store stats, REC metrics
-- **Settings** — Trusted IP management, active policy rules
+## API & Dashboard
 
-Access is protected by a randomly generated key stored at `/etc/vaultguardian/dashboard.key`.
+Observer exposes a REST API on port `9090`, protected by a randomly generated bearer token stored at `/etc/vaultguardian/dashboard.key`.
+
+The API provides:
+- Security findings (events, verdicts, evidence)
+- Pipeline stats (cache rate, LLM calls)
+- Pattern store inspection (scopes, learned patterns)
+- LLM decision audit trail
+- Trusted IP management
+- Policy rule status
+
+Connect your Observer instance to the hosted dashboard at [app.vaultguardian.io](https://app.vaultguardian.io) for a visual interface with multi-server management.
+
+You can also query the API directly:
+
+```bash
+# Get pipeline stats
+curl -H "Authorization: Bearer $(cat /etc/vaultguardian/dashboard.key)" \
+  http://localhost:9090/api/stats
+
+# Get recent findings
+curl -H "Authorization: Bearer $(cat /etc/vaultguardian/dashboard.key)" \
+  http://localhost:9090/api/findings?limit=50
+
+# Add a trusted IP
+curl -X POST -H "Authorization: Bearer $(cat /etc/vaultguardian/dashboard.key)" \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"98.152.173.124","description":"Office"}' \
+  http://localhost:9090/api/trusted-ips
+```
 
 ## Project Structure
 
 ```
-├── main.go                           # Pipeline wiring, coordinator, retry queue
+├── main.go                           # Pipeline wiring, coordinator, retry queue, reconciler
 ├── seeds.go                          # Curated malicious pattern seeds
 ├── resultrouter.go                   # Shared classification outcome handler
 ├── config.go                         # Environment variable configuration
 ├── install.sh                        # One-command installer
 ├── internal/
 │   ├── analyzer/                     # Normalize → match → classify → learn
-│   ├── api/                          # Dashboard REST API + static files
+│   ├── api/                          # REST API + bearer token auth
 │   ├── coordinator/                  # Evidence huddle + catch-all suppression
 │   ├── event/                        # Canonical event model
 │   ├── llm/                          # LLM client, Tier 1 + Tier 2 prompts
@@ -184,11 +237,8 @@ Access is protected by a randomly generated key stored at `/etc/vaultguardian/da
 │   ├── patternstore/                 # 4-bucket, 4-tier pattern matching
 │   ├── policy/                       # Deterministic pre-LLM policy engine
 │   ├── rec/                          # Response Evidence Capture (AF_PACKET)
-│   ├── store/                        # SQLite persistence (findings, decisions)
+│   ├── store/                        # SQLite persistence (findings, decisions, async writer)
 │   └── watcher/                      # Docker + journald log streaming
-├── Dockerfile
-├── docker-compose.yml
-├── go.mod / go.sum
 └── README.md
 ```
 
@@ -221,7 +271,7 @@ To add a normalizer:
 
 Observer's detection engine is open source. The full pipeline — classification, evidence capture, re-classification, pattern learning, policy engine, and local deployment — is free and unrestricted.
 
-Future commercial offerings (fleet dashboard at [app.vaultguardian.io](https://app.vaultguardian.io), multi-server management, long-term retention, team workflows) are separate.
+The hosted dashboard at [app.vaultguardian.io](https://app.vaultguardian.io) is a separate commercial product providing multi-server management, visual interface, long-term retention, and team workflows.
 
 ## License
 
