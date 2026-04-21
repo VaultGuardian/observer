@@ -189,6 +189,7 @@ func main() {
 		db:               db,
 		collector:        collector,
 		alertCoordinator: alertCoordinator,
+		dispatch:         dispatch,
 	}
 
 	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops, policyEngine, dispatch)

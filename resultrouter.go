@@ -25,6 +25,7 @@ type resultRouter struct {
 	db               *store.Store
 	collector        rec.EvidenceCollector
 	alertCoordinator *coordinator.Coordinator
+	dispatch         *notifier.Dispatcher
 }
 
 // Route processes a classification result: records LLM decision to audit trail,
@@ -205,6 +206,31 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		evt.ID, evt.ScopeKey(), result.Reason, result.Source, evt.Hash,
 		truncate(evt.Line, 200))
 
+	// Non-HTTP malicious events (e.g., container stderr with credential dumps,
+	// command execution output) bypass the coordinator evidence pipeline because
+	// there is no HTTP request/response pair to evaluate. The malicious content
+	// IS the log line itself. Dispatch notification directly, same as policy engine.
+	shouldNotify := result.Verdict == patternstore.VerdictMalicious
+
+	if shouldNotify {
+		log.Printf("[ESCALATE] EventID=%s Source=%s Reason=%s MatchedVia=%s (non-HTTP malicious, direct dispatch)",
+			evt.ID, evt.ScopeKey(), result.Reason, result.Source)
+
+		alert := notifier.Alert{
+			EventID:        evt.ID,
+			Severity:       notifier.SeverityMalicious,
+			ContainerID:    line.ContainerID,
+			ContainerName:  line.ContainerName,
+			LogLine:        evt.Line,
+			Reason:         result.Reason,
+			MatchedVia:     result.Source,
+			Classification: result.LLMClassification,
+			Confidence:     result.LLMConfidence,
+			Timestamp:      evt.Timestamp,
+		}
+		r.dispatch.Dispatch(context.Background(), alert)
+	}
+
 	// Fix 3: Use async writer for non-HTTP alerts (non-droppable — blocks if full)
 	r.db.SubmitFinding(&store.Finding{
 		EventID:        evt.ID,
@@ -224,6 +250,6 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		RawLine:        evt.Line,
 		NormalizedLine: evt.NormalizedLine,
 		NormalizedHash: evt.Hash,
-		Notified:       false,
+		Notified:       shouldNotify,
 	})
 }
