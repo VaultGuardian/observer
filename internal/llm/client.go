@@ -195,6 +195,16 @@ OTHER SYSTEM LOG RULES:
 - Systemd service restarts, reloads, timer events = noise + suppress. Routine. Confidence 0.95.
 - Connection closed/reset [preauth] = recon_failed + suppress. Handshake terminated before auth. Confidence 0.95.
 
+DATA EXFILTRATION AND COMMAND OUTPUT (ALWAYS malicious + malicious):
+A web application container should NEVER output the contents of system files, private keys, or shell command results to stdout/stderr. If you see any of the following in a Docker container log, it means an attacker has achieved remote code execution and is actively exfiltrating data. Classify as malicious with confidence 0.95. There is NO benign scenario.
+- Contents of /etc/passwd (lines matching "root:x:0:0:root" or "<user>:x:<uid>:<gid>:") = malicious. The attacker dumped the password file.
+- Contents of /etc/shadow (lines matching "root:$" or password hashes) = malicious. The attacker dumped password hashes.
+- Private keys ("BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY", "BEGIN EC PRIVATE KEY") = malicious. The attacker is stealing cryptographic keys.
+- Shell command output markers ("uid=0(root)", "uid=", "gid=", output of "id" command) appearing in a web app container = malicious. The attacker is running system commands inside the application.
+- Environment variable dumps containing KEY=, SECRET=, TOKEN=, PASSWORD=, API_KEY= = malicious. The attacker is stealing credentials from the environment.
+- AWS/cloud credentials (AKIA, aws_secret_access_key) = malicious. Cloud credential theft.
+Do NOT classify these as "suspicious" or "alert". A web app dumping root credentials to its log stream is a confirmed, active compromise. Confidence 0.95, action malicious.
+
 IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases. Do NOT hedge with 0.60-0.75 on failed SSH — you will poison the pattern cache with wrong classifications that persist forever.
 
 PATTERN RULES:
