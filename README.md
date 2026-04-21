@@ -11,6 +11,8 @@ Most security tools scream "SQL injection detected!" when a bot sprays your serv
 
 ## See It In Action
 
+### Failed Attack: Netgear Botnet Exploit
+
 A real attack caught in production — an IoT botnet tried to exploit a Netgear router vulnerability to download and execute malware:
 
 ![Observer downgrade example](docs/images/downgrade-netgear.png)
@@ -25,15 +27,39 @@ Here's what happened, step by step:
 
 That's one email saved. Multiply by the thousands of attacks every public server receives daily.
 
+### Successful Attack: CVE-2025-55182 (React2Shell)
+
+We deployed a vulnerable Next.js 15.0.0 container and fired the public PoC for CVE-2025-55182 — a CVSS 10.0 pre-auth RCE that achieved arbitrary code execution as root. The attacker dumped `/etc/passwd`:
+
+![Observer React2Shell escalation](docs/images/react2shell-escalated.png)
+
+Observer's detection chain:
+
+```
+[ALERT] Source=docker:srv-captain--react2shell-test
+  Reason=System credential file contents (/etc/passwd) in output
+  MatchedVia=seeded
+
+[ESCALATE] Source=docker:srv-captain--react2shell-test
+  Reason=System credential file contents (/etc/passwd) in output
+  MatchedVia=seeded (non-HTTP malicious, direct dispatch)
+```
+
+Seed matched `root:x:0:0:root` in the container's output → instant MALICIOUS classification → email sent. Zero LLM calls. The credential dump was detected deterministically before the AI even woke up.
+
+**Two examples, two opposite outcomes — that's the point.** The Netgear exploit was *blocked* by the server (404), so Observer downgraded and stayed quiet. React2Shell *succeeded* (root access, credential dump), so Observer escalated and woke you up.
+
 ## Install
 
-One command on any Linux server with Docker:
+One command on any Linux server:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 ```
 
 The installer prompts for your OpenAI API key and alert email, sets up the systemd service, and starts Observer. You'll need a GitHub account with access to the repo (private beta).
+
+Docker containers are monitored automatically if Docker is present. If not, Observer watches everything through journald — the policy engine, LLM classification, and email alerts all work on a bare metal server with nothing but sshd.
 
 After install, manage with the CLI:
 
@@ -42,7 +68,7 @@ vaultguardian status          # Service status + recent logs
 vaultguardian logs            # Tail logs
 vaultguardian stats           # Pipeline performance
 vaultguardian update          # Update to latest release
-vaultguardian update v0.36    # Update to specific version
+vaultguardian update v0.37    # Update to specific version
 vaultguardian restart         # Restart observer
 vaultguardian version         # Current + available versions
 vaultguardian uninstall       # Remove observer
@@ -54,6 +80,7 @@ vaultguardian uninstall       # Remove observer
 Log line arrives (Docker container or journald)
   → Deterministic filters (stack traces, failed HTTP probes, SSH brute force)
   → Policy engine (SSH logins, user creation, privilege escalation)
+  → Seed patterns (credential dumps, reverse shells, private keys)
   → Pattern store (nanosecond hash/prefix/regex/contains lookup)
     → Known-good? Skip silently.
     → Known-noise? Suppress silently.
@@ -66,6 +93,7 @@ If alert-worthy:
   → Re-classify with evidence: "Did the attack succeed or get ignored?"
   → Downgraded? Log it, don't email.
   → Confirmed credential exposure? Email immediately.
+  → Non-HTTP malicious (command output, credential dumps)? Email immediately.
   → Evidence not captured? Mark as "evidence unavailable" — honest, not silent.
 ```
 
@@ -78,11 +106,18 @@ If alert-worthy:
 - SSH authorized_keys modification → escalation
 - Failed sudo attempts → alert
 
+**Seed patterns (deterministic, no LLM needed):**
+- System credential file contents (`root:x:0:0:root`) in any log stream → instant escalation
+- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`) → instant escalation
+- Reverse shells (`bash -i >& /dev/tcp`) → instant escalation
+- Remote code execution (`curl | sh`, `wget | sh`, `base64 -d | bash`) → instant escalation
+
 **LLM classification (learns over time):**
 - SQL injection, shell injection, PHP wrappers, encoded exploits
 - Path traversal, reconnaissance probes
 - Successful vs failed attack outcomes (intent × outcome)
 - Protocol mismatches, binary probes, scanner noise
+- Data exfiltration patterns (command output, env dumps, credential leaks)
 
 **Deterministic suppression (never hits the LLM):**
 - Application stack traces (Node.js, Python, Go, Java)
@@ -97,7 +132,8 @@ If alert-worthy:
 - **Intent × outcome.** "Attacker probed and got nothing" (suppress) vs "attacker probed and got data" (email immediately).
 - **Learns over time.** First novel log line: LLM call (~3s, fraction of a cent). Every repeat: cache hit (nanoseconds, free). Cache rates reach 97%+ within hours.
 - **Low noise by design.** Failed scanners suppressed. SSH brute force invisible. Duplicate alerts grouped. False alarms downgraded with evidence.
-- **Single binary, no dependencies.** One Go binary, one systemd service. No Docker-in-Docker, no sidecar, no cloud requirement.
+- **Single binary, no dependencies.** One Go binary, one systemd service. No Docker required. No sidecar, no cloud requirement.
+- **Works everywhere.** Bare metal with just sshd, Docker hosts, Docker Swarm clusters — same binary, same install.
 - **Trusted IP allowlist.** Known IPs (your office, VPN) bypass SSH alerts. Unknown IP logs in → instant email.
 - **Adversarial-hardened.** VIP evidence lane prevents traffic flood eviction. Catch-all fingerprinting uses body hashes, not sizes. Async writes prevent DDoS-induced pipeline stalls.
 
@@ -114,7 +150,8 @@ Real production stats from servers running Observer:
 | Total OpenAI spend | ~$17 lifetime |
 | False alarm emails | 0 |
 | Attacks downgraded (emails saved) | 29 |
-| Real escalations caught | 1 (.env credential exposure) |
+| Real escalations caught | 3 |
+| CVEs tested against | CVE-2025-55182 (CVSS 10.0) |
 
 ## Configuration
 
@@ -145,6 +182,7 @@ Real production stats from servers running Observer:
   Docker API ──────▶│  Docker   ──▶│  Policy   │                 │
   (container logs)  │  Watcher     │  Engine   │                 │
                     │              │     │      │                 │
+                    │              │  Seeds +   │                 │
                     │              │  Pattern   │                 │
                     │              │  Store     │                 │
                     │              │     │      │                 │
@@ -163,19 +201,20 @@ Real production stats from servers running Observer:
 
 1. **Deterministic filters** — Stack traces, failed HTTP probes, SSH brute force. Regex-free structural detection. Never touches the LLM.
 2. **Policy engine** — SSH logins, user creation, privilege escalation, authorized_keys. Identity-based decisions with trusted IP allowlist.
-3. **Pattern store** — 4-bucket model (allow/malicious/alert/suppress), 4-tier matching (hash → prefix → regex → contains). Nanosecond lookups.
-4. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Learns patterns from verdicts. Bounded retry queue for backpressure.
-5. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Captures HTTP responses, redacts secrets, correlates with alerts. VIP lane protects malicious evidence from traffic flood eviction.
-6. **Coordinator** — Groups alerts, holds for evidence (2-5s), downgrades false alarms, dispatches findings. Email only on confirmed credential exposure.
-7. **Catch-all suppression** — Learns server response fingerprints (host, status, body hash). Auto-downgrades repeated identical responses across different attack paths.
-8. **Evidence reconciler** — Background process finalizes unresolved findings. Marks as "evidence unavailable" after 15 minutes if evidence was never captured.
+3. **Seed patterns** — Credential file contents, private keys, reverse shells, download-and-execute chains. Deterministic substring match, instant MALICIOUS verdict, direct email dispatch.
+4. **Pattern store** — 4-bucket model (allow/malicious/alert/suppress), 4-tier matching (hash → prefix → regex → contains). Nanosecond lookups.
+5. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Data exfiltration detection. Learns patterns from verdicts. Bounded retry queue for backpressure.
+6. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Captures HTTP responses, redacts secrets, correlates with alerts. VIP lane protects malicious evidence from traffic flood eviction.
+7. **Coordinator** — Groups alerts, holds for evidence (2-5s), downgrades false alarms, dispatches findings. Email only on confirmed credential exposure.
+8. **Catch-all suppression** — Learns server response fingerprints (host, status, body hash). Auto-downgrades repeated identical responses across different attack paths.
+9. **Evidence reconciler** — Background process finalizes unresolved findings. Marks as "evidence unavailable" after 15 minutes if evidence was never captured.
 
 ### Security Outcomes
 
 | Outcome | Meaning |
 |---------|---------|
 | **Escalated** | Evidence confirmed real credential/data exposure. Email sent. |
-| **Malicious** | Confirmed attack payload. Evidence not captured or inconclusive. Logged for awareness. |
+| **Malicious** | Confirmed attack payload or data exfiltration. Email sent. |
 | **Downgraded** | Attack confirmed failed via evidence. Email saved. |
 | **Suspicious** | Unusual activity, unresolved. Dashboard review. |
 | **Recon** | Probe logged for trend analysis. |
