@@ -197,6 +197,76 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 	return false, ""
 }
 
+// CheckFallbackByBytes is the Phase 3 fallback for REC-miss events.
+// Called only at dispatch timeout when no evidence arrived and no body hash
+// is available. Checks whether a verified catch-all exists for the broader
+// (host, method, status) tuple — ignoring body hash since we don't have one.
+//
+// Safety: only matches against VERIFIED entries (which passed the full
+// body-hash + self-check + LLM verification pipeline). If any entry for
+// this (host, method, status) was REJECTED, the fallback refuses to suppress.
+//
+// the design review threat model: REC-miss means nginx handled the request at the edge,
+// so no exfiltration occurred. Accordion padding on edge 404s produces noisy
+// emails but not silent breaches. Acceptable tradeoff.
+func (t *CatchAllTracker) CheckFallbackByBytes(host, method string, statusCode int, responseBytes int64, path string) (isCatchAll bool, reason string) {
+	if host == "" || responseBytes <= 0 {
+		return false, ""
+	}
+
+	// Edge-generated responses (nginx default 404, 302 redirects) are small.
+	// Real backend content is typically much larger. This cap prevents the
+	// fallback from suppressing responses that are clearly not edge templates.
+	const maxEdgeResponseBytes = 10000
+	if responseBytes > maxEdgeResponseBytes {
+		return false, ""
+	}
+
+	methodUpper := strings.ToUpper(method)
+	if methodUpper != "GET" && methodUpper != "HEAD" {
+		return false, ""
+	}
+
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Scan all entries for matching (host, method, status).
+	// If any match is REJECTED, refuse the fallback entirely.
+	// If at least one match is VERIFIED, suppress.
+	var verifiedEntry *catchAllEntry
+	var verifiedFP CatchAllFingerprint
+	for fp, entry := range t.entries {
+		if fp.Host != host || fp.Method != methodUpper || fp.StatusCode != statusCode {
+			continue
+		}
+		if entry.State == StateRejected {
+			// A rejection for this combo means we can't blindly suppress.
+			return false, ""
+		}
+		if entry.State == StateVerified && verifiedEntry == nil {
+			verifiedEntry = entry
+			verifiedFP = fp
+		}
+	}
+
+	if verifiedEntry == nil {
+		return false, ""
+	}
+
+	verifiedEntry.Suppressed++
+	reason = fmt.Sprintf("Catch-all fallback (REC-miss): verified pattern exists for %s %s %d (hash %.16s, %d prior paths) — ResponseBytes=%d, no body hash available",
+		methodUpper, host, statusCode, verifiedFP.BodyPreviewHash, verifiedEntry.TotalPaths, responseBytes)
+
+	log.Printf("[catchall:fallback] Suppressed via ResponseBytes: host=%s method=%s status=%d resp_bytes=%d verified_hash=%.16s path=%s",
+		host, methodUpper, statusCode, responseBytes, verifiedFP.BodyPreviewHash, path)
+
+	return true, reason
+}
+
 // runVerification calls the VerifyFunc and updates the entry state.
 func (t *CatchAllTracker) runVerification(fp CatchAllFingerprint, samplePath string) {
 	result := t.verify(VerifyRequest{

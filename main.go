@@ -435,6 +435,14 @@ func makeEvidenceCheckCallback(
 
 		// --- Path 1: Transport-only downgrade ---
 		if evidence != nil && evidence.Transport != nil {
+			// Phase 2 re-arm: populate BodyPreviewHash from REC evidence.
+			// This was hardcoded empty at routing time (resultrouter.go) because
+			// the hash only exists after REC captures the response. Now that
+			// evidence has arrived, arm the field so catch-all can use it.
+			if evidence.Transport.BodyPreviewHash != "" {
+				pending.BodyPreviewHash = evidence.Transport.BodyPreviewHash
+			}
+
 			code := evidence.Transport.StatusCode
 			if transportDowngradeCodes[code] {
 				pending.EvidenceResult = evidence

@@ -190,8 +190,10 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			HTTPMethod:     method,
 			HTTPPath:       path,
 			// Fix 2: BodyPreviewHash for catch-all matching.
-			// Empty at routing time — populated when evidence arrives.
-			// Catch-all Check skips when empty.
+			// Intentionally empty at routing time — evidence callback in
+			// tryEvidenceCheck() populates this when REC captures a response
+			// (Phase 2 re-arm). If REC misses entirely, Phase 3 fallback in
+			// investigationLoop() uses ResponseBytes instead.
 			BodyPreviewHash: "",
 			NormalizedLine:  evt.NormalizedLine,
 			SourceName:      evt.SourceName,

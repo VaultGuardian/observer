@@ -334,6 +334,53 @@ dispatch:
 		c.mu.Unlock()
 		return
 	}
+
+	// --- Phase 3: ResponseBytes fallback for REC-miss events ---
+	// Last chance before dispatching as malicious. If no evidence arrived
+	// (BodyPreviewHash still empty) but we have ResponseBytes from the nginx
+	// log, check if a verified catch-all exists for this (host, method, status).
+	// Only fires for REC-miss traffic — events where REC captured evidence
+	// already had their catch-all check via Phase 2 re-arm above.
+	if pending.BodyPreviewHash == "" && pending.ResponseBytes > 0 {
+		if isCatchAll, fallbackReason := c.catchAll.CheckFallbackByBytes(
+			pending.Host, pending.HTTPMethod, pending.StatusCode,
+			pending.ResponseBytes, extractPath(key),
+		); isCatchAll {
+			pending.Dispatched = true
+			delete(c.pending, key)
+			c.recordFinalized(key, "downgraded", fallbackReason, pending.EventCount, false)
+			c.mu.Unlock()
+
+			log.Printf("[coordinator] Investigation resolved: CATCH-ALL FALLBACK (REC-miss) key=%s events=%d reason=%s",
+				key, pending.EventCount, truncateStr(fallbackReason, 100))
+
+			c.dispatch(FinalAlert{
+				EventID:         pending.EventID,
+				ScopeKey:        pending.ScopeKey,
+				SourceType:      pending.SourceType,
+				Reason:          pending.Reason,
+				MatchedVia:      pending.MatchedVia,
+				Hash:            pending.Hash,
+				Line:            pending.Line,
+				Verdict:         pending.Verdict,
+				Severity:        pending.Severity,
+				Host:            pending.Host,
+				StatusCode:      pending.StatusCode,
+				ResponseBytes:   pending.ResponseBytes,
+				HTTPMethod:      pending.HTTPMethod,
+				HTTPPath:        pending.HTTPPath,
+				EvidenceJournal: pending.EvidenceJournal,
+				Evidence:        pending.EvidenceResult,
+				Downgraded:      true,
+				DowngradeReason: fallbackReason,
+				EventCount:      pending.EventCount,
+				Timestamp:       pending.Timestamp,
+				BuildAlert:      pending.BuildAlert,
+			})
+			return
+		}
+	}
+
 	pending.Dispatched = true
 	delete(c.pending, key)
 	c.recordFinalized(key, "alerted", pending.Reason, pending.EventCount, false)
@@ -466,6 +513,53 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		})
 
 		return true
+	}
+
+	// --- Phase 2 re-arm: catch-all retry with evidence-populated hash ---
+	// The evidence callback (Change 1) may have written BodyPreviewHash from
+	// REC transport data. If so, retry catch-all — this was the missing
+	// "re-evaluate when evidence arrives" path described in the v0.36 comments.
+	if pending.BodyPreviewHash != "" {
+		if isCatchAll, catchReason := c.catchAll.Check(
+			pending.Host, pending.HTTPMethod, pending.StatusCode,
+			pending.BodyPreviewHash, extractPath(key),
+		); isCatchAll {
+			pending.Resolved = true
+			pending.Downgraded = true
+			pending.DowngradeReason = catchReason
+			pending.Dispatched = true
+			delete(c.pending, key)
+			c.recordFinalized(key, "downgraded", catchReason, pending.EventCount, true)
+
+			log.Printf("[coordinator] Investigation resolved: CATCH-ALL (re-armed) key=%s events=%d hash=%.16s reason=%s",
+				key, pending.EventCount, pending.BodyPreviewHash, truncateStr(catchReason, 100))
+
+			c.dispatch(FinalAlert{
+				EventID:         pending.EventID,
+				ScopeKey:        pending.ScopeKey,
+				SourceType:      pending.SourceType,
+				Reason:          pending.Reason,
+				MatchedVia:      pending.MatchedVia,
+				Hash:            pending.Hash,
+				Line:            pending.Line,
+				Verdict:         pending.Verdict,
+				Severity:        pending.Severity,
+				Host:            pending.Host,
+				StatusCode:      pending.StatusCode,
+				ResponseBytes:   pending.ResponseBytes,
+				HTTPMethod:      pending.HTTPMethod,
+				HTTPPath:        pending.HTTPPath,
+				EvidenceJournal: pending.EvidenceJournal,
+				Evidence:        pending.EvidenceResult,
+				Downgraded:      true,
+				DowngradeReason: catchReason,
+				EventCount:      pending.EventCount,
+				Timestamp:       pending.Timestamp,
+				BuildAlert:      pending.BuildAlert,
+			})
+
+			return true
+		}
 	}
 
 	return false
