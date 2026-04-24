@@ -54,7 +54,7 @@ func LoadConfig() Config {
 		RECInterface:     getEnv("REC_INTERFACE", ""),
 		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
 		RECVerbose:       getEnv("REC_VERBOSE", "") == "true",
-		MaxConcurrentLLM: 2,
+		MaxConcurrentLLM: getEnvInt("LLM_SLOTS", 4),
 		Tier1Effort:      getEnv("LLM_TIER1_EFFORT", "low"),
 		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
 		DashboardPort:    9090,
@@ -108,6 +108,15 @@ func LoadConfig() Config {
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
 	return fallback
 }

@@ -40,6 +40,12 @@ type Finding struct {
 	Reason         string  `json:"reason"`
 	MatchedVia     string  `json:"matched_via"` // pattern, llm, noise_filter, seeded
 
+	// Pattern match info — populated on cache hits so the dashboard
+	// can delete incorrect patterns without needing an LLM decision ID.
+	MatchedPatternScope  string `json:"matched_pattern_scope,omitempty"`
+	MatchedPatternBucket string `json:"matched_pattern_bucket,omitempty"` // allow, malicious, alert, suppress
+	MatchedPatternValue  string `json:"matched_pattern_value,omitempty"`
+
 	// Raw/normalized data
 	RawLine        string `json:"raw_line,omitempty"`
 	NormalizedLine string `json:"normalized_line,omitempty"`

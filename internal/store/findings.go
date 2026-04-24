@@ -23,6 +23,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		event_id, timestamp, source_type, source_name,
 		source_ip, dest_host, http_method, http_path, http_status, response_bytes, user_agent,
 		verdict, classification, confidence, reason, matched_via,
+		matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
 		raw_line, normalized_line, normalized_hash,
 		evidence_status, evidence_status_code, evidence_content_type,
 		evidence_body_hash, evidence_capture_mode,
@@ -35,6 +36,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		?, ?, ?, ?, ?,
 		?, ?, ?,
 		?, ?, ?,
+		?, ?, ?,
 		?, ?,
 		?, ?, ?, ?,
 		?,
@@ -43,6 +45,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		f.EventID, f.Timestamp.Format(time.RFC3339), f.SourceType, f.SourceName,
 		f.SourceIP, f.DestHost, f.HTTPMethod, f.HTTPPath, f.HTTPStatus, f.ResponseBytes, f.UserAgent,
 		f.Verdict, f.Classification, f.Confidence, f.Reason, f.MatchedVia,
+		f.MatchedPatternScope, f.MatchedPatternBucket, f.MatchedPatternValue,
 		f.RawLine, f.NormalizedLine, f.NormalizedHash,
 		f.EvidenceStatus, f.EvidenceStatusCode, f.EvidenceContentType,
 		f.EvidenceBodyHash, f.EvidenceCaptureMode,
@@ -164,6 +167,7 @@ func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding,
 		SELECT event_id, timestamp, source_type, source_name,
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
+		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
 		       normalized_hash, downgraded, downgrade_reason, notified
 		FROM findings
 		WHERE source_ip = ?
@@ -185,6 +189,7 @@ func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) (
 		SELECT event_id, timestamp, source_type, source_name,
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
+		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
 		       normalized_hash, downgraded, downgrade_reason, notified
 		FROM findings
 		WHERE verdict = ?
@@ -206,6 +211,7 @@ func (s *Store) QueryRecent(ctx context.Context, limit int) ([]Finding, error) {
 		SELECT event_id, timestamp, source_type, source_name,
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
+		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
 		       normalized_hash, downgraded, downgrade_reason, notified
 		FROM findings
 		ORDER BY timestamp DESC
@@ -489,6 +495,7 @@ func scanFindings(rows interface {
 			&f.EventID, &ts, &f.SourceType, &f.SourceName,
 			&f.SourceIP, &f.DestHost, &f.HTTPMethod, &f.HTTPPath, &f.HTTPStatus,
 			&f.Verdict, &f.Classification, &f.Confidence, &f.Reason, &f.MatchedVia,
+			&f.MatchedPatternScope, &f.MatchedPatternBucket, &f.MatchedPatternValue,
 			&f.NormalizedHash, &downgraded, &f.DowngradeReason, &notified,
 		); err != nil {
 			return nil, err

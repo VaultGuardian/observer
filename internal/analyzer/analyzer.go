@@ -23,6 +23,12 @@ type AnalysisResult struct {
 	Reason  string                   `json:"reason,omitempty"` // Why this verdict
 	Source  string                   `json:"source,omitempty"` // "pattern", "llm", "seeded"
 
+	// Pattern match fields — populated on cache hits so the dashboard
+	// can offer "Wrong — delete pattern" for cached events.
+	PatternScope  string `json:"pattern_scope,omitempty"`
+	PatternBucket string `json:"pattern_bucket,omitempty"` // allow, malicious, alert, suppress
+	PatternValue  string `json:"pattern_value,omitempty"`
+
 	// LLM-specific fields (only set when the LLM was consulted)
 	LLMClassification string      `json:"llm_classification,omitempty"`
 	LLMConfidence     float64     `json:"llm_confidence,omitempty"`
@@ -152,11 +158,14 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 		a.stats.PatternHits.Add(1)
 
 		return AnalysisResult{
-			Event:   evt,
-			Verdict: result.Verdict,
-			Tier:    result.Tier,
-			Reason:  result.Pattern.Reason,
-			Source:  result.Pattern.Source,
+			Event:         evt,
+			Verdict:       result.Verdict,
+			Tier:          result.Tier,
+			Reason:        result.Pattern.Reason,
+			Source:        result.Pattern.Source,
+			PatternScope:  evt.ScopeKey(),
+			PatternBucket: string(result.Verdict),
+			PatternValue:  result.Pattern.Value,
 		}
 	}
 
@@ -192,11 +201,14 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 		a.stats.PatternHits.Add(1)
 		a.stats.RetriedPatternHit.Add(1)
 		return AnalysisResult{
-			Event:   evt,
-			Verdict: result.Verdict,
-			Tier:    result.Tier,
-			Reason:  result.Pattern.Reason,
-			Source:  result.Pattern.Source + "_retry",
+			Event:         evt,
+			Verdict:       result.Verdict,
+			Tier:          result.Tier,
+			Reason:        result.Pattern.Reason,
+			Source:        result.Pattern.Source + "_retry",
+			PatternScope:  evt.ScopeKey(),
+			PatternBucket: string(result.Verdict),
+			PatternValue:  result.Pattern.Value,
 		}
 	}
 

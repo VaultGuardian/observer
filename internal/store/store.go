@@ -380,6 +380,13 @@ func (s *Store) migrate() error {
 				UNIQUE(host, http_method, http_status, body_preview_hash)
 			);`,
 		},
+		{
+			version: 10,
+			desc:    "pattern match fields on findings for dashboard delete support",
+			sql: `ALTER TABLE findings ADD COLUMN matched_pattern_scope TEXT DEFAULT '';
+				  ALTER TABLE findings ADD COLUMN matched_pattern_bucket TEXT DEFAULT '';
+				  ALTER TABLE findings ADD COLUMN matched_pattern_value TEXT DEFAULT '';`,
+		},
 	}
 
 	for _, m := range migrations {
