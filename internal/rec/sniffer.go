@@ -90,6 +90,16 @@ type sniffer struct {
 	respPrefixHits int64
 	respParseFails int64
 
+	// --- Phase 1 segmentation diagnostics (v0.40) ---
+	// bodyEmptyInSegment: bodyInSegment == 0 for any reason (incl. HEAD, 204, 304)
+	// bodyExpectedButMissing: bodyInSegment == 0 AND a body was expected — the smoking gun
+	// chunkedRespCount: responses with Transfer-Encoding: chunked
+	// compressedRespCount: responses with Content-Encoding present (gzip/br/etc.)
+	bodyEmptyInSegment     int64
+	bodyExpectedButMissing int64
+	chunkedRespCount       int64
+	compressedRespCount    int64
+
 	portReqHits  map[int]int64
 	portRespHits map[int]int64
 
@@ -158,6 +168,8 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 				s.vxlanCount, s.vxlanHTTPReq, s.vxlanHTTPResp)
 			log.Printf("[rec] Speculative parse stats: reqPrefixHits=%d reqParseFails=%d respPrefixHits=%d respParseFails=%d",
 				s.reqPrefixHits, s.reqParseFails, s.respPrefixHits, s.respParseFails)
+			log.Printf("[rec:diag] Segmentation stats: bodyEmptyInSegment=%d bodyExpectedButMissing=%d chunkedResp=%d compressedResp=%d",
+				s.bodyEmptyInSegment, s.bodyExpectedButMissing, s.chunkedRespCount, s.compressedRespCount)
 			s.logPortStats()
 			return
 		default:
@@ -302,7 +314,22 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool
 // handleResponse tries to parse an HTTP response from a single TCP segment.
 // Fix 1: After inserting into the ring buffer, fires the onCapture callback
 // so the VIP lane can check for push matches.
+//
+// v0.40: Phase 1 diagnostics — detect header/body segmentation patterns.
+// We're looking for cases where nginx splits headers and body across
+// separate TCP packets. The single-segment parser sees headers, parses
+// HTTP 200, but reads zero body bytes because the body is in the next
+// packet. Phase 3 will fix this with full TCP reassembly. Phase 1 just
+// gives us the data to confirm and quantify the problem.
 func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) bool {
+	// Phase 1: locate the header/body boundary BEFORE parsing. This tells
+	// us how many body bytes (if any) are in this single segment.
+	hdrEnd := bytes.Index(payload, []byte("\r\n\r\n"))
+	bodyInSegment := 0
+	if hdrEnd >= 0 {
+		bodyInSegment = len(payload) - hdrEnd - 4
+	}
+
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
 	if err != nil {
 		s.respParseFails++
@@ -333,6 +360,54 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 	contentLength := resp.ContentLength
 	if contentLength < 0 && len(bodyPreview) > 0 {
 		contentLength = int64(len(bodyPreview))
+	}
+
+	// =========================================================================
+	// Phase 1 diagnostics
+	// =========================================================================
+	// Decide whether a body was *expected* in this response. Empty bodies are
+	// legitimate for: HEAD requests, 1xx informational, 204 No Content,
+	// 304 Not Modified. Anything else with Content-Length > 0 or chunked
+	// transfer encoding implies a body should exist.
+	isHEAD := pending != nil && pending.method == "HEAD"
+	bodylessStatus := resp.StatusCode == 204 || resp.StatusCode == 304 ||
+		(resp.StatusCode >= 100 && resp.StatusCode < 200)
+	hasChunked := len(resp.TransferEncoding) > 0
+	hasCompression := resp.Header.Get("Content-Encoding") != ""
+
+	bodyExpected := !isHEAD && !bodylessStatus &&
+		(resp.ContentLength > 0 || hasChunked)
+
+	if bodyInSegment == 0 {
+		s.bodyEmptyInSegment++
+		if bodyExpected {
+			s.bodyExpectedButMissing++
+		}
+	}
+	if hasChunked {
+		s.chunkedRespCount++
+	}
+	if hasCompression {
+		s.compressedRespCount++
+	}
+
+	// Per-response diagnostic log:
+	//   - verbose mode: every response
+	//   - default: only suspected-broken cases (the smoking gun for Phase 3)
+	// Without this filter, scanner traffic on bare-IP hosts would flood logs;
+	// with it, we see exactly the cases REC is failing on.
+	if s.verbose || (bodyInSegment == 0 && bodyExpected) {
+		method := "?"
+		path := "?"
+		if pending != nil {
+			method = pending.method
+			path = pending.path
+		}
+		log.Printf("[rec:diag] RESP status=%d cl=%d te=%v ce=%q ct=%q method=%s path=%s payloadLen=%d hdrEnd=%d bodyInSegment=%d rawPreviewLen=%d hash=%.16s",
+			resp.StatusCode, resp.ContentLength, resp.TransferEncoding,
+			resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"),
+			method, path,
+			len(payload), hdrEnd, bodyInSegment, len(bodyPreview), bodyPreviewHash)
 	}
 
 	captured := CapturedResponse{

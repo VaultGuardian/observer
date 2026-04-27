@@ -160,6 +160,12 @@ type RECStats struct {
 	RespPrefixHits int64
 	RespParseFails int64
 
+	// Phase 1 segmentation diagnostics (v0.40)
+	BodyEmptyInSegment     int64
+	BodyExpectedButMissing int64
+	ChunkedRespCount       int64
+	CompressedRespCount    int64
+
 	// Fix 1: VIP lane telemetry
 	VIPMatches int64
 }

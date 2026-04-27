@@ -446,6 +446,10 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.ReqParseFails = lc.sniffer.reqParseFails
 		stats.RespPrefixHits = lc.sniffer.respPrefixHits
 		stats.RespParseFails = lc.sniffer.respParseFails
+		stats.BodyEmptyInSegment = lc.sniffer.bodyEmptyInSegment
+		stats.BodyExpectedButMissing = lc.sniffer.bodyExpectedButMissing
+		stats.ChunkedRespCount = lc.sniffer.chunkedRespCount
+		stats.CompressedRespCount = lc.sniffer.compressedRespCount
 	}
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()

@@ -300,9 +300,6 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				Classification:    alert.Severity,
 				Reason:            alert.Reason,
 				MatchedVia:        alert.MatchedVia,
-				MatchedPatternScope:  alert.PatternScope,
-				MatchedPatternBucket: alert.PatternBucket,
-				MatchedPatternValue:  alert.PatternValue,
 				RawLine:           alert.Line,
 				NormalizedHash:    alert.Hash,
 				CoordinatorKey:    alert.ScopeKey,
@@ -348,9 +345,6 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				Classification:    "malicious",
 				Reason:            alert.EscalateReason,
 				MatchedVia:        alert.MatchedVia,
-				MatchedPatternScope:  alert.PatternScope,
-				MatchedPatternBucket: alert.PatternBucket,
-				MatchedPatternValue:  alert.PatternValue,
 				RawLine:           alert.Line,
 				NormalizedHash:    alert.Hash,
 				CoordinatorKey:    alert.ScopeKey,
@@ -391,9 +385,6 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			Classification:    alert.Severity,
 			Reason:            alert.Reason,
 			MatchedVia:        alert.MatchedVia,
-			MatchedPatternScope:  alert.PatternScope,
-			MatchedPatternBucket: alert.PatternBucket,
-			MatchedPatternValue:  alert.PatternValue,
 			RawLine:           alert.Line,
 			NormalizedHash:    alert.Hash,
 			CoordinatorKey:    alert.ScopeKey,
@@ -1044,6 +1035,12 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
 				log.Printf("[observer] REC parse: req_prefix=%d req_fail=%d resp_prefix=%d resp_fail=%d",
 					rStats.ReqPrefixHits, rStats.ReqParseFails, rStats.RespPrefixHits, rStats.RespParseFails)
+				// v0.40 Phase 1: segmentation diagnostics. body_missing is the smoking gun
+				// for the v1.0 reassembly blocker — high counts confirm header/body split
+				// in production traffic.
+				log.Printf("[observer] REC segmentation: body_empty=%d body_missing=%d chunked=%d compressed=%d",
+					rStats.BodyEmptyInSegment, rStats.BodyExpectedButMissing,
+					rStats.ChunkedRespCount, rStats.CompressedRespCount)
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()
