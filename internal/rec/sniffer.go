@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -95,6 +96,11 @@ type sniffer struct {
 	reassemblyResponses       int64
 	reassemblyRequests        int64
 	reassemblyParseErrors     int64
+
+	// DIAG (v0.42.1): packets fed to assembler involving HTTP ports.
+	// If 0, packets aren't reaching feedAssembler (upstream issue).
+	// If >0 but streams_total=0, assembler isn't dispatching to factory.
+	feedHTTP int64
 
 	verbose bool
 }
@@ -290,6 +296,11 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 // (e.g. via a channel), this invariant breaks and NoCopy must change to
 // gopacket.Default. Don't.
 func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, tcpData, payload []byte) {
+	// DIAG (v0.42.1): are we even reaching this function for HTTP traffic?
+	if s.knownPorts[int(srcPort)] || s.knownPorts[int(dstPort)] {
+		atomic.AddInt64(&s.feedHTTP, 1)
+	}
+
 	packet := gopacket.NewPacket(tcpData, layers.LayerTypeTCP, gopacket.NoCopy)
 	tcpLayer := packet.Layer(layers.LayerTypeTCP)
 	if tcpLayer == nil {

@@ -1044,6 +1044,10 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
 					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyResponses,
 					rStats.ReassemblyRequests, rStats.ReassemblyParseErrors)
+				// DIAG (v0.42.1) — triage why reassembly isn't producing captures.
+				log.Printf("[DIAG] feed_http=%d streams_total=%d responses=%d parse_errors=%d",
+					rStats.FeedHTTP, rStats.ReassemblyStreamsTotal,
+					rStats.ReassemblyResponses, rStats.ReassemblyParseErrors)
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()

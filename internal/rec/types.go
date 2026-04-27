@@ -160,6 +160,9 @@ type RECStats struct {
 	ReassemblyRequests        int64
 	ReassemblyParseErrors     int64
 
+	// DIAG (v0.42.1)
+	FeedHTTP int64
+
 	// Fix 1: VIP lane telemetry
 	VIPMatches int64
 }

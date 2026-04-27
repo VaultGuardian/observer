@@ -458,6 +458,7 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.ReassemblyResponses = lc.sniffer.reassemblyResponses
 		stats.ReassemblyRequests = lc.sniffer.reassemblyRequests
 		stats.ReassemblyParseErrors = lc.sniffer.reassemblyParseErrors
+		stats.FeedHTTP = lc.sniffer.feedHTTP
 	}
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()
