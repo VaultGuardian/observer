@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all Observer configuration loaded from environment variables.
@@ -24,6 +25,15 @@ type Config struct {
 	RECVXLANPort  uint16 // 0 = auto-detect
 	RECNSContainer string
 	RECVerbose     bool
+
+	// REC Phase 3 reassembly (v0.40, shadow mode by default)
+	RECReassemblyEnabled                 bool
+	RECReassemblyMaxBody                 int
+	RECReassemblyStreamTTL               time.Duration
+	RECReassemblyIdleTimeout             time.Duration
+	RECReassemblyMaxBufferedPagesTotal   int
+	RECReassemblyMaxBufferedPagesPerConn int
+	RECReassemblyMaxActiveStreams        int
 
 	// LLM concurrency
 	MaxConcurrentLLM int
@@ -59,6 +69,15 @@ func LoadConfig() Config {
 		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
 		DashboardPort:    9090,
 		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+
+		// Phase 3 reassembly — opt-in, default false. Cutover in v0.40.1.
+		RECReassemblyEnabled:                 getEnv("REC_REASSEMBLY_ENABLED", "") == "true",
+		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
+		RECReassemblyStreamTTL:               getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
+		RECReassemblyIdleTimeout:             getEnvDuration("REC_REASSEMBLY_IDLE_TIMEOUT", 2*time.Second),
+		RECReassemblyMaxBufferedPagesTotal:   getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_TOTAL", 4096),
+		RECReassemblyMaxBufferedPagesPerConn: getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_PER_CONN", 16),
+		RECReassemblyMaxActiveStreams:        getEnvInt("REC_REASSEMBLY_MAX_ACTIVE_STREAMS", 10000),
 	}
 
 	// Parse dashboard port
@@ -116,6 +135,15 @@ func getEnvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
 		}
 	}
 	return fallback

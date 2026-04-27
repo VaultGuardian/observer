@@ -166,6 +166,68 @@ type RECStats struct {
 	ChunkedRespCount       int64
 	CompressedRespCount    int64
 
+	// Phase 3 reassembly telemetry (v0.40, shadow mode)
+	ReassemblyStreamsActive   int64
+	ReassemblyStreamsTotal    int64
+	ReassemblyStreamsTimedOut int64
+	ReassemblyResponses       int64
+	ReassemblyRequests        int64
+	ReassemblyParseErrors     int64
+
 	// Fix 1: VIP lane telemetry
 	VIPMatches int64
+}
+
+// =============================================================================
+// Reassembly Config (v0.40 Phase 3)
+// =============================================================================
+//
+// Bounded by design — REC must never become a DoS target. All limits below
+// have safe defaults; an attacker cannot force unbounded memory by opening
+// many partial connections, sending slowloris-style dribble, or sending
+// massive bodies. Streams age out, total memory is capped, per-connection
+// memory is capped.
+
+type ReassemblyConfig struct {
+	// Enabled gates the entire reassembly path. When false, only the
+	// single-segment parser runs. v0.40 default: false (opt-in).
+	Enabled bool
+
+	// MaxBody bounds bytes read per response body. Default 2048.
+	MaxBody int
+
+	// StreamTTL is the absolute lifetime of any stream. After this,
+	// the stream is force-completed (Landmine 3 mitigation: ensures
+	// the http.ReadResponse goroutine cannot leak).
+	StreamTTL time.Duration
+
+	// IdleTimeout is how long a stream can go without packets before
+	// being flushed. Catches slowloris and abandoned connections.
+	IdleTimeout time.Duration
+
+	// MaxBufferedPagesTotal caps total memory across all streams.
+	// tcpassembly uses 4KB pages; 4096 pages = 16 MiB ceiling.
+	MaxBufferedPagesTotal int
+
+	// MaxBufferedPagesPerConn caps memory per single stream.
+	// Prevents one slow connection from consuming all memory.
+	MaxBufferedPagesPerConn int
+
+	// MaxActiveStreams caps the number of concurrent stream goroutines.
+	// Above this, new streams are dropped. Each stream has 1 goroutine
+	// + assembler bookkeeping; 10K is generous and bounded.
+	MaxActiveStreams int
+}
+
+// DefaultReassemblyConfig returns safe defaults for Phase 3 shadow mode.
+func DefaultReassemblyConfig() ReassemblyConfig {
+	return ReassemblyConfig{
+		Enabled:                 false, // opt-in, default off in v0.40
+		MaxBody:                 2048,
+		StreamTTL:               5 * time.Second,
+		IdleTimeout:             2 * time.Second,
+		MaxBufferedPagesTotal:   4096,
+		MaxBufferedPagesPerConn: 16,
+		MaxActiveStreams:        10000,
+	}
 }

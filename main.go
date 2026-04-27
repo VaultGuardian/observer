@@ -96,6 +96,15 @@ func main() {
 	recCfg.VXLANPort = cfg.RECVXLANPort
 	recCfg.NSContainer = cfg.RECNSContainer
 	recCfg.Verbose = cfg.RECVerbose
+	recCfg.Reassembly = rec.ReassemblyConfig{
+		Enabled:                 cfg.RECReassemblyEnabled,
+		MaxBody:                 cfg.RECReassemblyMaxBody,
+		StreamTTL:               cfg.RECReassemblyStreamTTL,
+		IdleTimeout:             cfg.RECReassemblyIdleTimeout,
+		MaxBufferedPagesTotal:   cfg.RECReassemblyMaxBufferedPagesTotal,
+		MaxBufferedPagesPerConn: cfg.RECReassemblyMaxBufferedPagesPerConn,
+		MaxActiveStreams:        cfg.RECReassemblyMaxActiveStreams,
+	}
 	collector := rec.NewCollector(recCfg)
 
 	// ------- Context with graceful shutdown -------
@@ -1041,6 +1050,15 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				log.Printf("[observer] REC segmentation: body_empty=%d body_missing=%d chunked=%d compressed=%d",
 					rStats.BodyEmptyInSegment, rStats.BodyExpectedButMissing,
 					rStats.ChunkedRespCount, rStats.CompressedRespCount)
+				// v0.40 Phase 3: reassembly telemetry (shadow mode).
+				// Only logs when reassembly has seen any activity, avoids noise
+				// when feature flag is off.
+				if rStats.ReassemblyStreamsTotal > 0 || rStats.ReassemblyResponses > 0 {
+					log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d responses=%d requests=%d parse_errors=%d",
+						rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
+						rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyResponses,
+						rStats.ReassemblyRequests, rStats.ReassemblyParseErrors)
+				}
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()

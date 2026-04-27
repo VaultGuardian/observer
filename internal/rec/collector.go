@@ -102,6 +102,12 @@ type CollectorConfig struct {
 	// only pair misses, parse failures, and periodic stats are logged.
 	// Set REC_VERBOSE=true for debugging packet capture issues.
 	Verbose bool
+
+	// Reassembly configures the Phase 3 TCP reassembly path (v0.40+).
+	// When Enabled=false, only the single-segment parser runs (canonical).
+	// When Enabled=true, reassembly runs in shadow mode — observation only,
+	// no writes to the canonical evidence buffer. Cutover is v0.40.1.
+	Reassembly ReassemblyConfig
 }
 
 // DefaultCollectorConfig returns the design team-agreed defaults.
@@ -114,6 +120,7 @@ func DefaultCollectorConfig() CollectorConfig {
 		VXLANPort:    0, // 0 = auto-detect from Docker API
 		DockerSocket: "/var/run/docker.sock",
 		NSContainer:  "", // empty = host namespace
+		Reassembly:   DefaultReassemblyConfig(),
 	}
 }
 
@@ -243,7 +250,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	iface := lc.config.Interface
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose)
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly)
 
 	// Fix 1: Wire sniffer capture callback for VIP lane.
 	// Every successfully parsed response fires this callback.
@@ -298,6 +305,11 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	// Launch cleanup goroutine for stale pending requests
 	go s.cleanupLoop(ctx)
+
+	// Phase 3: launch reassembly flush goroutine (no-op if reassembly disabled).
+	// Periodically flushes idle streams from the assembler so their httpStream
+	// goroutines can exit cleanly via EOF.
+	go s.flushLoop(ctx)
 
 	// Fix 1: Launch VIP cleanup goroutine (expire stale pins)
 	go lc.vipCleanupLoop(ctx)
@@ -450,6 +462,12 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.BodyExpectedButMissing = lc.sniffer.bodyExpectedButMissing
 		stats.ChunkedRespCount = lc.sniffer.chunkedRespCount
 		stats.CompressedRespCount = lc.sniffer.compressedRespCount
+		stats.ReassemblyStreamsActive = lc.sniffer.reassemblyStreamsActive
+		stats.ReassemblyStreamsTotal = lc.sniffer.reassemblyStreamsTotal
+		stats.ReassemblyStreamsTimedOut = lc.sniffer.reassemblyStreamsTimedOut
+		stats.ReassemblyResponses = lc.sniffer.reassemblyResponses
+		stats.ReassemblyRequests = lc.sniffer.reassemblyRequests
+		stats.ReassemblyParseErrors = lc.sniffer.reassemblyParseErrors
 	}
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()

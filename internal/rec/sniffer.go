@@ -13,6 +13,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/tcpassembly"
 )
 
 // =============================================================================
@@ -100,13 +104,29 @@ type sniffer struct {
 	chunkedRespCount       int64
 	compressedRespCount    int64
 
+	// --- Phase 3 reassembly (v0.40, shadow mode) ---
+	// When reassemblyEnabled is true, every TCP packet is also fed to the
+	// gopacket assembler. The assembler reconstructs streams and dispatches
+	// to httpStream goroutines (see stream.go). Single-segment parser
+	// remains canonical; reassembly is observation-only in v0.40.
+	reassemblyEnabled         bool
+	reassemblyConfig          ReassemblyConfig
+	assembler                 *tcpassembly.Assembler
+	assemblerMu               sync.Mutex // assembler is not goroutine-safe
+	reassemblyStreamsActive   int64
+	reassemblyStreamsTotal    int64
+	reassemblyStreamsTimedOut int64
+	reassemblyResponses       int64
+	reassemblyRequests        int64
+	reassemblyParseErrors     int64
+
 	portReqHits  map[int]int64
 	portRespHits map[int]int64
 
 	verbose bool
 }
 
-func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16, verbose bool) *sniffer {
+func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16, verbose bool, reasm ReassemblyConfig) *sniffer {
 	knownPorts := make(map[int]bool, len(ports))
 	for _, p := range ports {
 		knownPorts[p] = true
@@ -114,17 +134,39 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxla
 	if vxlanPort == 0 {
 		vxlanPort = DefaultVXLANPort
 	}
-	return &sniffer{
-		buffer:       buffer,
-		iface:        iface,
-		knownPorts:   knownPorts,
-		pending:      make(map[streamKey][]*pendingRequest),
-		maxBody:      maxBody,
-		vxlanPort:    vxlanPort,
-		portReqHits:  make(map[int]int64),
-		portRespHits: make(map[int]int64),
-		verbose:      verbose,
+	s := &sniffer{
+		buffer:            buffer,
+		iface:             iface,
+		knownPorts:        knownPorts,
+		pending:           make(map[streamKey][]*pendingRequest),
+		maxBody:           maxBody,
+		vxlanPort:         vxlanPort,
+		portReqHits:       make(map[int]int64),
+		portRespHits:      make(map[int]int64),
+		verbose:           verbose,
+		reassemblyEnabled: reasm.Enabled,
+		reassemblyConfig:  reasm,
 	}
+
+	if reasm.Enabled {
+		// Build the assembler with bounded memory limits. The factory
+		// produces httpStream goroutines that drive http.ReadResponse
+		// against reassembled byte streams (see stream.go).
+		factory := &httpStreamFactory{
+			sniffer:   s,
+			maxBody:   reasm.MaxBody,
+			streamTTL: reasm.StreamTTL,
+		}
+		pool := tcpassembly.NewStreamPool(factory)
+		s.assembler = tcpassembly.NewAssembler(pool)
+		s.assembler.MaxBufferedPagesTotal = reasm.MaxBufferedPagesTotal
+		s.assembler.MaxBufferedPagesPerConnection = reasm.MaxBufferedPagesPerConn
+		log.Printf("[rec:reassembly] enabled — maxBody=%d streamTTL=%s idleTimeout=%s pages_total=%d pages_per_conn=%d max_streams=%d",
+			reasm.MaxBody, reasm.StreamTTL, reasm.IdleTimeout,
+			reasm.MaxBufferedPagesTotal, reasm.MaxBufferedPagesPerConn, reasm.MaxActiveStreams)
+	}
+
+	return s
 }
 
 // openSocket opens the AF_PACKET raw socket and binds to the interface.
@@ -258,7 +300,17 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 
 	key := streamKey{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 
-	// --- Speculative parse ---
+	// --- Phase 3: feed the assembler with EVERY TCP packet (shadow mode) ---
+	// This must run BEFORE speculative parse — continuation packets (which
+	// don't start with "HTTP/") would otherwise fall through both
+	// looksLikeHTTPRequest and looksLikeHTTPResponse and never reach the
+	// assembler. Feeding here ensures the assembler sees the full byte
+	// stream including body data that's split across packets.
+	if s.reassemblyEnabled {
+		s.feedAssembler(srcIP, dstIP, srcPort, dstPort, tcpData, payload)
+	}
+
+	// --- Speculative parse (canonical) ---
 	if looksLikeHTTPRequest(payload) {
 		s.reqPrefixHits++
 		if s.handleRequest(key, payload, int(dstPort)) {
@@ -277,6 +329,75 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 			}
 		}
 		return
+	}
+}
+
+// feedAssembler hands a single TCP segment to gopacket's tcpassembly.
+//
+// We construct a minimal layers.TCP from raw bytes we already parsed,
+// instead of letting gopacket decode the frame. This is intentional —
+// it sidesteps Landmine 1 (checksum offload). Veth interfaces inside
+// Docker namespaces don't compute TCP checksums (the kernel does it
+// later in the stack). If we used gopacket's NewPacket with default
+// options, every packet would appear corrupt and silently drop.
+//
+// The assembler only needs Seq, DataOffset, flags, and Payload to do
+// its job. Contents (the raw header bytes) is unused for assembly.
+func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, tcpData, payload []byte) {
+	if s.assembler == nil {
+		return
+	}
+
+	netFlow := gopacket.NewFlow(layers.EndpointIPv4, srcIP[:], dstIP[:])
+	tcp := &layers.TCP{
+		SrcPort:    layers.TCPPort(srcPort),
+		DstPort:    layers.TCPPort(dstPort),
+		Seq:        binary.BigEndian.Uint32(tcpData[4:8]),
+		Ack:        binary.BigEndian.Uint32(tcpData[8:12]),
+		DataOffset: tcpData[12] >> 4,
+		FIN:        tcpData[13]&0x01 != 0,
+		SYN:        tcpData[13]&0x02 != 0,
+		RST:        tcpData[13]&0x04 != 0,
+		PSH:        tcpData[13]&0x08 != 0,
+		ACK:        tcpData[13]&0x10 != 0,
+		Window:     binary.BigEndian.Uint16(tcpData[14:16]),
+	}
+	tcp.BaseLayer.Payload = payload
+
+	s.assemblerMu.Lock()
+	s.assembler.AssembleWithTimestamp(netFlow, tcp, time.Now())
+	s.assemblerMu.Unlock()
+}
+
+// flushLoop runs the assembler's idle-timeout flush every second.
+// Streams that haven't seen data within IdleTimeout get force-completed,
+// which causes their httpStream goroutines to exit cleanly via EOF on
+// the underlying ReaderStream.
+//
+// Belt-and-suspenders for Landmine 3: even if a stream stays "barely
+// active" with periodic dribble (slowloris-style), each httpStream has
+// its own time.AfterFunc deadline at StreamTTL that force-closes the
+// reader. Both mechanisms work together — IdleTimeout for typical
+// stalls, StreamTTL for adversarial cases.
+func (s *sniffer) flushLoop(ctx context.Context) {
+	if !s.reassemblyEnabled || s.assembler == nil {
+		return
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.assemblerMu.Lock()
+			s.assembler.FlushAll()
+			s.assemblerMu.Unlock()
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-s.reassemblyConfig.IdleTimeout)
+			s.assemblerMu.Lock()
+			s.assembler.FlushOlderThan(cutoff)
+			s.assemblerMu.Unlock()
+		}
 	}
 }
 
