@@ -50,10 +50,10 @@ package rec
 
 import (
 	"bufio"
+	"encoding/binary"
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -133,8 +133,23 @@ func (s *httpStream) run() {
 	defer deadline.Stop()
 
 	// Determine direction from source port.
-	srcPortStr := s.transFlow.Src().String()
-	srcPort, _ := strconv.Atoi(srcPortStr)
+	//
+	// CAREFUL: do not use transFlow.Src().String() here — gopacket's
+	// layers.TCPPort.String() returns "80(http)" for well-known ports,
+	// "8080(http-alt)" for port 8080, etc. Only ephemeral ports return
+	// a plain decimal. Parsing that with strconv.Atoi silently fails and
+	// classifies every response stream as a request, then http.ReadRequest
+	// is called on response data and either errors or times out.
+	//
+	// Endpoint.Raw() returns the actual 2-byte port in network byte order.
+	// That's the source of truth — no IANA names, no string parsing.
+	srcPortBytes := s.transFlow.Src().Raw()
+	if len(srcPortBytes) != 2 {
+		// Defensive — should never happen for TCP endpoints
+		atomic.AddInt64(&s.sniffer.reassemblyParseErrors, 1)
+		return
+	}
+	srcPort := int(binary.BigEndian.Uint16(srcPortBytes))
 	isResponse := s.sniffer.knownPorts[srcPort]
 
 	bufReader := bufio.NewReader(&s.reader)
