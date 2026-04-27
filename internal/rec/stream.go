@@ -95,11 +95,24 @@ func (f *httpStreamFactory) New(netFlow, transFlow gopacket.Flow) tcpassembly.St
 	atomic.AddInt64(&f.sniffer.reassemblyStreamsActive, 1)
 	atomic.AddInt64(&f.sniffer.reassemblyStreamsTotal, 1)
 
-	go s.run()
+	// TEMPORARY v0.40.3 diagnostic — log every stream creation.
+	// Removes after we confirm reassembly is healthy.
+	srcRaw := transFlow.Src().Raw()
+	dstRaw := transFlow.Dst().Raw()
+	srcPort := uint16(0)
+	dstPort := uint16(0)
+	if len(srcRaw) == 2 {
+		srcPort = binary.BigEndian.Uint16(srcRaw)
+	}
+	if len(dstRaw) == 2 {
+		dstPort = binary.BigEndian.Uint16(dstRaw)
+	}
+	log.Printf("[rec:reassembly:diag] STREAM_NEW net=%s→%s tcp_src_port=%d tcp_dst_port=%d isResponse=%v",
+		netFlow.Src().String(), netFlow.Dst().String(),
+		srcPort, dstPort,
+		f.sniffer.knownPorts[int(srcPort)])
 
-	// Return a pointer to the embedded ReaderStream — that's what
-	// satisfies the tcpassembly.Stream interface. The assembler will
-	// call Reassembled() and ReassemblyComplete() on it.
+	go s.run()
 	return &s.reader
 }
 
@@ -167,11 +180,18 @@ func (s *httpStream) run() {
 // SHADOW MODE: emits comparison logs only. Does NOT write to s.buffer.
 // The single-segment parser in handleResponse() is still canonical for v0.40.
 func (s *httpStream) runResponse(r *bufio.Reader) {
+	iter := 0
 	for {
+		iter++
+		// TEMPORARY v0.40.3 diagnostic
+		log.Printf("[rec:reassembly:diag] runResponse iter=%d flow=%s→%s — calling ReadResponse",
+			iter, s.netFlow.Src().String(), s.netFlow.Dst().String())
+
 		resp, err := http.ReadResponse(r, nil)
 		if err != nil {
-			// EOF / unexpected EOF: stream ended (clean close, deadline,
-			// or premature termination). Not a parse error.
+			// TEMPORARY v0.40.3 diagnostic
+			log.Printf("[rec:reassembly:diag] runResponse iter=%d ReadResponse err=%v (type=%T)",
+				iter, err, err)
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
 				atomic.AddInt64(&s.sniffer.reassemblyParseErrors, 1)
 			}
@@ -184,10 +204,6 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 		bodyHash := HashBody(body)
 		atomic.AddInt64(&s.sniffer.reassemblyResponses, 1)
 
-		// Comparison log. The "match" between this and the single-segment
-		// [rec:diag] line is by visual correlation: same flow, same status,
-		// same approximate time. v0.40 shadow mode is observation-only;
-		// automated correlation is a v0.40.1 concern.
 		log.Printf("[rec:reassembly] RESP status=%d ct=%q cl=%d te=%v ce=%q bodyLen=%d hash=%.16s flow=%s→%s",
 			resp.StatusCode,
 			resp.Header.Get("Content-Type"),
