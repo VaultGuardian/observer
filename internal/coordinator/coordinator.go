@@ -53,6 +53,11 @@ type FinalAlert struct {
 	HTTPMethod    string
 	HTTPPath      string
 
+	// Pattern match info — for cache-hit pattern deletion from dashboard
+	PatternScope  string
+	PatternBucket string
+	PatternValue  string
+
 	EvidenceJournal string
 	Evidence        interface{}
 
@@ -87,6 +92,11 @@ type PendingAlert struct {
 	ResponseBytes  int64
 	HTTPMethod     string
 	HTTPPath       string
+
+	// Pattern match info — for cache-hit pattern deletion from dashboard
+	PatternScope   string
+	PatternBucket  string
+	PatternValue   string
 
 	// Fix 2: Body preview hash for catch-all matching.
 	// Populated when REC has evidence at routing time.
@@ -202,6 +212,11 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 		if alert.Classification != "" {
 			existing.Classification = alert.Classification
 		}
+		if alert.PatternValue != "" {
+			existing.PatternScope = alert.PatternScope
+			existing.PatternBucket = alert.PatternBucket
+			existing.PatternValue = alert.PatternValue
+		}
 
 		log.Printf("[coordinator] Event joined huddle: key=%s events=%d source=%s",
 			key, existing.EventCount, alert.ScopeKey)
@@ -245,6 +260,9 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 				ResponseBytes:   alert.ResponseBytes,
 				HTTPMethod:      alert.HTTPMethod,
 				HTTPPath:        alert.HTTPPath,
+				PatternScope:  alert.PatternScope,
+				PatternBucket: alert.PatternBucket,
+				PatternValue:  alert.PatternValue,
 				Downgraded:      true,
 				DowngradeReason: reason,
 				EventCount:      1,
@@ -369,6 +387,9 @@ dispatch:
 				ResponseBytes:   pending.ResponseBytes,
 				HTTPMethod:      pending.HTTPMethod,
 				HTTPPath:        pending.HTTPPath,
+				PatternScope:  pending.PatternScope,
+				PatternBucket: pending.PatternBucket,
+				PatternValue:  pending.PatternValue,
 				EvidenceJournal: pending.EvidenceJournal,
 				Evidence:        pending.EvidenceResult,
 				Downgraded:      true,
@@ -401,6 +422,9 @@ dispatch:
 		ResponseBytes:   pending.ResponseBytes,
 		HTTPMethod:      pending.HTTPMethod,
 		HTTPPath:        pending.HTTPPath,
+		PatternScope:  pending.PatternScope,
+		PatternBucket: pending.PatternBucket,
+		PatternValue:  pending.PatternValue,
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		Downgraded:      false,
@@ -457,6 +481,9 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			ResponseBytes:   pending.ResponseBytes,
 			HTTPMethod:      pending.HTTPMethod,
 			HTTPPath:        pending.HTTPPath,
+			PatternScope:  pending.PatternScope,
+			PatternBucket: pending.PatternBucket,
+			PatternValue:  pending.PatternValue,
 			EvidenceJournal: pending.EvidenceJournal,
 			Evidence:        pending.EvidenceResult,
 			Downgraded:      true,
@@ -503,6 +530,9 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 			ResponseBytes:   pending.ResponseBytes,
 			HTTPMethod:      pending.HTTPMethod,
 			HTTPPath:        pending.HTTPPath,
+			PatternScope:  pending.PatternScope,
+			PatternBucket: pending.PatternBucket,
+			PatternValue:  pending.PatternValue,
 			EvidenceJournal: pending.EvidenceJournal,
 			Evidence:        pending.EvidenceResult,
 			Escalated:       true,
@@ -549,6 +579,9 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 				ResponseBytes:   pending.ResponseBytes,
 				HTTPMethod:      pending.HTTPMethod,
 				HTTPPath:        pending.HTTPPath,
+				PatternScope:  pending.PatternScope,
+				PatternBucket: pending.PatternBucket,
+				PatternValue:  pending.PatternValue,
 				EvidenceJournal: pending.EvidenceJournal,
 				Evidence:        pending.EvidenceResult,
 				Downgraded:      true,
@@ -597,6 +630,9 @@ func (c *Coordinator) forceDispatch(pending *PendingAlert, reason string) {
 		ResponseBytes:   pending.ResponseBytes,
 		HTTPMethod:      pending.HTTPMethod,
 		HTTPPath:        pending.HTTPPath,
+		PatternScope:  pending.PatternScope,
+		PatternBucket: pending.PatternBucket,
+		PatternValue:  pending.PatternValue,
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		EventCount:      pending.EventCount,
