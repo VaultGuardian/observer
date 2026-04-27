@@ -417,6 +417,12 @@ func (s *sniffer) flushLoop(ctx context.Context) {
 }
 
 // handleRequest tries to parse an HTTP request from a single TCP segment.
+//
+// When reassemblyEnabled, this function is TELEMETRY ONLY — it counts
+// successful prefix-parses for the speculative parser stats but does
+// NOT append to the pending request map. Pending tracking moves to
+// stream.go's runRequest, which sees the full reassembled stream and
+// can pair correctly across keep-alive connections.
 func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool {
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(payload)))
 	if err != nil {
@@ -426,13 +432,16 @@ func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool
 	defer req.Body.Close()
 
 	s.mu.Lock()
-	s.pending[key] = append(s.pending[key], &pendingRequest{
-		method:    req.Method,
-		path:      req.RequestURI,
-		host:      req.Host,
-		userAgent: req.UserAgent(),
-		timestamp: time.Now(),
-	})
+	if !s.reassemblyEnabled {
+		// Single-segment is canonical — track pending for handleResponse pairing.
+		s.pending[key] = append(s.pending[key], &pendingRequest{
+			method:    req.Method,
+			path:      req.RequestURI,
+			host:      req.Host,
+			userAgent: req.UserAgent(),
+			timestamp: time.Now(),
+		})
+	}
 	s.portReqHits[dstPort]++
 	s.mu.Unlock()
 
@@ -474,16 +483,20 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 	defer resp.Body.Close()
 
 	// Pop the oldest pending request on the reverse stream (FIFO).
+	// When reassemblyEnabled, this pop is SKIPPED — runResponse in stream.go
+	// owns pairing with the request stream's pending queue.
 	reverseKey := key.reverse()
 
 	s.mu.Lock()
 	var pending *pendingRequest
-	queue := s.pending[reverseKey]
-	if len(queue) > 0 {
-		pending = queue[0]
-		s.pending[reverseKey] = queue[1:]
-		if len(s.pending[reverseKey]) == 0 {
-			delete(s.pending, reverseKey)
+	if !s.reassemblyEnabled {
+		queue := s.pending[reverseKey]
+		if len(queue) > 0 {
+			pending = queue[0]
+			s.pending[reverseKey] = queue[1:]
+			if len(s.pending[reverseKey]) == 0 {
+				delete(s.pending, reverseKey)
+			}
 		}
 	}
 	s.portRespHits[srcPort]++
@@ -567,7 +580,10 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 				key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
 				resp.StatusCode, pending.method, pending.path)
 		}
-	} else {
+	} else if !s.reassemblyEnabled {
+		// Pair miss is only a "real" miss when single-segment is canonical.
+		// Under reassembly, runResponse owns pairing — single-segment never
+		// expected to find a pending here.
 		s.pairMissCount++
 		log.Printf("[rec] RESP pair miss: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d reverseKey=%d.%d.%d.%d:%d→%d.%d.%d.%d:%d pendingStreams=%d",
 			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
@@ -578,15 +594,15 @@ func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) boo
 			len(s.pending))
 	}
 
-	s.buffer.Insert(captured)
-	s.httpRespCount++
-
-	// Fix 1: Fire VIP lane callback.
-	// The collector checks VIP pins for immediate push resolution.
-	// Non-blocking — this must not slow down the packet capture loop.
-	if s.onCapture != nil {
-		s.onCapture(captured)
+	// Canonical writes: buffer insert + VIP callback.
+	// Skipped when reassemblyEnabled — stream.go's runResponse owns these now.
+	if !s.reassemblyEnabled {
+		s.buffer.Insert(captured)
+		if s.onCapture != nil {
+			s.onCapture(captured)
+		}
 	}
+	s.httpRespCount++
 
 	return true
 }
