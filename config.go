@@ -26,8 +26,7 @@ type Config struct {
 	RECNSContainer string
 	RECVerbose     bool
 
-	// REC Phase 3 reassembly (v0.40, shadow mode by default)
-	RECReassemblyEnabled                 bool
+	// REC reassembly tuning (always-on as of v0.42)
 	RECReassemblyMaxBody                 int
 	RECReassemblyStreamTTL               time.Duration
 	RECReassemblyIdleTimeout             time.Duration
@@ -70,8 +69,7 @@ func LoadConfig() Config {
 		DashboardPort:    9090,
 		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
 
-		// Phase 3 reassembly — opt-in, default false. Cutover in v0.40.1.
-		RECReassemblyEnabled:                 getEnv("REC_REASSEMBLY_ENABLED", "") == "true",
+		// REC reassembly tuning — always-on, only the bounds are tunable.
 		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
 		RECReassemblyStreamTTL:               getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
 		RECReassemblyIdleTimeout:             getEnvDuration("REC_REASSEMBLY_IDLE_TIMEOUT", 2*time.Second),

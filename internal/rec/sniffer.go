@@ -2,14 +2,10 @@
 package rec
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +18,10 @@ import (
 // =============================================================================
 // Stream Tracking — Pair HTTP requests with responses
 // =============================================================================
+//
+// The sniffer's `pending` map is shared with stream.go. runRequest appends
+// to it, runResponse pops from it. The cleanupLoop ages out stale entries
+// for connections where the response was never observed.
 
 type streamKey struct {
 	srcIP   [4]byte
@@ -46,22 +46,19 @@ type pendingRequest struct {
 }
 
 // =============================================================================
-// Sniffer — Raw socket packet capture + HTTP parsing
+// Sniffer — Raw socket packet capture, feeds tcpassembly
 // =============================================================================
 //
-// WHAT THIS IS:
-//   Best-effort, single-segment HTTP sniffing on plaintext traffic behind
-//   a reverse proxy. Pure Go stdlib, zero external dependencies, no CGO.
-//
-// HOW IT WORKS (v0.22 — SPECULATIVE PARSE):
+// HOW IT WORKS:
 //   1. Opens an AF_PACKET raw socket (requires CAP_NET_RAW)
-//   2. Reads ethernet frames, parses IPv4 headers manually
-//   3. For TCP: checks payload prefix speculatively
-//   4. For UDP: detects VXLAN, unwraps inner frame, recurses
-//   5. Uses stdlib net/http to parse HTTP request/response from TCP payload
-//   6. Tracks request→response pairing via FIFO queue per TCP stream
-//   7. Inserts completed transactions into the ring buffer
-//   8. Fix 1: Fires onCapture callback for VIP lane push matching
+//   2. Reads ethernet frames, parses IPv4/TCP headers manually (cheap)
+//   3. For UDP/VXLAN: decapsulates and recurses on the inner frame
+//   4. Hands every TCP segment with payload to gopacket's tcpassembly
+//   5. tcpassembly reconstructs streams, our httpStreamFactory creates
+//      per-direction goroutines that run http.ReadRequest / http.ReadResponse
+//      against the reassembled byte stream (see stream.go)
+//   6. runResponse builds CapturedResponse, inserts into the ring buffer,
+//      fires the onCapture callback for VIP lane push matching
 
 type sniffer struct {
 	buffer    *RingBuffer
@@ -69,59 +66,35 @@ type sniffer struct {
 	maxBody   int
 	vxlanPort uint16
 
+	// HTTP ports — used by stream.go for direction detection (response
+	// streams have src port in this set).
 	knownPorts map[int]bool
 
+	// pending is the request→response correlation map. runRequest appends
+	// here, runResponse pops the reverse-keyed entry.
 	pending map[streamKey][]*pendingRequest
 	mu      sync.Mutex
 
-	// Fix 1: Called after each successful response capture.
-	// The collector uses this to check VIP pins for push matching.
-	// Set by the liveCollector before readLoop starts.
+	// onCapture is called after each successful response capture so the
+	// collector can check VIP pins for push-mode resolution.
 	onCapture func(CapturedResponse)
 
-	// --- Core counters ---
+	// --- Reassembly machinery (always-on as of v0.42) ---
+	reassemblyConfig ReassemblyConfig
+	assembler        *tcpassembly.Assembler
+	assemblerMu      sync.Mutex // assembler is not goroutine-safe
+
+	// --- Counters ---
 	packetCount   int64
-	httpReqCount  int64
-	httpRespCount int64
 	pairMissCount int64
 	vxlanCount    int64
-	vxlanHTTPReq  int64
-	vxlanHTTPResp int64
 
-	// --- Speculative parse telemetry ---
-	reqPrefixHits  int64
-	reqParseFails  int64
-	respPrefixHits int64
-	respParseFails int64
-
-	// --- Phase 1 segmentation diagnostics (v0.40) ---
-	// bodyEmptyInSegment: bodyInSegment == 0 for any reason (incl. HEAD, 204, 304)
-	// bodyExpectedButMissing: bodyInSegment == 0 AND a body was expected — the smoking gun
-	// chunkedRespCount: responses with Transfer-Encoding: chunked
-	// compressedRespCount: responses with Content-Encoding present (gzip/br/etc.)
-	bodyEmptyInSegment     int64
-	bodyExpectedButMissing int64
-	chunkedRespCount       int64
-	compressedRespCount    int64
-
-	// --- Phase 3 reassembly (v0.40, shadow mode) ---
-	// When reassemblyEnabled is true, every TCP packet is also fed to the
-	// gopacket assembler. The assembler reconstructs streams and dispatches
-	// to httpStream goroutines (see stream.go). Single-segment parser
-	// remains canonical; reassembly is observation-only in v0.40.
-	reassemblyEnabled         bool
-	reassemblyConfig          ReassemblyConfig
-	assembler                 *tcpassembly.Assembler
-	assemblerMu               sync.Mutex // assembler is not goroutine-safe
 	reassemblyStreamsActive   int64
 	reassemblyStreamsTotal    int64
 	reassemblyStreamsTimedOut int64
 	reassemblyResponses       int64
 	reassemblyRequests        int64
 	reassemblyParseErrors     int64
-
-	portReqHits  map[int]int64
-	portRespHits map[int]int64
 
 	verbose bool
 }
@@ -135,36 +108,28 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxla
 		vxlanPort = DefaultVXLANPort
 	}
 	s := &sniffer{
-		buffer:            buffer,
-		iface:             iface,
-		knownPorts:        knownPorts,
-		pending:           make(map[streamKey][]*pendingRequest),
-		maxBody:           maxBody,
-		vxlanPort:         vxlanPort,
-		portReqHits:       make(map[int]int64),
-		portRespHits:      make(map[int]int64),
-		verbose:           verbose,
-		reassemblyEnabled: reasm.Enabled,
-		reassemblyConfig:  reasm,
+		buffer:           buffer,
+		iface:            iface,
+		knownPorts:       knownPorts,
+		pending:          make(map[streamKey][]*pendingRequest),
+		maxBody:          maxBody,
+		vxlanPort:        vxlanPort,
+		verbose:          verbose,
+		reassemblyConfig: reasm,
 	}
 
-	if reasm.Enabled {
-		// Build the assembler with bounded memory limits. The factory
-		// produces httpStream goroutines that drive http.ReadResponse
-		// against reassembled byte streams (see stream.go).
-		factory := &httpStreamFactory{
-			sniffer:   s,
-			maxBody:   reasm.MaxBody,
-			streamTTL: reasm.StreamTTL,
-		}
-		pool := tcpassembly.NewStreamPool(factory)
-		s.assembler = tcpassembly.NewAssembler(pool)
-		s.assembler.MaxBufferedPagesTotal = reasm.MaxBufferedPagesTotal
-		s.assembler.MaxBufferedPagesPerConnection = reasm.MaxBufferedPagesPerConn
-		log.Printf("[rec:reassembly] enabled — maxBody=%d streamTTL=%s idleTimeout=%s pages_total=%d pages_per_conn=%d max_streams=%d",
-			reasm.MaxBody, reasm.StreamTTL, reasm.IdleTimeout,
-			reasm.MaxBufferedPagesTotal, reasm.MaxBufferedPagesPerConn, reasm.MaxActiveStreams)
+	factory := &httpStreamFactory{
+		sniffer:   s,
+		maxBody:   reasm.MaxBody,
+		streamTTL: reasm.StreamTTL,
 	}
+	pool := tcpassembly.NewStreamPool(factory)
+	s.assembler = tcpassembly.NewAssembler(pool)
+	s.assembler.MaxBufferedPagesTotal = reasm.MaxBufferedPagesTotal
+	s.assembler.MaxBufferedPagesPerConnection = reasm.MaxBufferedPagesPerConn
+	log.Printf("[rec:reassembly] enabled — maxBody=%d streamTTL=%s idleTimeout=%s pages_total=%d pages_per_conn=%d max_streams=%d",
+		reasm.MaxBody, reasm.StreamTTL, reasm.IdleTimeout,
+		reasm.MaxBufferedPagesTotal, reasm.MaxBufferedPagesPerConn, reasm.MaxActiveStreams)
 
 	return s
 }
@@ -205,14 +170,11 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[rec] Sniffer stopping (packets=%d httpReq=%d httpResp=%d pairMisses=%d vxlan=%d vxlanReq=%d vxlanResp=%d)",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount,
-				s.vxlanCount, s.vxlanHTTPReq, s.vxlanHTTPResp)
-			log.Printf("[rec] Speculative parse stats: reqPrefixHits=%d reqParseFails=%d respPrefixHits=%d respParseFails=%d",
-				s.reqPrefixHits, s.reqParseFails, s.respPrefixHits, s.respParseFails)
-			log.Printf("[rec:diag] Segmentation stats: bodyEmptyInSegment=%d bodyExpectedButMissing=%d chunkedResp=%d compressedResp=%d",
-				s.bodyEmptyInSegment, s.bodyExpectedButMissing, s.chunkedRespCount, s.compressedRespCount)
-			s.logPortStats()
+			log.Printf("[rec] Sniffer stopping (packets=%d pairMisses=%d vxlan=%d)",
+				s.packetCount, s.pairMissCount, s.vxlanCount)
+			log.Printf("[rec:reassembly] final — streams_total=%d responses=%d requests=%d timeout=%d parse_errors=%d",
+				s.reassemblyStreamsTotal, s.reassemblyResponses, s.reassemblyRequests,
+				s.reassemblyStreamsTimedOut, s.reassemblyParseErrors)
 			return
 		default:
 		}
@@ -234,27 +196,28 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 		s.processFrame(buf[:n], 0)
 
 		if !debugLogged && s.packetCount >= 10 {
-			log.Printf("[rec] Sniffer active: %d packets, %d HTTP req, %d HTTP resp, %d pair misses, %d VXLAN unwrapped",
-				s.packetCount, s.httpReqCount, s.httpRespCount, s.pairMissCount, s.vxlanCount)
+			log.Printf("[rec] Sniffer active: %d packets, %d VXLAN unwrapped",
+				s.packetCount, s.vxlanCount)
 			debugLogged = true
 		}
 	}
 }
 
-// processFrame parses an ethernet frame and routes HTTP traffic to handlers.
+// processFrame parses an Ethernet frame, decapsulates VXLAN if present,
+// and feeds the contained TCP segment to the assembler.
 func (s *sniffer) processFrame(frame []byte, depth int) {
 	if depth > maxDecapDepth {
 		return
 	}
 
-	// --- Try VXLAN decapsulation first ---
+	// Try VXLAN decapsulation first — Swarm overlay traffic is wrapped.
 	if result, err := decapVXLAN(frame, s.vxlanPort); err == nil {
 		s.vxlanCount++
 		s.processFrame(result.InnerFrame, depth+1)
 		return
 	}
 
-	// --- Normal Ethernet → IPv4 → TCP → Speculative HTTP ---
+	// Ethernet → IPv4 → TCP
 	if len(frame) < 14 {
 		return
 	}
@@ -298,81 +261,38 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 		return
 	}
 
-	key := streamKey{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
-
-	// --- Phase 3: feed the assembler with EVERY TCP packet (shadow mode) ---
-	// This must run BEFORE speculative parse — continuation packets (which
-	// don't start with "HTTP/") would otherwise fall through both
-	// looksLikeHTTPRequest and looksLikeHTTPResponse and never reach the
-	// assembler. Feeding here ensures the assembler sees the full byte
-	// stream including body data that's split across packets.
-	if s.reassemblyEnabled {
-		s.feedAssembler(srcIP, dstIP, srcPort, dstPort, tcpData, payload)
-	}
-
-	// --- Speculative parse (canonical) ---
-	if looksLikeHTTPRequest(payload) {
-		s.reqPrefixHits++
-		if s.handleRequest(key, payload, int(dstPort)) {
-			if depth > 0 {
-				s.vxlanHTTPReq++
-			}
-		}
-		return
-	}
-
-	if looksLikeHTTPResponse(payload) {
-		s.respPrefixHits++
-		if s.handleResponse(key, payload, int(srcPort)) {
-			if depth > 0 {
-				s.vxlanHTTPResp++
-			}
-		}
-		return
-	}
+	// Hand the TCP segment to gopacket's tcpassembly. Per-direction stream
+	// goroutines (see stream.go) consume the reassembled byte stream and
+	// run http.ReadRequest / http.ReadResponse against it.
+	s.feedAssembler(srcIP, dstIP, srcPort, dstPort, tcpData, payload)
 }
 
 // feedAssembler hands a single TCP segment to gopacket's tcpassembly.
 //
-// Why the gopacket decode path (instead of hand-constructing layers.TCP):
+// We let gopacket decode the TCP layer (gopacket.NewPacket) rather than
+// hand-constructing a layers.TCP. The hand-construction path leaves the
+// private byte-slice representations of SrcPort/DstPort empty, which
+// causes tcp.TransportFlow() to return a Flow with zero-length endpoints.
+// The first call to .String() on those endpoints panics.
 //
-//	v0.40 originally hand-constructed the TCP struct from raw bytes to
-//	sidestep what we believed was Landmine 1 (gopacket validating
-//	checksums on veth-namespace traffic). That assumption was wrong:
-//	gopacket's default decode does NOT validate TCP checksums — it only
-//	stores the field. So Landmine 1 was overcautious.
+// gopacket's default decode does NOT validate TCP checksums (we initially
+// avoided NewPacket out of fear of veth-namespace checksum offload — that
+// fear was misplaced).
 //
-//	The hand-constructed layers.TCP set the public SrcPort/DstPort fields
-//	but left the private byte-slice representations empty. When the
-//	assembler called tcp.TransportFlow() internally, it built a Flow from
-//	those empty slices. The stream goroutine's first call to
-//	transFlow.Src().String() then read 2 bytes from a 0-length slice and
-//	panicked. v0.40.1 fixes this by letting gopacket decode the TCP layer
-//	properly — populating all internal state at marginal CPU cost.
+// Lifetime invariant: gopacket.NoCopy is safe because AssembleWithTimestamp
+// is synchronous. Inside that call, tcpassembly's Reassembled hands the
+// bytes to tcpreader.ReaderStream, which COPIES them into its internal
+// page buffer. By the time AssembleWithTimestamp returns, the original
+// slice (the kernel recvfrom buffer) can be reused with no risk to the
+// stream goroutines — they only ever read the ReaderStream's owned copies.
 //
-// Lifetime invariant:
-//
-//	gopacket.NoCopy avoids copying tcpData. This is safe because
-//	AssembleWithTimestamp is synchronous: it calls Reassembled on the
-//	stream, which calls tcpreader.ReaderStream.Reassembled, which COPIES
-//	the bytes into its internal page buffer (via append). By the time
-//	AssembleWithTimestamp returns, the original byte slice can be reused
-//	by the kernel recvfrom buffer with no risk to the stream goroutine —
-//	it only reads from ReaderStream's owned copies.
-//
-//	If you ever change AssembleWithTimestamp to be called asynchronously
-//	(e.g. via a channel from packet capture), this invariant breaks and
-//	NoCopy must change to Default. Don't.
+// If you ever change AssembleWithTimestamp to be called asynchronously
+// (e.g. via a channel), this invariant breaks and NoCopy must change to
+// gopacket.Default. Don't.
 func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, tcpData, payload []byte) {
-	if s.assembler == nil {
-		return
-	}
-
 	packet := gopacket.NewPacket(tcpData, layers.LayerTypeTCP, gopacket.NoCopy)
 	tcpLayer := packet.Layer(layers.LayerTypeTCP)
 	if tcpLayer == nil {
-		// Malformed TCP — skip. The single-segment parser path will have
-		// also failed to extract anything useful from this packet.
 		return
 	}
 	tcp := tcpLayer.(*layers.TCP)
@@ -384,20 +304,16 @@ func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, t
 	s.assemblerMu.Unlock()
 }
 
-// flushLoop runs the assembler's idle-timeout flush every second.
-// Streams that haven't seen data within IdleTimeout get force-completed,
-// which causes their httpStream goroutines to exit cleanly via EOF on
-// the underlying ReaderStream.
+// flushLoop runs the assembler's idle-timeout flush every second. Streams
+// that haven't seen data within IdleTimeout get force-completed, which
+// causes their stream goroutines to exit cleanly via EOF on the underlying
+// ReaderStream.
 //
-// Belt-and-suspenders for Landmine 3: even if a stream stays "barely
-// active" with periodic dribble (slowloris-style), each httpStream has
-// its own time.AfterFunc deadline at StreamTTL that force-closes the
-// reader. Both mechanisms work together — IdleTimeout for typical
-// stalls, StreamTTL for adversarial cases.
+// Belt-and-suspenders for Landmine 3: each httpStream also has its own
+// time.AfterFunc deadline at StreamTTL that force-closes the reader. Both
+// mechanisms work together — IdleTimeout for typical idle keep-alive
+// connections, StreamTTL for adversarial slowloris-style cases.
 func (s *sniffer) flushLoop(ctx context.Context) {
-	if !s.reassemblyEnabled || s.assembler == nil {
-		return
-	}
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -416,198 +332,10 @@ func (s *sniffer) flushLoop(ctx context.Context) {
 	}
 }
 
-// handleRequest tries to parse an HTTP request from a single TCP segment.
-//
-// When reassemblyEnabled, this function is TELEMETRY ONLY — it counts
-// successful prefix-parses for the speculative parser stats but does
-// NOT append to the pending request map. Pending tracking moves to
-// stream.go's runRequest, which sees the full reassembled stream and
-// can pair correctly across keep-alive connections.
-func (s *sniffer) handleRequest(key streamKey, payload []byte, dstPort int) bool {
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(payload)))
-	if err != nil {
-		s.reqParseFails++
-		return false
-	}
-	defer req.Body.Close()
-
-	s.mu.Lock()
-	if !s.reassemblyEnabled {
-		// Single-segment is canonical — track pending for handleResponse pairing.
-		s.pending[key] = append(s.pending[key], &pendingRequest{
-			method:    req.Method,
-			path:      req.RequestURI,
-			host:      req.Host,
-			userAgent: req.UserAgent(),
-			timestamp: time.Now(),
-		})
-	}
-	s.portReqHits[dstPort]++
-	s.mu.Unlock()
-
-	if s.verbose {
-		log.Printf("[rec] REQ: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d %s %s",
-			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-			req.Method, req.RequestURI)
-	}
-
-	s.httpReqCount++
-	return true
-}
-
-// handleResponse tries to parse an HTTP response from a single TCP segment.
-// Fix 1: After inserting into the ring buffer, fires the onCapture callback
-// so the VIP lane can check for push matches.
-//
-// v0.40: Phase 1 diagnostics — detect header/body segmentation patterns.
-// We're looking for cases where nginx splits headers and body across
-// separate TCP packets. The single-segment parser sees headers, parses
-// HTTP 200, but reads zero body bytes because the body is in the next
-// packet. Phase 3 will fix this with full TCP reassembly. Phase 1 just
-// gives us the data to confirm and quantify the problem.
-func (s *sniffer) handleResponse(key streamKey, payload []byte, srcPort int) bool {
-	// Phase 1: locate the header/body boundary BEFORE parsing. This tells
-	// us how many body bytes (if any) are in this single segment.
-	hdrEnd := bytes.Index(payload, []byte("\r\n\r\n"))
-	bodyInSegment := 0
-	if hdrEnd >= 0 {
-		bodyInSegment = len(payload) - hdrEnd - 4
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
-	if err != nil {
-		s.respParseFails++
-		return false
-	}
-	defer resp.Body.Close()
-
-	// Pop the oldest pending request on the reverse stream (FIFO).
-	// When reassemblyEnabled, this pop is SKIPPED — runResponse in stream.go
-	// owns pairing with the request stream's pending queue.
-	reverseKey := key.reverse()
-
-	s.mu.Lock()
-	var pending *pendingRequest
-	if !s.reassemblyEnabled {
-		queue := s.pending[reverseKey]
-		if len(queue) > 0 {
-			pending = queue[0]
-			s.pending[reverseKey] = queue[1:]
-			if len(s.pending[reverseKey]) == 0 {
-				delete(s.pending, reverseKey)
-			}
-		}
-	}
-	s.portRespHits[srcPort]++
-	s.mu.Unlock()
-
-	// Read body preview
-	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
-	bodyPreviewHash := HashBody(bodyPreview)
-
-	contentLength := resp.ContentLength
-	if contentLength < 0 && len(bodyPreview) > 0 {
-		contentLength = int64(len(bodyPreview))
-	}
-
-	// =========================================================================
-	// Phase 1 diagnostics
-	// =========================================================================
-	// Decide whether a body was *expected* in this response. Empty bodies are
-	// legitimate for: HEAD requests, 1xx informational, 204 No Content,
-	// 304 Not Modified. Anything else with Content-Length > 0 or chunked
-	// transfer encoding implies a body should exist.
-	isHEAD := pending != nil && pending.method == "HEAD"
-	bodylessStatus := resp.StatusCode == 204 || resp.StatusCode == 304 ||
-		(resp.StatusCode >= 100 && resp.StatusCode < 200)
-	hasChunked := len(resp.TransferEncoding) > 0
-	hasCompression := resp.Header.Get("Content-Encoding") != ""
-
-	bodyExpected := !isHEAD && !bodylessStatus &&
-		(resp.ContentLength > 0 || hasChunked)
-
-	if bodyInSegment == 0 {
-		s.bodyEmptyInSegment++
-		if bodyExpected {
-			s.bodyExpectedButMissing++
-		}
-	}
-	if hasChunked {
-		s.chunkedRespCount++
-	}
-	if hasCompression {
-		s.compressedRespCount++
-	}
-
-	// Per-response diagnostic log:
-	//   - verbose mode: every response
-	//   - default: only suspected-broken cases (the smoking gun for Phase 3)
-	// Without this filter, scanner traffic on bare-IP hosts would flood logs;
-	// with it, we see exactly the cases REC is failing on.
-	if s.verbose || (bodyInSegment == 0 && bodyExpected) {
-		method := "?"
-		path := "?"
-		if pending != nil {
-			method = pending.method
-			path = pending.path
-		}
-		log.Printf("[rec:diag] RESP status=%d cl=%d te=%v ce=%q ct=%q method=%s path=%s payloadLen=%d hdrEnd=%d bodyInSegment=%d rawPreviewLen=%d hash=%.16s",
-			resp.StatusCode, resp.ContentLength, resp.TransferEncoding,
-			resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"),
-			method, path,
-			len(payload), hdrEnd, bodyInSegment, len(bodyPreview), bodyPreviewHash)
-	}
-
-	captured := CapturedResponse{
-		Timestamp:       time.Now(),
-		StatusCode:      resp.StatusCode,
-		ContentType:     resp.Header.Get("Content-Type"),
-		ContentLength:   contentLength,
-		BodyPreview:     bodyPreview,
-		BodyPreviewHash: bodyPreviewHash,
-	}
-
-	// Attach request fields if we saw the matching request.
-	if pending != nil {
-		captured.Method = pending.method
-		captured.Path = pending.path
-		captured.Host = pending.host
-		captured.UserAgent = pending.userAgent
-		if s.verbose {
-			log.Printf("[rec] RESP paired: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d method=%s path=%s",
-				key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-				key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-				resp.StatusCode, pending.method, pending.path)
-		}
-	} else if !s.reassemblyEnabled {
-		// Pair miss is only a "real" miss when single-segment is canonical.
-		// Under reassembly, runResponse owns pairing — single-segment never
-		// expected to find a pending here.
-		s.pairMissCount++
-		log.Printf("[rec] RESP pair miss: %d.%d.%d.%d:%d→%d.%d.%d.%d:%d status=%d reverseKey=%d.%d.%d.%d:%d→%d.%d.%d.%d:%d pendingStreams=%d",
-			key.srcIP[0], key.srcIP[1], key.srcIP[2], key.srcIP[3], key.srcPort,
-			key.dstIP[0], key.dstIP[1], key.dstIP[2], key.dstIP[3], key.dstPort,
-			resp.StatusCode,
-			reverseKey.srcIP[0], reverseKey.srcIP[1], reverseKey.srcIP[2], reverseKey.srcIP[3], reverseKey.srcPort,
-			reverseKey.dstIP[0], reverseKey.dstIP[1], reverseKey.dstIP[2], reverseKey.dstIP[3], reverseKey.dstPort,
-			len(s.pending))
-	}
-
-	// Canonical writes: buffer insert + VIP callback.
-	// Skipped when reassemblyEnabled — stream.go's runResponse owns these now.
-	if !s.reassemblyEnabled {
-		s.buffer.Insert(captured)
-		if s.onCapture != nil {
-			s.onCapture(captured)
-		}
-	}
-	s.httpRespCount++
-
-	return true
-}
-
-// cleanupLoop removes stale pending requests every 30 seconds.
+// cleanupLoop removes stale pending requests every 30 seconds. runRequest
+// may append entries that runResponse never matches (e.g., when a response
+// stream errors before parsing). Without this, the pending map grows
+// without bound on long-lived processes.
 func (s *sniffer) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -635,59 +363,10 @@ func (s *sniffer) cleanupLoop(ctx context.Context) {
 	}
 }
 
-// logPortStats logs which ports had successful HTTP parses.
-func (s *sniffer) logPortStats() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if len(s.portReqHits) == 0 && len(s.portRespHits) == 0 {
-		return
-	}
-
-	log.Printf("[rec] Port stats (requests):")
-	for port, count := range s.portReqHits {
-		known := ""
-		if s.knownPorts[port] {
-			known = " (configured)"
-		}
-		log.Printf("[rec]   port %d: %d parsed%s", port, count, known)
-	}
-	log.Printf("[rec] Port stats (responses):")
-	for port, count := range s.portRespHits {
-		known := ""
-		if s.knownPorts[port] {
-			known = " (configured)"
-		}
-		log.Printf("[rec]   port %d: %d parsed%s", port, count, known)
-	}
-}
-
 // =============================================================================
 // Helpers
 // =============================================================================
 
 func htons(i uint16) uint16 {
 	return (i << 8) | (i >> 8)
-}
-
-func looksLikeHTTPRequest(payload []byte) bool {
-	if len(payload) < 4 {
-		return false
-	}
-	switch {
-	case bytes.HasPrefix(payload, []byte("GET ")),
-		bytes.HasPrefix(payload, []byte("POST ")),
-		bytes.HasPrefix(payload, []byte("PUT ")),
-		bytes.HasPrefix(payload, []byte("DELETE ")),
-		bytes.HasPrefix(payload, []byte("PATCH ")),
-		bytes.HasPrefix(payload, []byte("HEAD ")),
-		bytes.HasPrefix(payload, []byte("OPTIONS ")),
-		bytes.HasPrefix(payload, []byte("CONNECT ")):
-		return true
-	}
-	return false
-}
-
-func looksLikeHTTPResponse(payload []byte) bool {
-	return len(payload) >= 5 && bytes.HasPrefix(payload, []byte("HTTP/"))
 }

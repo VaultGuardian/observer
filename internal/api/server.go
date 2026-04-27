@@ -247,17 +247,17 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if s.collector.Enabled() {
 		rStats := s.collector.Stats()
 		result["rec"] = map[string]interface{}{
-			"packets":          rStats.PacketsSeen,
-			"http_requests":    rStats.HTTPRequests,
-			"http_responses":   rStats.HTTPResponses,
-			"pair_misses":      rStats.PairMisses,
-			"vxlan_unwrapped":  rStats.VXLANUnwrapped,
-			"buffer_entries":   rStats.BufferEntries,
-			"buffer_bytes":     rStats.BufferBytes,
-			"req_prefix_hits":  rStats.ReqPrefixHits,
-			"req_parse_fails":  rStats.ReqParseFails,
-			"resp_prefix_hits": rStats.RespPrefixHits,
-			"resp_parse_fails": rStats.RespParseFails,
+			"packets":            rStats.PacketsSeen,
+			"http_requests":      rStats.HTTPRequests,
+			"http_responses":     rStats.HTTPResponses,
+			"pair_misses":        rStats.PairMisses,
+			"vxlan_unwrapped":    rStats.VXLANUnwrapped,
+			"buffer_entries":     rStats.BufferEntries,
+			"buffer_bytes":       rStats.BufferBytes,
+			"reassembly_active":  rStats.ReassemblyStreamsActive,
+			"reassembly_total":   rStats.ReassemblyStreamsTotal,
+			"reassembly_timeout": rStats.ReassemblyStreamsTimedOut,
+			"reassembly_errors":  rStats.ReassemblyParseErrors,
 		}
 	}
 

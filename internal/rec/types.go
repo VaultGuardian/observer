@@ -149,24 +149,10 @@ type RECStats struct {
 	HTTPResponses  int64
 	PairMisses     int64
 	VXLANUnwrapped int64
-	VXLANHTTPReq   int64
-	VXLANHTTPResp  int64
 	BufferEntries  int
 	BufferBytes    int64
 
-	// Speculative parse telemetry (v0.22)
-	ReqPrefixHits  int64
-	ReqParseFails  int64
-	RespPrefixHits int64
-	RespParseFails int64
-
-	// Phase 1 segmentation diagnostics (v0.40)
-	BodyEmptyInSegment     int64
-	BodyExpectedButMissing int64
-	ChunkedRespCount       int64
-	CompressedRespCount    int64
-
-	// Phase 3 reassembly telemetry (v0.40, shadow mode)
+	// Reassembly telemetry — the only HTTP parsing path
 	ReassemblyStreamsActive   int64
 	ReassemblyStreamsTotal    int64
 	ReassemblyStreamsTimedOut int64
@@ -179,7 +165,7 @@ type RECStats struct {
 }
 
 // =============================================================================
-// Reassembly Config (v0.40 Phase 3)
+// Reassembly Config
 // =============================================================================
 //
 // Bounded by design — REC must never become a DoS target. All limits below
@@ -189,10 +175,6 @@ type RECStats struct {
 // memory is capped.
 
 type ReassemblyConfig struct {
-	// Enabled gates the entire reassembly path. When false, only the
-	// single-segment parser runs. v0.40 default: false (opt-in).
-	Enabled bool
-
 	// MaxBody bounds bytes read per response body. Default 2048.
 	MaxBody int
 
@@ -219,10 +201,9 @@ type ReassemblyConfig struct {
 	MaxActiveStreams int
 }
 
-// DefaultReassemblyConfig returns safe defaults for Phase 3 shadow mode.
+// DefaultReassemblyConfig returns safe defaults.
 func DefaultReassemblyConfig() ReassemblyConfig {
 	return ReassemblyConfig{
-		Enabled:                 false, // opt-in, default off in v0.40
 		MaxBody:                 2048,
 		StreamTTL:               5 * time.Second,
 		IdleTimeout:             2 * time.Second,

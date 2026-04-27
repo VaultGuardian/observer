@@ -192,8 +192,7 @@ func (s *httpStream) run() {
 //
 // Parses requests out of the reassembled client→server stream and appends
 // to s.sniffer.pending so runResponse on the reverse direction can pair
-// against them. This replaces single-segment handleRequest's pending insert
-// when reassemblyEnabled.
+// against them.
 
 func (s *httpStream) runRequest(r *bufio.Reader) {
 	key := s.streamKey()

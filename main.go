@@ -97,7 +97,6 @@ func main() {
 	recCfg.NSContainer = cfg.RECNSContainer
 	recCfg.Verbose = cfg.RECVerbose
 	recCfg.Reassembly = rec.ReassemblyConfig{
-		Enabled:                 cfg.RECReassemblyEnabled,
 		MaxBody:                 cfg.RECReassemblyMaxBody,
 		StreamTTL:               cfg.RECReassemblyStreamTTL,
 		IdleTimeout:             cfg.RECReassemblyIdleTimeout,
@@ -1038,27 +1037,13 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
 			if collector.Enabled() {
 				rStats := collector.Stats()
-				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d vxlan_req=%d vxlan_resp=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
+				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
 					rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
-					rStats.VXLANUnwrapped, rStats.VXLANHTTPReq, rStats.VXLANHTTPResp,
-					rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
-				log.Printf("[observer] REC parse: req_prefix=%d req_fail=%d resp_prefix=%d resp_fail=%d",
-					rStats.ReqPrefixHits, rStats.ReqParseFails, rStats.RespPrefixHits, rStats.RespParseFails)
-				// v0.40 Phase 1: segmentation diagnostics. body_missing is the smoking gun
-				// for the v1.0 reassembly blocker — high counts confirm header/body split
-				// in production traffic.
-				log.Printf("[observer] REC segmentation: body_empty=%d body_missing=%d chunked=%d compressed=%d",
-					rStats.BodyEmptyInSegment, rStats.BodyExpectedButMissing,
-					rStats.ChunkedRespCount, rStats.CompressedRespCount)
-				// v0.40 Phase 3: reassembly telemetry (shadow mode).
-				// Only logs when reassembly has seen any activity, avoids noise
-				// when feature flag is off.
-				if rStats.ReassemblyStreamsTotal > 0 || rStats.ReassemblyResponses > 0 {
-					log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d responses=%d requests=%d parse_errors=%d",
-						rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
-						rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyResponses,
-						rStats.ReassemblyRequests, rStats.ReassemblyParseErrors)
-				}
+					rStats.VXLANUnwrapped, rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
+				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d responses=%d requests=%d parse_errors=%d",
+					rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
+					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyResponses,
+					rStats.ReassemblyRequests, rStats.ReassemblyParseErrors)
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()
