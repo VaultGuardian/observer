@@ -334,35 +334,50 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 
 // feedAssembler hands a single TCP segment to gopacket's tcpassembly.
 //
-// We construct a minimal layers.TCP from raw bytes we already parsed,
-// instead of letting gopacket decode the frame. This is intentional —
-// it sidesteps Landmine 1 (checksum offload). Veth interfaces inside
-// Docker namespaces don't compute TCP checksums (the kernel does it
-// later in the stack). If we used gopacket's NewPacket with default
-// options, every packet would appear corrupt and silently drop.
+// Why the gopacket decode path (instead of hand-constructing layers.TCP):
 //
-// The assembler only needs Seq, DataOffset, flags, and Payload to do
-// its job. Contents (the raw header bytes) is unused for assembly.
+//	v0.40 originally hand-constructed the TCP struct from raw bytes to
+//	sidestep what we believed was Landmine 1 (gopacket validating
+//	checksums on veth-namespace traffic). That assumption was wrong:
+//	gopacket's default decode does NOT validate TCP checksums — it only
+//	stores the field. So Landmine 1 was overcautious.
+//
+//	The hand-constructed layers.TCP set the public SrcPort/DstPort fields
+//	but left the private byte-slice representations empty. When the
+//	assembler called tcp.TransportFlow() internally, it built a Flow from
+//	those empty slices. The stream goroutine's first call to
+//	transFlow.Src().String() then read 2 bytes from a 0-length slice and
+//	panicked. v0.40.1 fixes this by letting gopacket decode the TCP layer
+//	properly — populating all internal state at marginal CPU cost.
+//
+// Lifetime invariant:
+//
+//	gopacket.NoCopy avoids copying tcpData. This is safe because
+//	AssembleWithTimestamp is synchronous: it calls Reassembled on the
+//	stream, which calls tcpreader.ReaderStream.Reassembled, which COPIES
+//	the bytes into its internal page buffer (via append). By the time
+//	AssembleWithTimestamp returns, the original byte slice can be reused
+//	by the kernel recvfrom buffer with no risk to the stream goroutine —
+//	it only reads from ReaderStream's owned copies.
+//
+//	If you ever change AssembleWithTimestamp to be called asynchronously
+//	(e.g. via a channel from packet capture), this invariant breaks and
+//	NoCopy must change to Default. Don't.
 func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, tcpData, payload []byte) {
 	if s.assembler == nil {
 		return
 	}
 
-	netFlow := gopacket.NewFlow(layers.EndpointIPv4, srcIP[:], dstIP[:])
-	tcp := &layers.TCP{
-		SrcPort:    layers.TCPPort(srcPort),
-		DstPort:    layers.TCPPort(dstPort),
-		Seq:        binary.BigEndian.Uint32(tcpData[4:8]),
-		Ack:        binary.BigEndian.Uint32(tcpData[8:12]),
-		DataOffset: tcpData[12] >> 4,
-		FIN:        tcpData[13]&0x01 != 0,
-		SYN:        tcpData[13]&0x02 != 0,
-		RST:        tcpData[13]&0x04 != 0,
-		PSH:        tcpData[13]&0x08 != 0,
-		ACK:        tcpData[13]&0x10 != 0,
-		Window:     binary.BigEndian.Uint16(tcpData[14:16]),
+	packet := gopacket.NewPacket(tcpData, layers.LayerTypeTCP, gopacket.NoCopy)
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if tcpLayer == nil {
+		// Malformed TCP — skip. The single-segment parser path will have
+		// also failed to extract anything useful from this packet.
+		return
 	}
-	tcp.BaseLayer.Payload = payload
+	tcp := tcpLayer.(*layers.TCP)
+
+	netFlow := gopacket.NewFlow(layers.EndpointIPv4, srcIP[:], dstIP[:])
 
 	s.assemblerMu.Lock()
 	s.assembler.AssembleWithTimestamp(netFlow, tcp, time.Now())
