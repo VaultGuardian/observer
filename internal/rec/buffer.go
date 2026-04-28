@@ -236,9 +236,25 @@ func (rb *RingBuffer) Lookup(req LookupRequest) []CapturedResponse {
 			if entry.Method != req.Method || entry.Path != req.Path {
 				continue
 			}
+		} else {
+			// Orphan response (pair miss) — Method/Path filter is unavailable,
+			// so we rely on StatusCode + timestamp + Host below. BUT we also
+			// need to gate on body size compatibility, otherwise a tiny
+			// healthcheck UUID body (cl=36) can match a real attack response
+			// (cl=2401) just because they share status=200 and a 5-second
+			// timestamp window. That false correlation actually fired in
+			// production — a captain-identifier-healthcheck body downgraded
+			// an XDEBUG curl event because the LLM looked at the wrong body.
+			//
+			// Tolerance: response bytes from the access log (req.ExpectedBytes)
+			// should be plausibly compatible with captured ContentLength.
+			// Reject orphan if both are known and they disagree by more than
+			// max(10%, 256 bytes). When either side is unknown (zero/unset),
+			// don't filter — fall through and let other gates decide.
+			if !orphanBytesCompatible(req.ExpectedBytes, entry.ContentLength) {
+				continue
+			}
 		}
-		// else: orphan response (pair miss) — skip Method/Path check,
-		// rely on StatusCode + timestamp + Host filters below
 
 		// Status code is a HARD filter, not a soft downgrade.
 		// If the log says 404 and the wire says 200, these are definitively
@@ -297,4 +313,31 @@ func (rb *RingBuffer) evictOldest() {
 	rb.total -= rb.entries[oldestIdx].entryBytes
 	rb.entries[oldestIdx] = emptyResponse // zero for GC (code review's fix)
 	rb.count--
+}
+// orphanBytesCompatible decides whether an orphan response (no Method/Path)
+// could plausibly be the response to a request whose access log says
+// expectedBytes. Used as a sanity gate to prevent tiny healthcheck bodies
+// from matching large attack responses.
+//
+// When either side is unknown (<=0), returns true — we don't have enough
+// information to reject, so fall through to other filters.
+//
+// When both are known, accepts a difference up to max(10%, 256 bytes).
+// 256 bytes accommodates small responses where 10% is too tight (e.g.
+// a 100-byte access log "bytes" vs a 95-byte captured response is fine).
+// 10% accommodates larger responses where 256 bytes is too tight (e.g.
+// a 50KB response with slight chunked-encoding overhead).
+func orphanBytesCompatible(expectedBytes, contentLength int64) bool {
+	if expectedBytes <= 0 || contentLength <= 0 {
+		return true
+	}
+	diff := expectedBytes - contentLength
+	if diff < 0 {
+		diff = -diff
+	}
+	tolerance := expectedBytes / 10
+	if tolerance < 256 {
+		tolerance = 256
+	}
+	return diff <= tolerance
 }

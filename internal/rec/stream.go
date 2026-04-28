@@ -156,6 +156,23 @@ func (s *httpStream) streamKey() streamKey {
 func (s *httpStream) run() {
 	defer atomic.AddInt64(&s.sniffer.reassemblyStreamsActive, -1)
 
+	// CRITICAL: Close the ReaderStream when this goroutine exits, regardless
+	// of how it exits. tcpreader.ReaderStream's contract is that the consumer
+	// MUST keep reading bytes; if data arrives via Reassembled() and no one
+	// reads, the assembler blocks. Without this Close(), a stream that exits
+	// (parse error, successful EOF, normal completion) leaves its reader
+	// registered with the assembler. Future packets on the same 4-tuple
+	// then block AssembleWithTimestamp() trying to deliver into the abandoned
+	// reader, which wedges the entire readLoop.
+	//
+	// Close() puts the reader into safe-discard mode: future Reassembled()
+	// calls drain instead of block. Documented in tcpreader package docs.
+	//
+	// AfterFunc below is a separate safety net for streams that get stuck
+	// inside http.ReadRequest/Response waiting for bytes that never arrive.
+	// Close() handles every OTHER exit path. Both are needed.
+	defer s.reader.Close()
+
 	// Landmine 3: deadline-triggered EOF.
 	deadline := time.AfterFunc(s.streamTTL, func() {
 		// Only count as "timeout" if no successful parses happened on this
