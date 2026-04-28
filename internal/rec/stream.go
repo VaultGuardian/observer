@@ -244,6 +244,24 @@ func (s *httpStream) runRequest(r *bufio.Reader) {
 	}
 }
 
+// popPending atomically pops the first pending request for a given key.
+// Returns nil if no pending request exists. Extracted to avoid duplicating
+// the lock/pop/cleanup logic in the retry path.
+func (s *httpStream) popPending(key streamKey) *pendingRequest {
+	s.sniffer.mu.Lock()
+	defer s.sniffer.mu.Unlock()
+	queue := s.sniffer.pending[key]
+	if len(queue) == 0 {
+		return nil
+	}
+	pending := queue[0]
+	s.sniffer.pending[key] = queue[1:]
+	if len(s.sniffer.pending[key]) == 0 {
+		delete(s.sniffer.pending, key)
+	}
+	return pending
+}
+
 // =============================================================================
 // runResponse — canonical response side
 // =============================================================================
@@ -297,17 +315,19 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 		}
 
 		// Pop the matching pending request from the request-direction stream.
-		s.sniffer.mu.Lock()
-		var pending *pendingRequest
-		queue := s.sniffer.pending[reverseKey]
-		if len(queue) > 0 {
-			pending = queue[0]
-			s.sniffer.pending[reverseKey] = queue[1:]
-			if len(s.sniffer.pending[reverseKey]) == 0 {
-				delete(s.sniffer.pending, reverseKey)
-			}
+		// RETRY LOGIC: TCP reassembly runs request and response in separate
+		// goroutines. When the kernel buffers both packets, readLoop feeds
+		// the assembler back-to-back, signaling both goroutines before either
+		// runs. The Go scheduler picks one — it's a coin flip. If the
+		// response goroutine wins, the request hasn't inserted into pending
+		// yet. A single 2ms retry gives the request goroutine more than
+		// enough time to parse headers and insert (~microseconds of work).
+		// Only fires on miss — zero cost on the happy path.
+		pending := s.popPending(reverseKey)
+		if pending == nil {
+			time.Sleep(2 * time.Millisecond)
+			pending = s.popPending(reverseKey)
 		}
-		s.sniffer.mu.Unlock()
 
 		captured := CapturedResponse{
 			Timestamp:       time.Now(),
