@@ -561,6 +561,12 @@ func matchesVIP(resp CapturedResponse, req LookupRequest) bool {
 		if resp.Method != req.Method || resp.Path != req.Path {
 			return false
 		}
+	} else if !orphanBytesCompatible(req.ExpectedBytes, resp.ContentLength) {
+		// Orphan response (no method/path from request pairing). Apply the
+		// same byte-tolerance gate that the ring buffer Lookup uses, so a
+		// tiny healthcheck UUID body (cl=36) can't match a large attack
+		// response (2401 bytes) through the VIP push lane.
+		return false
 	}
 
 	// Status code hard filter

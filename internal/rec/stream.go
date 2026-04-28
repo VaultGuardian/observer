@@ -211,17 +211,12 @@ func (s *httpStream) runRequest(r *bufio.Reader) {
 			return
 		}
 
-		// Drain the request body FULLY (not capped at maxBody). The bufio
-		// reader is shared across all requests on this keep-alive stream;
-		// leftover body bytes from request N corrupt parsing of request N+1,
-		// which causes a parse error, which causes us to drain the whole
-		// rest of the stream and exit — losing all subsequent requests.
-		// We don't keep request bodies as evidence, so just discard.
-		io.Copy(io.Discard, req.Body)
-		req.Body.Close()
-
-		// Append to the sniffer's shared pending map. runResponse on the
-		// reverse-direction stream will pop from here using the reversed key.
+		// CRITICAL: register pending request BEFORE draining body.
+		// The response-side goroutine runs concurrently and may already
+		// be parsing the matching response. If we drain the body first,
+		// the response goroutine wins the race ~50% of the time, looks
+		// up pending[reverseKey], finds nothing, and increments pairMiss.
+		// (v0.42.4 pair-rate regression: 99.6% → 52.7%.)
 		s.sniffer.mu.Lock()
 		s.sniffer.pending[key] = append(s.sniffer.pending[key], &pendingRequest{
 			method:    req.Method,
@@ -234,6 +229,18 @@ func (s *httpStream) runRequest(r *bufio.Reader) {
 
 		atomic.AddInt64(&s.sniffer.reassemblyRequests, 1)
 		atomic.AddInt64(&s.parseCount, 1)
+
+		// Drain the request body FULLY (not capped at maxBody). The bufio
+		// reader is shared across all requests on this keep-alive stream;
+		// leftover body bytes from request N corrupt parsing of request N+1,
+		// which causes a parse error, which causes us to drain the whole
+		// rest of the stream and exit — losing all subsequent requests.
+		// We don't keep request bodies as evidence, so just discard.
+		// Safe to do AFTER pending insert — body bytes don't affect the
+		// pending entry, and the next http.ReadRequest won't start until
+		// this drain completes.
+		io.Copy(io.Discard, req.Body)
+		req.Body.Close()
 	}
 }
 
@@ -321,7 +328,7 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 			// startup). Insert anyway so segmentation-broken traffic still
 			// produces evidence; coordinator's L7 heuristic correlation
 			// (method/path matching) will weed out unmatched fragments.
-			s.sniffer.pairMissCount++
+			atomic.AddInt64(&s.sniffer.pairMissCount, 1)
 		}
 
 		// Canonical writes — this is the cutover.
