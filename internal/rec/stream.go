@@ -156,23 +156,6 @@ func (s *httpStream) streamKey() streamKey {
 func (s *httpStream) run() {
 	defer atomic.AddInt64(&s.sniffer.reassemblyStreamsActive, -1)
 
-	// CRITICAL: Close the ReaderStream when this goroutine exits, regardless
-	// of how it exits. tcpreader.ReaderStream's contract is that the consumer
-	// MUST keep reading bytes; if data arrives via Reassembled() and no one
-	// reads, the assembler blocks. Without this Close(), a stream that exits
-	// (parse error, successful EOF, normal completion) leaves its reader
-	// registered with the assembler. Future packets on the same 4-tuple
-	// then block AssembleWithTimestamp() trying to deliver into the abandoned
-	// reader, which wedges the entire readLoop.
-	//
-	// Close() puts the reader into safe-discard mode: future Reassembled()
-	// calls drain instead of block. Documented in tcpreader package docs.
-	//
-	// AfterFunc below is a separate safety net for streams that get stuck
-	// inside http.ReadRequest/Response waiting for bytes that never arrive.
-	// Close() handles every OTHER exit path. Both are needed.
-	defer s.reader.Close()
-
 	// Landmine 3: deadline-triggered EOF.
 	deadline := time.AfterFunc(s.streamTTL, func() {
 		// Only count as "timeout" if no successful parses happened on this
@@ -219,13 +202,22 @@ func (s *httpStream) runRequest(r *bufio.Reader) {
 		if err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
 				atomic.AddInt64(&s.sniffer.reassemblyParseErrors, 1)
+				// Drain the rest of this stream until tcpassembly signals EOF,
+				// otherwise FlushOlderThan() will block trying to deliver more
+				// bytes into our abandoned reader, holding assemblerMu and
+				// freezing readLoop. See v0.42.3 deadlock postmortem.
+				io.Copy(io.Discard, r)
 			}
 			return
 		}
 
-		// Drain body — bufio reader needs each request's body fully consumed
-		// before the next one can be parsed (HTTP keep-alive).
-		io.Copy(io.Discard, io.LimitReader(req.Body, int64(s.maxBody)))
+		// Drain the request body FULLY (not capped at maxBody). The bufio
+		// reader is shared across all requests on this keep-alive stream;
+		// leftover body bytes from request N corrupt parsing of request N+1,
+		// which causes a parse error, which causes us to drain the whole
+		// rest of the stream and exit — losing all subsequent requests.
+		// We don't keep request bodies as evidence, so just discard.
+		io.Copy(io.Discard, req.Body)
 		req.Body.Close()
 
 		// Append to the sniffer's shared pending map. runResponse on the
@@ -267,11 +259,27 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 		if err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
 				atomic.AddInt64(&s.sniffer.reassemblyParseErrors, 1)
+				// Drain the rest of this stream until tcpassembly signals EOF.
+				// Same reason as runRequest: an abandoned reader wedges
+				// FlushOlderThan() and freezes the entire pipeline.
+				io.Copy(io.Discard, r)
 			}
 			return
 		}
 
+		// Capture up to maxBody bytes as evidence preview.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
+
+		// CRITICAL: drain the REMAINDER of the response body. maxBody is just
+		// the evidence cap (e.g. 2048 bytes); the actual body might be longer
+		// (e.g. 2401 bytes for the CapRover landing page). The leftover bytes
+		// sit in our bufio reader and corrupt parsing of the next response on
+		// keep-alive connections — http.ReadResponse tries to parse mid-body
+		// HTML as a status line, errors out, and we exit losing everything.
+		// Worse: those abandoned bytes wedge FlushOlderThan() inside
+		// tcpreader.Reassembled(), which holds assemblerMu, which freezes
+		// readLoop. (v0.42.3 postmortem.)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		bodyHash := HashBody(body)
