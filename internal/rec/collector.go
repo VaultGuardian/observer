@@ -103,11 +103,11 @@ type CollectorConfig struct {
 	// Set REC_VERBOSE=true for debugging packet capture issues.
 	Verbose bool
 
-	// Reassembly configures the Phase 3 TCP reassembly path (v0.40+).
-	// When Enabled=false, only the single-segment parser runs (canonical).
-	// When Enabled=true, reassembly runs in shadow mode — observation only,
-	// no writes to the canonical evidence buffer. Cutover is v0.40.1.
+	// Reassembly configures the response-only TCP reassembly path (v0.42.7+).
 	Reassembly ReassemblyConfig
+
+	// Flow configures the bidirectional pairing queue bounds (v0.42.7+).
+	Flow FlowConfig
 }
 
 // DefaultCollectorConfig returns the design team-agreed defaults.
@@ -121,6 +121,7 @@ func DefaultCollectorConfig() CollectorConfig {
 		DockerSocket: "/var/run/docker.sock",
 		NSContainer:  "", // empty = host namespace
 		Reassembly:   DefaultReassemblyConfig(),
+		Flow:         DefaultFlowConfig(),
 	}
 }
 
@@ -250,7 +251,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	iface := lc.config.Interface
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly)
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
 
 	// Fix 1: Wire sniffer capture callback for VIP lane.
 	// Every successfully parsed response fires this callback.
@@ -447,23 +448,44 @@ func (lc *liveCollector) Enabled() bool {
 func (lc *liveCollector) Stats() RECStats {
 	stats := RECStats{}
 	if lc.sniffer != nil {
-		stats.PacketsSeen = lc.sniffer.packetCount
-		stats.PairMisses = lc.sniffer.pairMissCount
-		stats.VXLANUnwrapped = lc.sniffer.vxlanCount
-		stats.HTTPRequests = lc.sniffer.reassemblyRequests
-		stats.HTTPResponses = lc.sniffer.reassemblyResponses
-		stats.ReassemblyStreamsActive = lc.sniffer.reassemblyStreamsActive
-		stats.ReassemblyStreamsTotal = lc.sniffer.reassemblyStreamsTotal
-		stats.ReassemblyStreamsTimedOut = lc.sniffer.reassemblyStreamsTimedOut
-		stats.ReassemblyResponses = lc.sniffer.reassemblyResponses
-		stats.ReassemblyRequests = lc.sniffer.reassemblyRequests
-		stats.ReassemblyParseErrors = lc.sniffer.reassemblyParseErrors
-		stats.FeedHTTP = lc.sniffer.feedHTTP
+		stats.PacketsSeen = atomic.LoadInt64(&lc.sniffer.packetCount)
+		stats.VXLANUnwrapped = atomic.LoadInt64(&lc.sniffer.vxlanCount)
+
+		// Inline parser
+		stats.InlineRequests = atomic.LoadInt64(&lc.sniffer.inlineRequests)
+		stats.InlineDuplicateDrops = atomic.LoadInt64(&lc.sniffer.inlineDuplicateDrops)
+		stats.InlineBodySkips = atomic.LoadInt64(&lc.sniffer.inlineBodySkips)
+
+		// Response reassembly
+		stats.ReassemblyStreamsActive = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsActive)
+		stats.ReassemblyStreamsTotal = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsTotal)
+		stats.ReassemblyStreamsTimedOut = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsTimedOut)
+		stats.ReassemblyStreamDrops = atomic.LoadInt64(&lc.sniffer.reassemblyStreamDrops)
+		stats.ReassemblyResponses = atomic.LoadInt64(&lc.sniffer.reassemblyResponses)
+		stats.ReassemblyParseErrors = atomic.LoadInt64(&lc.sniffer.reassemblyParseErrors)
+
+		// Pairing
+		stats.PairImmediate = atomic.LoadInt64(&lc.sniffer.pairImmediate)
+		stats.OrphanResponses = atomic.LoadInt64(&lc.sniffer.orphanResponses)
+		stats.RequestsExpired = atomic.LoadInt64(&lc.sniffer.requestsExpired)
+
+		// Flow state
+		lc.sniffer.flowsMu.Lock()
+		stats.FlowStates = int64(len(lc.sniffer.flows))
+		lc.sniffer.flowsMu.Unlock()
+		stats.FlowEvictions = atomic.LoadInt64(&lc.sniffer.flowEvictions)
+
+		stats.FeedHTTP = atomic.LoadInt64(&lc.sniffer.feedHTTP)
+
+		// Dashboard backward compat
+		stats.HTTPRequests = stats.InlineRequests
+		stats.HTTPResponses = stats.ReassemblyResponses
+		stats.PairMisses = stats.OrphanResponses
 	}
 	if lc.buffer != nil {
 		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()
 	}
-	stats.VIPMatches = lc.vipMatches
+	stats.VIPMatches = atomic.LoadInt64(&lc.vipMatches)
 	return stats
 }
 
@@ -523,7 +545,7 @@ func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
 			lc.vipEvidence[eventID] = resp
 			correlationKey := pin.correlationKey
 			delete(lc.vipPins, eventID)
-			lc.vipMatches++
+			atomic.AddInt64(&lc.vipMatches, 1)
 
 			log.Printf("[rec:vip] Evidence matched for %s: status=%d method=%s path=%s",
 				eventID, resp.StatusCode, resp.Method, resp.Path)

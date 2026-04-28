@@ -26,13 +26,20 @@ type Config struct {
 	RECNSContainer string
 	RECVerbose     bool
 
-	// REC reassembly tuning (always-on as of v0.42)
+	// REC reassembly tuning (response-only as of v0.42.7)
 	RECReassemblyMaxBody                 int
 	RECReassemblyStreamTTL               time.Duration
 	RECReassemblyIdleTimeout             time.Duration
 	RECReassemblyMaxBufferedPagesTotal   int
 	RECReassemblyMaxBufferedPagesPerConn int
 	RECReassemblyMaxActiveStreams        int
+
+	// REC flow pairing bounds (v0.42.7)
+	RECFlowMaxStates         int
+	RECFlowMaxReqPerFlow     int
+	RECFlowMaxRespPerFlow    int
+	RECFlowRespOrphanTimeout time.Duration
+	RECFlowReqExpireTimeout  time.Duration
 
 	// LLM concurrency
 	MaxConcurrentLLM int
@@ -69,13 +76,20 @@ func LoadConfig() Config {
 		DashboardPort:    9090,
 		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
 
-		// REC reassembly tuning — always-on, only the bounds are tunable.
+		// REC reassembly tuning — response-only, bounds are tunable.
 		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
 		RECReassemblyStreamTTL:               getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
 		RECReassemblyIdleTimeout:             getEnvDuration("REC_REASSEMBLY_IDLE_TIMEOUT", 2*time.Second),
 		RECReassemblyMaxBufferedPagesTotal:   getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_TOTAL", 4096),
 		RECReassemblyMaxBufferedPagesPerConn: getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_PER_CONN", 16),
 		RECReassemblyMaxActiveStreams:        getEnvInt("REC_REASSEMBLY_MAX_ACTIVE_STREAMS", 10000),
+
+		// REC flow pairing bounds.
+		RECFlowMaxStates:         getEnvInt("REC_FLOW_MAX_STATES", 50000),
+		RECFlowMaxReqPerFlow:     getEnvInt("REC_FLOW_MAX_REQ_PER_FLOW", 64),
+		RECFlowMaxRespPerFlow:    getEnvInt("REC_FLOW_MAX_RESP_PER_FLOW", 64),
+		RECFlowRespOrphanTimeout: getEnvDuration("REC_FLOW_RESP_ORPHAN_TIMEOUT", 2*time.Second),
+		RECFlowReqExpireTimeout:  getEnvDuration("REC_FLOW_REQ_EXPIRE_TIMEOUT", 30*time.Second),
 	}
 
 	// Parse dashboard port

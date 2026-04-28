@@ -104,6 +104,13 @@ func main() {
 		MaxBufferedPagesPerConn: cfg.RECReassemblyMaxBufferedPagesPerConn,
 		MaxActiveStreams:        cfg.RECReassemblyMaxActiveStreams,
 	}
+	recCfg.Flow = rec.FlowConfig{
+		MaxFlowStates:         cfg.RECFlowMaxStates,
+		MaxRequestsPerFlow:    cfg.RECFlowMaxReqPerFlow,
+		MaxResponsesPerFlow:   cfg.RECFlowMaxRespPerFlow,
+		ResponseOrphanTimeout: cfg.RECFlowRespOrphanTimeout,
+		RequestExpireTimeout:  cfg.RECFlowReqExpireTimeout,
+	}
 	collector := rec.NewCollector(recCfg)
 
 	// ------- Context with graceful shutdown -------
@@ -1037,17 +1044,17 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
 			if collector.Enabled() {
 				rStats := collector.Stats()
-				log.Printf("[observer] REC: packets=%d http_req=%d http_resp=%d pair_misses=%d vxlan=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
-					rStats.PacketsSeen, rStats.HTTPRequests, rStats.HTTPResponses, rStats.PairMisses,
+				log.Printf("[observer] REC: packets=%d inline_req=%d resp=%d pair_immediate=%d orphan_resp=%d req_expired=%d vxlan=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
+					rStats.PacketsSeen, rStats.InlineRequests, rStats.ReassemblyResponses,
+					rStats.PairImmediate, rStats.OrphanResponses, rStats.RequestsExpired,
 					rStats.VXLANUnwrapped, rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
-				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d responses=%d requests=%d parse_errors=%d",
+				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d stream_drops=%d parse_errors=%d flows=%d flow_evictions=%d",
 					rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
-					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyResponses,
-					rStats.ReassemblyRequests, rStats.ReassemblyParseErrors)
-				// DIAG (v0.42.1) — triage why reassembly isn't producing captures.
-				log.Printf("[DIAG] feed_http=%d streams_total=%d responses=%d parse_errors=%d",
-					rStats.FeedHTTP, rStats.ReassemblyStreamsTotal,
-					rStats.ReassemblyResponses, rStats.ReassemblyParseErrors)
+					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyStreamDrops,
+					rStats.ReassemblyParseErrors, rStats.FlowStates, rStats.FlowEvictions)
+				log.Printf("[observer] REC inline: requests=%d seq_dedup=%d body_skip=%d feed_http=%d",
+					rStats.InlineRequests, rStats.InlineDuplicateDrops,
+					rStats.InlineBodySkips, rStats.FeedHTTP)
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()

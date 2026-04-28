@@ -142,33 +142,50 @@ func HashBody(body []byte) string {
 // =============================================================================
 // REC Stats
 // =============================================================================
+//
+// v0.42.7: counters split into inline-parser, reassembly, and pairing groups.
+// Request parsing is synchronous (inline in processFrame). Response parsing
+// uses TCP reassembly. Pairing is event-driven with timeout-based orphaning.
 
 type RECStats struct {
 	PacketsSeen    int64
-	HTTPRequests   int64
-	HTTPResponses  int64
-	PairMisses     int64
 	VXLANUnwrapped int64
 	BufferEntries  int
 	BufferBytes    int64
 
-	// Reassembly telemetry — the only HTTP parsing path
+	// Inline request parser (synchronous in processFrame)
+	InlineRequests       int64 // successful inline parses
+	InlineDuplicateDrops int64 // TCP seq dedupe caught retransmit
+	InlineBodySkips      int64 // skipped segment (body data, not new request)
+
+	// Response reassembly (response-direction only, via gopacket/tcpassembly)
 	ReassemblyStreamsActive   int64
 	ReassemblyStreamsTotal    int64
 	ReassemblyStreamsTimedOut int64
+	ReassemblyStreamDrops    int64 // MaxActiveStreams cap hit
 	ReassemblyResponses       int64
-	ReassemblyRequests        int64
 	ReassemblyParseErrors     int64
 
-	// DIAG (v0.42.1)
-	FeedHTTP int64
+	// Pairing
+	PairImmediate   int64 // response found waiting request (normal fast path)
+	OrphanResponses int64 // response expired from queue without matching request
+	RequestsExpired int64 // request expired without matching response (edge-generated)
 
-	// Fix 1: VIP lane telemetry
+	// Flow state
+	FlowStates    int64 // current active flow entries
+	FlowEvictions int64 // flows evicted due to MaxFlowStates cap
+
+	// Dashboard backward compat — populated from above in Stats()
+	HTTPRequests  int64 // = InlineRequests
+	HTTPResponses int64 // = ReassemblyResponses
+	PairMisses    int64 // = OrphanResponses
+
+	FeedHTTP   int64
 	VIPMatches int64
 }
 
 // =============================================================================
-// Reassembly Config
+// Reassembly Config (response-only as of v0.42.7)
 // =============================================================================
 //
 // Bounded by design — REC must never become a DoS target. All limits below
@@ -213,5 +230,52 @@ func DefaultReassemblyConfig() ReassemblyConfig {
 		MaxBufferedPagesTotal:   4096,
 		MaxBufferedPagesPerConn: 16,
 		MaxActiveStreams:        10000,
+	}
+}
+
+// =============================================================================
+// Flow Config — bidirectional pairing queue bounds (v0.42.7)
+// =============================================================================
+//
+// Every queue that an attacker can influence needs hard caps. An attacker
+// could flood half-open connections, weird partial requests, or spray
+// responses to grow memory. These bounds prevent that.
+
+type FlowConfig struct {
+	// MaxFlowStates caps total tracked flows. When exceeded, the oldest
+	// flow with both queues empty is evicted; if none, the oldest flow
+	// overall. 50K flows × ~1KB each ≈ 50 MB ceiling.
+	MaxFlowStates int
+
+	// MaxRequestsPerFlow caps queued requests per flow. Protects against
+	// keep-alive connections with many unanswered requests. When exceeded,
+	// oldest request is dropped.
+	MaxRequestsPerFlow int
+
+	// MaxResponsesPerFlow caps queued orphan responses per flow. Protects
+	// against responses flooding a flow with no matching requests.
+	MaxResponsesPerFlow int
+
+	// ResponseOrphanTimeout is how long an unmatched response sits in the
+	// queue before being inserted as an orphan into the ring buffer and
+	// counted as a miss. 2s is generous — the inline parser succeeds in
+	// microseconds; if the request hasn't arrived by then, it was split,
+	// missed, or mid-stream capture.
+	ResponseOrphanTimeout time.Duration
+
+	// RequestExpireTimeout is how long an unmatched request sits before
+	// being discarded. These are requests where the response was never
+	// observed (edge-generated 404, 301, static files served by nginx).
+	RequestExpireTimeout time.Duration
+}
+
+// DefaultFlowConfig returns bounded defaults.
+func DefaultFlowConfig() FlowConfig {
+	return FlowConfig{
+		MaxFlowStates:         50000,
+		MaxRequestsPerFlow:    64,
+		MaxResponsesPerFlow:   64,
+		ResponseOrphanTimeout: 2 * time.Second,
+		RequestExpireTimeout:  30 * time.Second,
 	}
 }

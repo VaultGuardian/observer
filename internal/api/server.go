@@ -251,13 +251,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"http_requests":      rStats.HTTPRequests,
 			"http_responses":     rStats.HTTPResponses,
 			"pair_misses":        rStats.PairMisses,
+			"pair_immediate":     rStats.PairImmediate,
+			"orphan_responses":   rStats.OrphanResponses,
+			"requests_expired":   rStats.RequestsExpired,
+			"inline_requests":    rStats.InlineRequests,
+			"inline_seq_dedup":   rStats.InlineDuplicateDrops,
+			"inline_body_skip":   rStats.InlineBodySkips,
 			"vxlan_unwrapped":    rStats.VXLANUnwrapped,
 			"buffer_entries":     rStats.BufferEntries,
 			"buffer_bytes":       rStats.BufferBytes,
 			"reassembly_active":  rStats.ReassemblyStreamsActive,
 			"reassembly_total":   rStats.ReassemblyStreamsTotal,
 			"reassembly_timeout": rStats.ReassemblyStreamsTimedOut,
+			"reassembly_drops":   rStats.ReassemblyStreamDrops,
 			"reassembly_errors":  rStats.ReassemblyParseErrors,
+			"flow_states":        rStats.FlowStates,
+			"flow_evictions":     rStats.FlowEvictions,
 		}
 	}
 
