@@ -191,6 +191,29 @@ func main() {
 	// ------- Seed verified catch-alls from database -------
 	seedCatchAllsFromDB(db, alertCoordinator)
 
+	// ------- Wire human correction callbacks -------
+	// The API server needs to reach the coordinator's catch-all tracker and
+	// the reclass cache for human corrections. We pass narrow callbacks
+	// instead of the full objects to avoid coupling. (code review suggestion.)
+	if apiServer != nil {
+		apiServer.SetCorrectionCallbacks(
+			// Invalidate reclass cache entry
+			func(bodyHash string) {
+				reclassCache.delete(bodyHash)
+			},
+			// Seed a verified catch-all fingerprint (live, no restart needed)
+			func(host, method string, status int, bodyHash, reason string) {
+				fps := []coordinator.CatchAllFingerprint{{
+					Host:            host,
+					Method:          method,
+					StatusCode:      status,
+					BodyPreviewHash: bodyHash,
+				}}
+				alertCoordinator.CatchAllTracker().SeedVerified(fps, []string{reason})
+			},
+		)
+	}
+
 	// ------- Ingestion Pipeline -------
 	const pipelineBufferSize = 1000
 	pipeline := make(chan watcher.LogLine, pipelineBufferSize)

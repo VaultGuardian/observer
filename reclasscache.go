@@ -72,3 +72,16 @@ func (c *reclassCache) put(bodyHash string, downgraded bool, escalated bool, rea
 		newSeverity: newSeverity,
 	}
 }
+
+// delete removes a specific body hash from the cache. Called when a human
+// correction overrides a Tier 2 evidence decision — the old cached verdict
+// must not persist. (design consensus: if you leave the wrong answer in
+// the fast-access cache, you haven't actually fixed the problem.)
+func (c *reclassCache) delete(bodyHash string) {
+	if bodyHash == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, bodyHash)
+}

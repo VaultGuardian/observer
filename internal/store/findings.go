@@ -168,7 +168,9 @@ func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding,
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
-		       normalized_hash, downgraded, downgrade_reason, notified
+		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
+		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
+		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
 		FROM findings
 		WHERE source_ip = ?
 		ORDER BY timestamp DESC
@@ -190,7 +192,9 @@ func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) (
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
-		       normalized_hash, downgraded, downgrade_reason, notified
+		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
+		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
+		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
 		FROM findings
 		WHERE verdict = ?
 		ORDER BY timestamp DESC
@@ -212,7 +216,9 @@ func (s *Store) QueryRecent(ctx context.Context, limit int) ([]Finding, error) {
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
-		       normalized_hash, downgraded, downgrade_reason, notified
+		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
+		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
+		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
 		FROM findings
 		ORDER BY timestamp DESC
 		LIMIT ?`, limit)
@@ -496,7 +502,9 @@ func scanFindings(rows interface {
 			&f.SourceIP, &f.DestHost, &f.HTTPMethod, &f.HTTPPath, &f.HTTPStatus,
 			&f.Verdict, &f.Classification, &f.Confidence, &f.Reason, &f.MatchedVia,
 			&f.MatchedPatternScope, &f.MatchedPatternBucket, &f.MatchedPatternValue,
-			&f.NormalizedHash, &downgraded, &f.DowngradeReason, &notified,
+			&f.NormalizedLine, &f.NormalizedHash, &downgraded, &f.DowngradeReason, &notified,
+			&f.EvidenceBodyHash, &f.EvidenceStatusCode,
+			&f.EvidenceContentType, &f.ResolutionStatus,
 		); err != nil {
 			return nil, err
 		}
@@ -506,4 +514,81 @@ func scanFindings(rows interface {
 		findings = append(findings, f)
 	}
 	return findings, rows.Err()
+}
+// UpdateFindingVerdict changes the verdict on a finding as part of a human
+// correction. Records the previous verdict for audit trail, sets resolution
+// method to "human_override". Used when a human corrects a classification
+// from the dashboard.
+func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVerdict string, reason string) error {
+	now := time.Now().Format(time.RFC3339)
+
+	// Get the current verdict for audit trail
+	var currentVerdict string
+	err := s.db.QueryRowContext(ctx,
+		"SELECT verdict FROM findings WHERE event_id = ? ORDER BY id DESC LIMIT 1",
+		eventID,
+	).Scan(&currentVerdict)
+	if err != nil {
+		return fmt.Errorf("lookup current verdict for %s: %w", eventID, err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `UPDATE findings SET
+		verdict = ?,
+		resolution_status = 'resolved',
+		resolved_at = ?,
+		resolution_method = 'human_override',
+		previous_verdict = ?,
+		downgraded = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN 1 ELSE downgraded END,
+		downgrade_reason = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN ? ELSE downgrade_reason END
+	WHERE event_id = ?`,
+		newVerdict, now, currentVerdict,
+		newVerdict,
+		newVerdict, reason,
+		eventID,
+	)
+	if err != nil {
+		return fmt.Errorf("update verdict for %s: %w", eventID, err)
+	}
+	return nil
+}
+
+// GetFindingByEventID returns the most recent finding for an event ID.
+// Used by the correction API to look up finding data server-side.
+func (s *Store) GetFindingByEventID(ctx context.Context, eventID string) (*Finding, error) {
+	var f Finding
+	var ts string
+	var downgraded, notified int
+
+	err := s.db.QueryRowContext(ctx, `SELECT
+		event_id, timestamp, source_type, source_name,
+		COALESCE(source_ip,''), COALESCE(dest_host,''),
+		COALESCE(http_method,''), COALESCE(http_path,''),
+		COALESCE(http_status,0), COALESCE(response_bytes,0),
+		verdict, COALESCE(classification,''), COALESCE(confidence,0), COALESCE(reason,''),
+		COALESCE(matched_via,''),
+		COALESCE(matched_pattern_scope,''), COALESCE(matched_pattern_bucket,''), COALESCE(matched_pattern_value,''),
+		COALESCE(normalized_line,''), COALESCE(normalized_hash,''),
+		COALESCE(downgraded,0), COALESCE(downgrade_reason,''), COALESCE(notified,0),
+		COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
+		COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
+	FROM findings WHERE event_id = ? ORDER BY id DESC LIMIT 1`, eventID).Scan(
+		&f.EventID, &ts, &f.SourceType, &f.SourceName,
+		&f.SourceIP, &f.DestHost,
+		&f.HTTPMethod, &f.HTTPPath,
+		&f.HTTPStatus, &f.ResponseBytes,
+		&f.Verdict, &f.Classification, &f.Confidence, &f.Reason,
+		&f.MatchedVia,
+		&f.MatchedPatternScope, &f.MatchedPatternBucket, &f.MatchedPatternValue,
+		&f.NormalizedLine, &f.NormalizedHash,
+		&downgraded, &f.DowngradeReason, &notified,
+		&f.EvidenceBodyHash, &f.EvidenceStatusCode,
+		&f.EvidenceContentType, &f.ResolutionStatus,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get finding %s: %w", eventID, err)
+	}
+	f.Timestamp, _ = time.Parse(time.RFC3339, ts)
+	f.Downgraded = downgraded == 1
+	f.Notified = notified == 1
+	return &f, nil
 }

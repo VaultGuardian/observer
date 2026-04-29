@@ -543,6 +543,73 @@ func (s *Store) DeletePattern(scopeKey string, verdict Verdict, patternValue str
 	return false
 }
 
+// MarkHumanValidated finds a hash pattern by its value across all buckets
+// in a scope and marks it as human-validated. This protects the pattern from
+// future pruning and signals to other humans that it was explicitly confirmed.
+func (s *Store) MarkHumanValidated(scopeKey string, hashValue string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var scope *ScopeEntry
+	if scopeKey == "__global__" {
+		scope = s.global
+	} else {
+		scope = s.scopes[scopeKey]
+	}
+	if scope == nil {
+		return false
+	}
+
+	// Search all four buckets for this hash
+	for _, bucket := range []*PatternBucket{&scope.Allow, &scope.Malicious, &scope.Alert, &scope.Suppress} {
+		if p, ok := bucket.Hashes[hashValue]; ok {
+			p.Source = "human_validated"
+			return true
+		}
+	}
+	return false
+}
+
+// MarkPatternValidated finds a pattern by its value in a specific bucket
+// and marks it as human-validated. Works for any pattern type (hash, prefix,
+// regex, contains), not just hashes. (code review fix #7.)
+func (s *Store) MarkPatternValidated(scopeKey string, verdict Verdict, patternValue string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var scope *ScopeEntry
+	if scopeKey == "__global__" {
+		scope = s.global
+	} else {
+		scope = s.scopes[scopeKey]
+	}
+	if scope == nil {
+		return false
+	}
+
+	bucket := s.getBucket(scope, verdict)
+	if bucket == nil {
+		return false
+	}
+
+	// Check hash first
+	if p, ok := bucket.Hashes[patternValue]; ok {
+		p.Source = "human_validated"
+		return true
+	}
+
+	// Check prefix/regex/contains
+	for _, list := range []*[]*LearnedPattern{&bucket.Prefixes, &bucket.Regexes, &bucket.Contains} {
+		for _, p := range *list {
+			if p.Value == patternValue {
+				p.Source = "human_validated"
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // getBucketReadOnly returns the bucket for a verdict (read-only, no creation).
 func (s *Store) getBucketReadOnly(scope *ScopeEntry, v Verdict) *PatternBucket {
 	switch v {
