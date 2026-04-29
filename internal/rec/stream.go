@@ -40,6 +40,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +48,26 @@ import (
 	"github.com/google/gopacket/tcpassembly"
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
+
+// safeReaderStream wraps tcpreader.ReaderStream to make ReassemblyComplete
+// idempotent. gopacket's ReaderStream panics on double-close of its internal
+// channel. Both the streamTTL AfterFunc and FlushOlderThan can trigger
+// ReassemblyComplete on the same stream — whichever fires first wins,
+// the other is a no-op. (v0.43 crash-loop fix.)
+type safeReaderStream struct {
+	reader *tcpreader.ReaderStream
+	once   sync.Once
+}
+
+func (s *safeReaderStream) Reassembled(rs []tcpassembly.Reassembly) {
+	s.reader.Reassembled(rs)
+}
+
+func (s *safeReaderStream) ReassemblyComplete() {
+	s.once.Do(func() {
+		s.reader.ReassemblyComplete()
+	})
+}
 
 // =============================================================================
 // httpStreamFactory — response streams only
@@ -102,9 +123,12 @@ func (f *httpStreamFactory) New(netFlow, transFlow gopacket.Flow) tcpassembly.St
 		reader:    tcpreader.NewReaderStream(),
 	}
 
+	safe := &safeReaderStream{reader: &s.reader}
+	s.safeReader = safe
+
 	go s.run()
 
-	return &s.reader
+	return safe
 }
 
 // =============================================================================
@@ -118,10 +142,8 @@ type httpStream struct {
 	streamTTL          time.Duration
 	createdAt          time.Time
 	reader             tcpreader.ReaderStream
+	safeReader         *safeReaderStream // returned to assembler, guards double-close
 
-	// parseCount tracks successful response parses on this stream. The
-	// AfterFunc deadline only counts toward streams_timeout if parseCount
-	// == 0 — a stream that parsed at least once and then idled is success.
 	parseCount int64
 }
 
@@ -160,11 +182,15 @@ func (s *httpStream) run() {
 	defer atomic.AddInt64(&s.sniffer.reassemblyStreamsActive, -1)
 
 	// Landmine 3: deadline-triggered EOF.
+	// CRITICAL: ReassemblyComplete can also be called by FlushOlderThan
+	// (via assembler.closeConnection). Both paths go through safeReaderStream
+	// which uses sync.Once to prevent double-close panic.
+	// (v0.43 crash-loop: 20 restarts in 5 minutes.)
 	deadline := time.AfterFunc(s.streamTTL, func() {
 		if atomic.LoadInt64(&s.parseCount) == 0 {
 			atomic.AddInt64(&s.sniffer.reassemblyStreamsTimedOut, 1)
 		}
-		s.reader.ReassemblyComplete()
+		s.safeReader.ReassemblyComplete()
 	})
 	defer deadline.Stop()
 
