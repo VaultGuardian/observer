@@ -467,7 +467,7 @@ func makeEvidenceCheckCallback(
 			SourceContainer: pending.SourceName,
 			StatusCode:      statusCode,
 			Timestamp:       pending.Timestamp,
-			Window:          5 * time.Second,
+			Window:          10 * time.Second, // Matches coordinator finalize window (v0.43.2+)
 			ExpectedBytes:   extractResponseBytes(pending.Line),
 		})
 

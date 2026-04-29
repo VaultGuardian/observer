@@ -22,8 +22,13 @@ import (
 //   GRAVEYARD — recently finalized outcomes (TTL 300s).
 
 const (
-	DefaultEvidenceWindow    = 2 * time.Second
-	DefaultFinalizeWindow    = 5 * time.Second
+	// v0.43.2+: Bumped from 2s/5s to 5s/10s to account for the full REC pipeline
+	// delay: assembler flush (~2s) + orphan response expiry queue (~2-3s) + cleanup
+	// loop interval (1s). The v0.42.7 bidirectional flow pairing intentionally holds
+	// unmatched responses for 2s before inserting as orphans. That intentional delay
+	// pushes the total pipeline past the old 5s window. (the design review catch.)
+	DefaultEvidenceWindow    = 5 * time.Second
+	DefaultFinalizeWindow    = 10 * time.Second
 	DefaultGraveyardTTL      = 300 * time.Second
 	maxPendingInvestigations = 100
 )
