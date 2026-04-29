@@ -57,14 +57,27 @@ import (
 type safeReaderStream struct {
 	reader *tcpreader.ReaderStream
 	once   sync.Once
+	closed atomic.Bool // set after ReassemblyComplete — Reassembled becomes no-op
 }
 
 func (s *safeReaderStream) Reassembled(rs []tcpassembly.Reassembly) {
+	if s.closed.Load() {
+		return // stream already closed, discard late packets
+	}
+	// Belt and suspenders: recover from the tiny race window where
+	// closed.Load() returns false but ReassemblyComplete closes the
+	// channel before reader.Reassembled sends. (v0.43.1 crash fix.)
+	defer func() {
+		if r := recover(); r != nil {
+			s.closed.Store(true) // ensure future calls skip fast
+		}
+	}()
 	s.reader.Reassembled(rs)
 }
 
 func (s *safeReaderStream) ReassemblyComplete() {
 	s.once.Do(func() {
+		s.closed.Store(true)
 		s.reader.ReassemblyComplete()
 	})
 }
