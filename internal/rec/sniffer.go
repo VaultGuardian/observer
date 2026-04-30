@@ -363,9 +363,9 @@ type sniffer struct {
 	reassemblyStreamsActive   int64
 	reassemblyStreamsTotal    int64
 	reassemblyStreamsTimedOut int64
-	reassemblyStreamDrops    int64 // MaxActiveStreams cap hit
-	reassemblyResponses      int64
-	reassemblyParseErrors    int64
+	reassemblyStreamDrops     int64 // MaxActiveStreams cap hit
+	reassemblyResponses       int64
+	reassemblyParseErrors     int64
 
 	feedHTTP      int64
 	flowEvictions int64 // flow cap hit, blunt eviction
@@ -716,7 +716,7 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 	// No request waiting — log diagnostics before queuing as orphan.
 	if s.verbose {
 		log.Printf("[rec] PAIR MISS: status=%d body_bytes=%d src=%d.%d.%d.%d:%d dst=%d.%d.%d.%d:%d",
-			captured.StatusCode, len(captured.ResponseBody),
+			captured.StatusCode, len(captured.BodyPreview),
 			flowKey.dstIP[0], flowKey.dstIP[1], flowKey.dstIP[2], flowKey.dstIP[3], flowKey.dstPort,
 			flowKey.srcIP[0], flowKey.srcIP[1], flowKey.srcIP[2], flowKey.srcIP[3], flowKey.srcPort)
 		for i, req := range fp.requests {
