@@ -728,6 +728,31 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 			atomic.LoadInt64(&s.pairImmediate),
 			atomic.LoadInt64(&s.orphanResponses),
 			atomic.LoadInt64(&s.requestsExpired))
+
+		// Scan for requests to the same server on different ephemeral ports.
+		// If we find any, it's a NAT/port rewrite problem — the request
+		// exists but under a different flow key.
+		serverIP := flowKey.dstIP
+		serverPort := flowKey.dstPort
+		s.flowsMu.Lock()
+		for otherKey, otherFP := range s.flows {
+			if otherKey == flowKey {
+				continue
+			}
+			if otherFP == nil {
+				continue
+			}
+			if otherKey.dstIP == serverIP && otherKey.dstPort == serverPort {
+				otherFP.mu.Lock()
+				if len(otherFP.requests) > 0 {
+					log.Printf("[rec] PAIR MISS:   !! FOUND on different ephemeral: %d.%d.%d.%d:%d has %d pending req",
+						otherKey.srcIP[0], otherKey.srcIP[1], otherKey.srcIP[2], otherKey.srcIP[3], otherKey.srcPort,
+						len(otherFP.requests))
+				}
+				otherFP.mu.Unlock()
+			}
+		}
+		s.flowsMu.Unlock()
 	}
 
 	// Queue the response as an orphan candidate.
