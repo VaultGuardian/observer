@@ -713,7 +713,24 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 		return req
 	}
 
-	// No request waiting. Queue the response as an orphan candidate.
+	// No request waiting — log diagnostics before queuing as orphan.
+	if s.verbose {
+		log.Printf("[rec] PAIR MISS: status=%d body_bytes=%d src=%d.%d.%d.%d:%d dst=%d.%d.%d.%d:%d",
+			captured.StatusCode, len(captured.ResponseBody),
+			flowKey.dstIP[0], flowKey.dstIP[1], flowKey.dstIP[2], flowKey.dstIP[3], flowKey.dstPort,
+			flowKey.srcIP[0], flowKey.srcIP[1], flowKey.srcIP[2], flowKey.srcIP[3], flowKey.srcPort)
+		for i, req := range fp.requests {
+			log.Printf("[rec] PAIR MISS:   pending[%d] %s %s (age=%.1fs)",
+				i, req.method, req.path, time.Since(req.timestamp).Seconds())
+		}
+		log.Printf("[rec] PAIR MISS:   stats: inline_req=%d pair_immediate=%d total_misses=%d expired=%d",
+			atomic.LoadInt64(&s.inlineRequests),
+			atomic.LoadInt64(&s.pairImmediate),
+			atomic.LoadInt64(&s.orphanResponses),
+			atomic.LoadInt64(&s.requestsExpired))
+	}
+
+	// Queue the response as an orphan candidate.
 	// It will expire after ResponseOrphanTimeout and be inserted as orphan.
 	if len(fp.responses) >= s.flowConfig.MaxResponsesPerFlow {
 		fp.responses = fp.responses[1:] // drop oldest
@@ -841,9 +858,14 @@ func (s *sniffer) runCleanup() {
 			fp.responses = fp.responses[i:]
 		}
 
-		// Expire old requests.
+		// Expire old requests — log each one when verbose.
 		j := 0
 		for j < len(fp.requests) && fp.requests[j].timestamp.Before(reqCutoff) {
+			if s.verbose {
+				log.Printf("[rec] CLEANUP: expired request %s %s (age=%.1fs)",
+					fp.requests[j].method, fp.requests[j].path,
+					time.Since(fp.requests[j].timestamp).Seconds())
+			}
 			j++
 		}
 		if j > 0 {
