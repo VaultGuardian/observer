@@ -115,6 +115,66 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		return
 	}
 
+	// --- Cache-hit status-aware routing (Option C — design consensus) ---
+	//
+	// WHY: The pattern store caches T1 verdicts ("this is an attack") but NOT
+	// T2 outcomes ("the attack failed"). Cache-hit events go to the coordinator,
+	// but the coordinator/graveyard cycle re-produces MALICIOUS findings every
+	// ~5 minutes as graveyard entries expire. Over 12 hours, the dashboard
+	// fills with orange badges for attacks bouncing off 404s.
+	//
+	// FIX: For cache-hit attack patterns where the HTTP status code in the log
+	// line already proves the attack was rejected, short-circuit as recon.
+	// No coordinator, no REC, no email. The pattern store is untouched — the
+	// pattern still means "this request shape is malicious." The event outcome
+	// means "this specific attempt failed."
+	//
+	// SCOPE:
+	//   - Cache hits only (result.Source != "llm") — fresh LLM events always
+	//     go through the full coordinator/evidence pipeline.
+	//   - HTTP events with status 403/404/405/410 only.
+	//   - 200/3xx/5xx/unknown still route to coordinator for REC/T2.
+	//   - Non-HTTP events are untouched.
+	//   - Pattern store verdict is NOT modified.
+	//
+	// SAFETY: 400 excluded from first cut. Ship conservative, add after logs.
+	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
+		reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server — HTTP %d confirms failure", result.Source, statusCode)
+
+		log.Printf("[RECON:STATUS] EventID=%s Source=%s Status=%d Classification=%s PatternVia=%s Line=%s",
+			evt.ID, evt.ScopeKey(), statusCode, result.LLMClassification, result.Source,
+			truncate(evt.Line, 200))
+
+		r.db.SubmitFinding(&store.Finding{
+			EventID:              evt.ID,
+			Timestamp:            evt.Timestamp,
+			SourceType:           evt.SourceType,
+			SourceName:           evt.SourceName,
+			DestHost:             host,
+			HTTPMethod:           method,
+			HTTPPath:             path,
+			HTTPStatus:           statusCode,
+			Verdict:              "recon",
+			Classification:       "recon_failed_status",
+			Confidence:           result.LLMConfidence,
+			Reason:               reason,
+			MatchedVia:           result.Source,
+			MatchedPatternScope:  result.PatternScope,
+			MatchedPatternBucket: result.PatternBucket,
+			MatchedPatternValue:  result.PatternValue,
+			RawLine:              evt.Line,
+			NormalizedLine:       evt.NormalizedLine,
+			NormalizedHash:       evt.Hash,
+			Notified:             false,
+			Downgraded:           true,
+			DowngradeReason:      reason,
+			ResolutionStatus:     "resolved",
+			ResolutionMethod:     "status_only",
+			PreviousVerdict:      string(result.Verdict),
+		})
+		return
+	}
+
 	severity := "malicious"
 	notifSeverity := notifier.SeverityMalicious
 	if result.Verdict == patternstore.VerdictAlert {

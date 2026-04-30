@@ -108,3 +108,18 @@ var reCanonicalNumbers = regexp.MustCompile(`\b\d{4,}\b`)
 func canonicalPath(path string) string {
 	return reCanonicalNumbers.ReplaceAllString(path, "<NUM>")
 }
+
+// statusCodeRejectsAttack returns true if the HTTP status code is conclusive
+// evidence that the server rejected/ignored the attack. Used by the cache-hit
+// status-aware routing in routeAlert() to short-circuit repeat probes.
+//
+// Conservative first cut: 403/404/405/410 only.
+// 400 excluded — revisit after watching production logs.
+// 200/3xx/5xx/unknown always route to coordinator for REC/T2 evidence.
+func statusCodeRejectsAttack(code int) bool {
+	switch code {
+	case 403, 404, 405, 410:
+		return true
+	}
+	return false
+}
