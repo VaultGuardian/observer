@@ -1,12 +1,14 @@
+// httpparse.go
 package main
 
 import (
+	"net"
 	"regexp"
 	"strconv"
 )
 
 // =============================================================================
-// HTTP Request Extraction from Normalized Log Lines
+// HTTP Request Extraction from Log Lines
 // =============================================================================
 //
 // Observer's normalizers produce three different formats depending on the
@@ -23,6 +25,27 @@ import (
 //
 // Format 3 — Bare (no hostname, no quotes):
 //   "GET /?q=UNION+SELECT+1,2,3 HTTP/1.0 200"
+//
+// =============================================================================
+// NORMALIZED vs RAW — why we have two parsers (P0 fix, design consensus)
+// =============================================================================
+//
+// The generic/Docker normalizer applies `\b\d{4,}\b -> <NUM>` GLOBALLY on the
+// log line, including inside the quoted HTTP request line. So a backend log:
+//
+//   Raw:        "GET /api/orders/123456?ts=1774472800 HTTP/1.1" 200 1234
+//   Normalized: "GET /api/orders/<NUM>?ts=<NUM> HTTP/1.1" 200 <NUM>
+//
+// The nginx normalizer treats the request line as SACRED and preserves it raw.
+//
+// REC's AF_PACKET sniffer captures the literal wire path. Its lookup does an
+// exact string match on (Method, Path). For backend-sourced events with
+// numeric URL components, looking up REC with the normalized `<NUM>` path
+// fails every time because REC has the raw `123456` form.
+//
+// Fix: parse RAW path from evt.Line for REC correlation. Keep parseNormalizedLine
+// for coordinator correlation key (where collapsing numbers is desirable so
+// nginx and backend events for the same request join the same huddle).
 
 var httpMethods = `GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE`
 
@@ -38,10 +61,17 @@ var reNormalizedHTTPQuoted = regexp.MustCompile(
 var reNormalizedHTTPBare = regexp.MustCompile(
 	`^(` + httpMethods + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// parseNormalizedLine extracts HTTP components from a normalized log line.
+// parseNormalizedLine extracts HTTP components from a NORMALIZED log line.
 // Tries all three formats in order: hostname-prefixed, quoted, bare.
 // Returns method, path (with query string), host, statusCode.
 // Returns zero values for non-HTTP logs (error logs, syslog, etc.)
+//
+// USE FOR: coordinator correlation key (canonicalPath collapses numbers,
+// joining nginx + backend events for the same request), pattern store
+// scope keys, anything that wants stable hashing.
+//
+// DO NOT USE FOR: REC evidence lookup. The normalized path may contain
+// <NUM> placeholders that will never match REC's raw wire capture.
 func parseNormalizedLine(normalized string) (method, path, host string, statusCode int) {
 	// Format 1: hostname-prefixed (CapRover nginx normalizer)
 	if m := reNormalizedHTTPHosted.FindStringSubmatch(normalized); m != nil {
@@ -57,6 +87,39 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 
 	// Format 3: bare (no hostname, no quotes)
 	if m := reNormalizedHTTPBare.FindStringSubmatch(normalized); m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
+	return "", "", "", 0
+}
+
+// parseRawHTTPLine extracts HTTP components from a RAW (pre-normalization)
+// log line. Used for REC evidence lookup, which requires the literal path
+// the client sent on the wire — including any numeric values that the
+// generic/Docker normalizer would substitute with <NUM>.
+//
+// Tries Format 2 (quoted request line) and Format 3 (bare). Format 1
+// (hostname-prefixed) does NOT occur in raw logs — it is produced by the
+// nginx normalizer prepending the resolved vhost to the request line.
+//
+// Returns method, path (with query string, RAW), host (always empty — raw
+// access logs do not carry the resolved vhost in a position we can extract
+// generically), and statusCode. Returns zero values for non-HTTP logs.
+//
+// CALLER NOTE: when you need a host, fall back to parseNormalizedLine's
+// host field. The combination "raw path from this function + host from
+// parseNormalizedLine" is what feeds REC's LookupRequest.
+func parseRawHTTPLine(raw string) (method, path, host string, statusCode int) {
+	// Format 2: quoted request line (covers raw nginx access log AND raw
+	// generic backend access log — both wrap the request line in quotes).
+	if m := reNormalizedHTTPQuoted.FindStringSubmatch(raw); m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
+	// Format 3: bare (rare — some custom containers emit "METHOD path HTTP/x" directly).
+	if m := reNormalizedHTTPBare.FindStringSubmatch(raw); m != nil {
 		code, _ := strconv.Atoi(m[3])
 		return m[1], m[2], "", code
 	}
@@ -122,4 +185,23 @@ func statusCodeRejectsAttack(code int) bool {
 		return true
 	}
 	return false
+}
+
+// isBareIP returns true if the host string is an IP address rather than a
+// domain name. Handles IPv4, IPv6, and host:port formats.
+//
+// Used by the edge-generated response routing in routeAlert() to detect
+// bare-IP requests hitting the default server. When the Host header is an
+// IP address, the request almost certainly hit the web server's default
+// server block, not a configured vhost with a backend application.
+func isBareIP(host string) bool {
+	if host == "" {
+		return false
+	}
+	// Strip port if present (handles "1.2.3.4:80" and "[::1]:443")
+	h, _, err := net.SplitHostPort(host)
+	if err == nil {
+		host = h
+	}
+	return net.ParseIP(host) != nil
 }

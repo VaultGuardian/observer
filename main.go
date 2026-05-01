@@ -439,6 +439,20 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 // Two downgrade paths (design consensus, 2026-03-25):
 //   Path 1 — Transport-only downgrade (403/404/405/410)
 //   Path 2 — Body-aware re-classification (200, 3xx, 5xx)
+//
+// =============================================================================
+// PATH SOURCE — design consensus P0 fix (2026-05)
+// =============================================================================
+// We intentionally do NOT re-parse pending.NormalizedLine here. That field
+// can contain <NUM>-substituted paths from the generic/Docker normalizer, and
+// REC's wire capture stores raw paths. Exact-match lookup against <NUM>
+// fails for any URL with 4+ digit numbers, which was the dominant cause of
+// "REC missed but should have matched" findings before this fix.
+//
+// resultRouter.routeAlert now stores the RAW path on PendingAlert.HTTPPath
+// (parsed from evt.Line via parseRawHTTPLine). The coordinator join logic
+// preserves raw over <NUM> when events merge. We just read the struct here.
+// =============================================================================
 func makeEvidenceCheckCallback(
 	collector rec.EvidenceCollector,
 	llmClient *llm.Client,
@@ -453,9 +467,16 @@ func makeEvidenceCheckCallback(
 	}
 
 	return func(pending *coordinator.PendingAlert) (bool, bool, string, string) {
-		method, path, host, statusCode := parseNormalizedLine(pending.NormalizedLine)
+		// Read HTTP identity directly from the PendingAlert struct.
+		// pending.HTTPPath is the RAW wire path stored at routing time
+		// (resultrouter.go) and preserved across joins (coordinator.go).
+		method := pending.HTTPMethod
+		path := pending.HTTPPath
+		host := pending.Host
+		statusCode := pending.StatusCode
+
 		if method == "" {
-			log.Printf("[coordinator] Evidence check SKIP: no HTTP in normalized line key=%s normalized=%s",
+			log.Printf("[coordinator] Evidence check SKIP: no HTTP identity on pending key=%s normalized=%s",
 				pending.Key, truncate(pending.NormalizedLine, 120))
 			return false, false, "", ""
 		}

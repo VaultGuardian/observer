@@ -4,6 +4,7 @@ package coordinator
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -221,6 +222,28 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 			existing.PatternScope = alert.PatternScope
 			existing.PatternBucket = alert.PatternBucket
 			existing.PatternValue = alert.PatternValue
+		}
+
+		// design consensus P0 fix (2026-05): prefer RAW HTTPPath over <NUM>.
+		//
+		// Two events for the same request can join the same huddle:
+		//   nginx normalizer:    HTTPPath = "/api/orders/123456?ts=1774472800"  (raw, sacred)
+		//   generic normalizer:  HTTPPath = "/api/orders/<NUM>?ts=<NUM>"        (substituted)
+		//
+		// REC's wire-side capture has the raw path. The evidence-check callback
+		// reads pending.HTTPPath directly. If the last-joining event overwrote
+		// a raw path with a <NUM> path, REC lookup misses every time.
+		//
+		// Rule: if existing has <NUM> and incoming is raw, upgrade.
+		// Otherwise keep existing (avoid raw → <NUM> downgrade, avoid raw → raw churn).
+		if existing.HTTPPath == "" && alert.HTTPPath != "" {
+			existing.HTTPPath = alert.HTTPPath
+			existing.HTTPMethod = alert.HTTPMethod
+			existing.StatusCode = alert.StatusCode
+		} else if alert.HTTPPath != "" &&
+			strings.Contains(existing.HTTPPath, "<NUM>") &&
+			!strings.Contains(alert.HTTPPath, "<NUM>") {
+			existing.HTTPPath = alert.HTTPPath
 		}
 
 		log.Printf("[coordinator] Event joined huddle: key=%s events=%d source=%s",

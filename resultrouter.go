@@ -79,8 +79,53 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 }
 
 // routeAlert handles malicious/alert verdicts.
+//
+// =============================================================================
+// PATH HANDLING — design consensus P0 fix (2026-05)
+// =============================================================================
+// We compute TWO HTTP identities here:
+//
+//   normalized identity (parseNormalizedLine on evt.NormalizedLine)
+//     → drives coordinator correlation key. Numbers are collapsed to <NUM>
+//       so nginx and backend logs for the same request join the same huddle.
+//
+//   raw identity (parseRawHTTPLine on evt.Line)
+//     → drives REC evidence lookup, PinVIP, alertBuilder closure, and the
+//       HTTPPath stored on the PendingAlert / Finding records. REC's
+//       AF_PACKET sniffer captures the literal wire path; matching against
+//       a <NUM>-substituted path fails for any URL with 4+ digit numbers.
+//
+// Method, status, and host don't differ between normalized and raw, so we
+// take them from whichever parse succeeded (raw preferred, normalized as
+// fallback for host since raw access logs don't carry the resolved vhost).
+// =============================================================================
 func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisResult, line watcher.LogLine) {
-	method, path, host, statusCode := parseNormalizedLine(evt.NormalizedLine)
+	nMethod, nPath, nHost, nStatus := parseNormalizedLine(evt.NormalizedLine)
+	rMethod, rPath, _, rStatus := parseRawHTTPLine(evt.Line)
+
+	// method/status: prefer raw, fall back to normalized
+	method := rMethod
+	if method == "" {
+		method = nMethod
+	}
+	statusCode := rStatus
+	if statusCode == 0 {
+		statusCode = nStatus
+	}
+
+	// path: raw is for REC; normalized (canonicalized) is for coordinator key.
+	rawPath := rPath
+	if rawPath == "" {
+		rawPath = nPath // safe fallback if raw parse failed
+	}
+	normPath := nPath
+	if normPath == "" {
+		normPath = rPath // safe fallback if normalized parse failed
+	}
+
+	// host: raw logs don't expose vhost, so always pull from normalized
+	host := nHost
+
 	isHTTP := method != ""
 
 	// --- Recon routing ---
@@ -97,7 +142,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			SourceName:           evt.SourceName,
 			DestHost:             host,
 			HTTPMethod:           method,
-			HTTPPath:             path,
+			HTTPPath:             rawPath,
 			HTTPStatus:           statusCode,
 			Verdict:              "recon",
 			Classification:       result.LLMClassification,
@@ -152,7 +197,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			SourceName:           evt.SourceName,
 			DestHost:             host,
 			HTTPMethod:           method,
-			HTTPPath:             path,
+			HTTPPath:             rawPath,
 			HTTPStatus:           statusCode,
 			Verdict:              "recon",
 			Classification:       "recon_failed_status",
@@ -175,6 +220,67 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		return
 	}
 
+	// --- Edge-generated response routing (design consensus) ---
+	//
+	// WHY: When a scanner probes the bare IP (e.g., GET /?phpinfo=-1 on
+	// 144.126.131.55), the web server answers with its default page (welcome
+	// page, error page, etc.) without proxying to any backend container.
+	// REC watches backend traffic — this response never crosses that path.
+	// The coordinator opens an investigation, REC finds nothing, coordinator
+	// times out, dashboard shows MALICIOUS/SUSPICIOUS "awaiting evidence"
+	// forever. The evidence will never arrive.
+	//
+	// FIX: If the host is a bare IP address (not a domain/vhost), the
+	// request hit the default server block. The 200 is the default page,
+	// not a successful exploit reaching an application backend. Short-circuit
+	// as recon — no coordinator, no REC, no email.
+	//
+	// SCOPE:
+	//   - Bare IP hosts only (isBareIP). Real vhosts always go to coordinator.
+	//   - Status 200 only. Non-200 bare-IP events are already handled by
+	//     the cache-hit status check above (404/405) or are rare enough to
+	//     leave in the coordinator.
+	//   - Both LLM-first and cache-hit events.
+	//   - Classification is "edge_inferred" (heuristic, not proof).
+	//     Promotion to "edge_generated" when upstream_response_time is
+	//     available is a future enhancement.
+	if isHTTP && isBareIP(host) && statusCode == 200 {
+		reason := fmt.Sprintf("Attack probe hit bare-IP default server (%s) — HTTP 200 is the default page, no backend application involved", host)
+
+		log.Printf("[RECON:EDGE] EventID=%s Source=%s Host=%s Status=%d Classification=%s Via=%s Line=%s",
+			evt.ID, evt.ScopeKey(), host, statusCode, result.LLMClassification, result.Source,
+			truncate(evt.Line, 200))
+
+		r.db.SubmitFinding(&store.Finding{
+			EventID:              evt.ID,
+			Timestamp:            evt.Timestamp,
+			SourceType:           evt.SourceType,
+			SourceName:           evt.SourceName,
+			DestHost:             host,
+			HTTPMethod:           method,
+			HTTPPath:             rawPath,
+			HTTPStatus:           statusCode,
+			Verdict:              "recon",
+			Classification:       "edge_inferred",
+			Confidence:           result.LLMConfidence,
+			Reason:               reason,
+			MatchedVia:           result.Source,
+			MatchedPatternScope:  result.PatternScope,
+			MatchedPatternBucket: result.PatternBucket,
+			MatchedPatternValue:  result.PatternValue,
+			RawLine:              evt.Line,
+			NormalizedLine:       evt.NormalizedLine,
+			NormalizedHash:       evt.Hash,
+			Notified:             false,
+			Downgraded:           true,
+			DowngradeReason:      reason,
+			ResolutionStatus:     "resolved",
+			ResolutionMethod:     "bare_ip_default_server",
+			PreviousVerdict:      string(result.Verdict),
+		})
+		return
+	}
+
 	severity := "malicious"
 	notifSeverity := notifier.SeverityMalicious
 	if result.Verdict == patternstore.VerdictAlert {
@@ -186,16 +292,21 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 
 	// --- HTTP alerts: route through coordinator for evidence huddle ---
 	if isHTTP && r.collector.Enabled() {
-		correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(path), statusCode)
+		// Coordinator key uses NORMALIZED+canonicalized path so nginx (raw)
+		// and backend (<NUM>) events for the same request join the same huddle.
+		correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(normPath), statusCode)
 
 		// Fix 1: Pin VIP evidence for malicious events.
 		// The collector stores match criteria in a protected map that
 		// CANNOT be evicted by traffic floods. When a matching response
 		// arrives, the VIP callback fires immediately.
+		//
+		// REC LookupRequest.Path uses the RAW path (not normalized) — REC
+		// captures the literal wire path, exact-match comparison.
 		if result.Verdict == patternstore.VerdictMalicious {
 			r.collector.PinVIP(evt.ID, correlationKey, rec.LookupRequest{
 				Method:          method,
-				Path:            path,
+				Path:            rawPath,
 				Host:            host,
 				SourceContainer: evt.SourceName,
 				StatusCode:      statusCode,
@@ -209,11 +320,12 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		evtCopy := evt
 		resultCopy := result
 		lineCopy := line
+		recPathCopy := rawPath
 
 		alertBuilder := func() interface{} {
 			evidence := r.collector.Lookup(rec.LookupRequest{
 				Method:          method,
-				Path:            path,
+				Path:            recPathCopy,
 				SourceContainer: evtCopy.SourceName,
 				StatusCode:      statusCode,
 				Timestamp:       evtCopy.Timestamp,
@@ -254,7 +366,10 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			StatusCode:     statusCode,
 			ResponseBytes:  respBytes,
 			HTTPMethod:     method,
-			HTTPPath:       path,
+			// HTTPPath stores RAW path. The evidence-check callback in main.go
+			// reads this directly (no re-parsing of NormalizedLine) so REC
+			// lookups always get the wire path, not the <NUM>-substituted one.
+			HTTPPath:       rawPath,
 			// Fix 2: BodyPreviewHash for catch-all matching.
 			// Intentionally empty at routing time — evidence callback in
 			// tryEvidenceCheck() populates this when REC captures a response
@@ -307,7 +422,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		SourceName:           evt.SourceName,
 		DestHost:             host,
 		HTTPMethod:           method,
-		HTTPPath:             path,
+		HTTPPath:             rawPath,
 		HTTPStatus:           statusCode,
 		ResponseBytes:        respBytes,
 		Verdict:              string(result.Verdict),
