@@ -653,8 +653,22 @@ func (s *Store) Persist() error {
 	}
 
 	path := s.dataDir + "/patternstore.json"
-	if err := os.WriteFile(path, jsonBytes, 0644); err != nil {
-		return fmt.Errorf("writing pattern store: %w", err)
+
+	// Atomic write to avoid corruption from crashes mid-write. the design review raised
+	// this and code review confirmed: a previous os.WriteFile could leave a
+	// partially-written JSON file that fails to parse on next boot, taking
+	// the entire pattern store down with it.
+	//
+	// 0600 because patterns include normalized payload prefixes, hashes, and
+	// learned attack signatures — sensitive security state, not world-readable.
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, jsonBytes, 0600); err != nil {
+		return fmt.Errorf("writing pattern store tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		// Best-effort cleanup of the tmp file if rename fails.
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("renaming pattern store: %w", err)
 	}
 
 	return nil

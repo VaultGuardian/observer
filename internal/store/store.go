@@ -33,8 +33,10 @@ type Store struct {
 func Init(dataDir string) (*Store, error) {
 	dbPath := filepath.Join(dataDir, "observer.db")
 
-	// Ensure data directory exists
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	// Ensure data directory exists. 0700 (owner-only) — Observer's data
+	// includes raw logs, evidence body previews, LLM decisions, and learned
+	// patterns. Treat as sensitive security telemetry, not world-readable.
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 

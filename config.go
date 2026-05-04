@@ -55,6 +55,8 @@ type Config struct {
 	// Dashboard API
 	DashboardPort int
 	DashboardKeyFile string
+	DashboardBindAddr string
+	DashboardAllowedOrigins []string
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -75,6 +77,7 @@ func LoadConfig() Config {
 		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
 		DashboardPort:    9090,
 		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+		DashboardBindAddr: getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
 		// REC reassembly tuning — response-only, bounds are tunable.
 		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
@@ -96,6 +99,17 @@ func LoadConfig() Config {
 	if portStr := getEnv("DASHBOARD_PORT", ""); portStr != "" {
 		if port, err := strconv.Atoi(portStr); err == nil && port > 0 && port < 65536 {
 			cfg.DashboardPort = port
+		}
+	}
+
+	// Parse dashboard CORS allowlist (comma-separated origins).
+	// Empty default = no CORS headers set on responses (safer than wildcard).
+	// Set to e.g. "https://vaultguardian.io,http://localhost:3000" for hosted dashboards.
+	if raw := getEnv("DASHBOARD_ALLOWED_ORIGINS", ""); raw != "" {
+		for _, origin := range strings.Split(raw, ",") {
+			if o := strings.TrimSpace(origin); o != "" {
+				cfg.DashboardAllowedOrigins = append(cfg.DashboardAllowedOrigins, o)
+			}
 		}
 	}
 

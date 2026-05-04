@@ -197,29 +197,11 @@ ExecStart=$BIN
 Restart=always
 RestartSec=5
 
-# Core
-Environment=DATA_DIR=$DATA_DIR
-Environment=API_PORT=$DASHBOARD_PORT
-
-# LLM
-Environment=LLM_URL=https://api.openai.com
-Environment=LLM_MODEL=$LLM_MODEL
-Environment=LLM_API_KEY=$API_KEY
-
-# Sources
-Environment=DOCKER_SOCKET=/var/run/docker.sock
-Environment=JOURNALD_ENABLED=$JOURNALD_FOUND
-Environment=EXCLUDE_CONTAINERS=
-
-# Evidence capture
-Environment=REC_ENABLED=$REC_ENABLED
+# Secrets and configuration are loaded from a 0600 file outside the unit
+# (systemd unit files are typically world-readable, which would expose API keys
+# to local users on the box).
+EnvironmentFile=$CONFIG_DIR/observer.env
 EOF
-
-# Add email config if provided
-if [ -n "$RESEND_KEY" ] && [ -n "$ALERT_EMAIL" ]; then
-    echo "Environment=RESEND_API_KEY=$RESEND_KEY" >> "$SERVICE_FILE"
-    echo "Environment=ALERT_EMAIL_TO=$ALERT_EMAIL" >> "$SERVICE_FILE"
-fi
 
 # Add Install section
 cat >> "$SERVICE_FILE" << 'EOF'
@@ -229,6 +211,57 @@ WantedBy=multi-user.target
 EOF
 
 ok "Service file created at $SERVICE_FILE"
+
+# -------------------------------------------------------------------
+# Create environment file (chmod 600, contains secrets)
+# -------------------------------------------------------------------
+ENV_FILE="$CONFIG_DIR/observer.env"
+info "Writing $ENV_FILE (mode 0600)..."
+
+cat > "$ENV_FILE" << EOF
+# VaultGuardian Observer environment
+# This file contains API keys and runtime configuration.
+# Permissions: 0600 (root only). Do not chmod world-readable.
+
+# Core
+DATA_DIR=$DATA_DIR
+DASHBOARD_PORT=$DASHBOARD_PORT
+
+# Dashboard binding.
+#   127.0.0.1 = localhost only (default, safest — for self-hosted setups)
+#   0.0.0.0   = all interfaces (for hosted dashboards via proxy/VPN; firewall the port)
+DASHBOARD_BIND_ADDR=127.0.0.1
+
+# Dashboard CORS allowlist (comma-separated origins). Empty = no CORS headers.
+# Set this if a browser-side dashboard hits Observer directly.
+DASHBOARD_ALLOWED_ORIGINS=
+
+# LLM
+LLM_URL=https://api.openai.com
+LLM_MODEL=$LLM_MODEL
+LLM_API_KEY=$API_KEY
+
+# Sources
+DOCKER_SOCKET=/var/run/docker.sock
+JOURNALD_ENABLED=$JOURNALD_FOUND
+EXCLUDE_CONTAINERS=
+
+# Evidence capture
+REC_ENABLED=$REC_ENABLED
+EOF
+
+# Add email config if provided
+if [ -n "$RESEND_KEY" ] && [ -n "$ALERT_EMAIL" ]; then
+    cat >> "$ENV_FILE" << EOF
+
+# Email alerts
+RESEND_API_KEY=$RESEND_KEY
+ALERT_EMAIL_TO=$ALERT_EMAIL
+EOF
+fi
+
+chmod 600 "$ENV_FILE"
+ok "Environment file written (chmod 0600)"
 
 # -------------------------------------------------------------------
 # Install CLI tool

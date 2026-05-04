@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,6 +41,18 @@ type ServerConfig struct {
 	// Path to the bearer token key file.
 	// If the file doesn't exist, a new key is auto-generated.
 	KeyFile string
+
+	// Interface address to bind. Default 127.0.0.1 (localhost only — safest).
+	// Set to 0.0.0.0 ONLY when fronting with a reverse proxy or VPN, AND
+	// firewalling the port to known sources. Bare 0.0.0.0 + open firewall
+	// exposes the control plane to the public internet.
+	BindAddr string
+
+	// CORS allowlist for browser-origin dashboards. Empty list = no CORS
+	// headers set (correct for server-side proxy patterns where the
+	// browser never talks to Observer directly). Populated list = echo
+	// matched Origin back, set CORS headers only for allowed origins.
+	AllowedOrigins []string
 }
 
 // Server is the dashboard API server.
@@ -50,6 +63,9 @@ type Server struct {
 	patterns *patternstore.Store
 	analyzer *analyzer.Analyzer
 	collector rec.EvidenceCollector
+
+	// Pre-computed CORS origin lookup for O(1) allowlist checks.
+	allowedOrigins map[string]struct{}
 
 	// Human correction callbacks — narrow interfaces to avoid coupling
 	// the API package to coordinator/reclassCache internals.
@@ -71,13 +87,29 @@ func NewServer(
 		return nil, fmt.Errorf("dashboard auth setup: %w", err)
 	}
 
+	// Defense in depth: if the token file existed but was empty/whitespace,
+	// loadOrGenerateToken returned an empty string. Refuse to start rather
+	// than silently regenerating (which would lock the user out of their
+	// existing dashboard) or running with empty token (which would let
+	// empty Authorization headers compare-equal and bypass auth).
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("dashboard auth setup: token file %s is empty or whitespace; delete it to regenerate", cfg.KeyFile)
+	}
+
+	// Build O(1) origin lookup for CORS middleware.
+	originSet := make(map[string]struct{}, len(cfg.AllowedOrigins))
+	for _, o := range cfg.AllowedOrigins {
+		originSet[o] = struct{}{}
+	}
+
 	return &Server{
-		config:    cfg,
-		token:     token,
-		store:     db,
-		patterns:  patterns,
-		analyzer:  a,
-		collector: collector,
+		config:         cfg,
+		token:          token,
+		store:          db,
+		patterns:       patterns,
+		analyzer:       a,
+		collector:      collector,
+		allowedOrigins: originSet,
 	}, nil
 }
 
@@ -112,22 +144,70 @@ func (s *Server) Start() error {
 	mux.Handle("/api/trusted-ips/delete", s.requireAuth(http.HandlerFunc(s.handleDeleteTrustedIP)))
 	mux.Handle("/api/corrections", s.requireAuth(http.HandlerFunc(s.handleCorrection)))
 
-	addr := fmt.Sprintf(":%d", s.config.Port)
-	log.Printf("[api] Dashboard API listening on %s (key file: %s)", addr, s.config.KeyFile)
-	return http.ListenAndServe(addr, s.corsMiddleware(mux))
+	// Default bind to localhost if not configured. Defense in depth — if
+	// somehow the config arrived without a BindAddr, lock down rather than
+	// expose the control plane.
+	bindAddr := s.config.BindAddr
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+	addr := net.JoinHostPort(bindAddr, strconv.Itoa(s.config.Port))
+
+	// Visible startup state — makes "why doesn't my dashboard connect" debuggable.
+	log.Printf("[api] Dashboard API listening: bind=%s port=%d cors_origins=%d key_file=%s",
+		bindAddr, s.config.Port, len(s.allowedOrigins), s.config.KeyFile)
+
+	// Loud warning when binding to all interfaces. v0.45.0 default is
+	// 127.0.0.1; this fires when the operator explicitly opts into public
+	// exposure (Vercel-proxied dashboards, hosted setups).
+	if bindAddr == "0.0.0.0" {
+		log.Printf("[api:warn] Dashboard API is listening on ALL interfaces (0.0.0.0). " +
+			"Protect with firewall rules, VPN, or reverse proxy with TLS. " +
+			"Bare 0.0.0.0 exposes the control plane to the public internet.")
+	}
+
+	// Slowloris/timeout hardening. ReadHeaderTimeout is the most important
+	// for slowloris-style attacks; the others bound tail-latency abuse.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.securityHeadersMiddleware(s.corsMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
+	}
+
+	return srv.ListenAndServe()
 }
 
-// corsMiddleware handles CORS preflight and adds headers to all responses.
-// Required because the dashboard app runs on a different origin (e.g.
-// localhost:3000 or app.vaultguardian.io) and makes authenticated fetch calls.
+// corsMiddleware sets CORS headers only for explicitly allowed origins.
+//
+// Empty allowlist = no CORS headers (correct for server-side proxy patterns
+// where the browser never directly hits Observer — e.g. Vercel proxy).
+//
+// Non-empty allowlist = echo matched Origin (not wildcard). Browsers reject
+// wildcard + credentials, and our bearer-token API benefits from the same
+// stricter posture even though we don't use cookies.
+//
+// Origin not in allowlist = no CORS headers set. The cross-origin request
+// will fail at the browser, which is what we want.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Max-Age", "86400")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if _, ok := s.allowedOrigins[origin]; ok {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "86400")
+			}
+		}
 
-		// Preflight — return immediately, don't hit auth
+		// Preflight — return immediately, don't hit auth.
+		// (CORS-non-compliant browsers will fail at the missing CORS headers
+		// above; this just avoids wasting auth checks on OPTIONS.)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -137,18 +217,38 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeadersMiddleware adds defensive headers to every response.
+//
+// HSTS is intentionally omitted — Observer's API serves HTTP locally and TLS
+// is terminated upstream (nginx/Caddy/Vercel proxy). Setting HSTS on a raw
+// HTTP response is meaningless and can confuse browsers when behind a proxy
+// that already sets it correctly.
+func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Cache-Control", "no-store, max-age=0")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // =============================================================================
 // Auth Middleware
 // =============================================================================
 
 // requireAuth wraps a handler with bearer token verification.
+//
+// v0.45.0 hardening:
+//   - Header-only authentication. Query-param token support removed — bearer
+//     tokens leak into shell history, browser history, reverse proxy logs,
+//     access logs, and Referer headers. Use curl -H instead for testing.
+//   - Length check before ConstantTimeCompare. Go's subtle.ConstantTimeCompare
+//     returns 0 immediately for unequal-length slices, leaking length via
+//     timing. Token length is fixed (64-char hex), but the cleaner pattern
+//     is to reject mismatched-length up front.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if auth == "" {
-			// Also check query param for easy browser/curl testing
-			auth = "Bearer " + r.URL.Query().Get("token")
-		}
 
 		if !strings.HasPrefix(auth, "Bearer ") {
 			jsonError(w, "Missing Authorization: Bearer <token> header", http.StatusUnauthorized)
@@ -156,6 +256,10 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 
 		provided := strings.TrimPrefix(auth, "Bearer ")
+		if len(provided) != len(s.token) {
+			jsonError(w, "Invalid token", http.StatusForbidden)
+			return
+		}
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
 			jsonError(w, "Invalid token", http.StatusForbidden)
 			return
@@ -347,12 +451,21 @@ func (s *Server) handleDeletePattern(w http.ResponseWriter, r *http.Request) {
 		Verdict string `json:"verdict"`
 		Value   string `json:"value"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "Invalid JSON body", http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Scope == "" || req.Verdict == "" || req.Value == "" {
 		jsonError(w, "Missing required fields: scope, verdict, value", http.StatusBadRequest)
+		return
+	}
+	// Validate verdict against the known enum. patternstore.getBucket() defaults
+	// unknown verdicts to the allow bucket, so a typo would silently delete from
+	// the wrong bucket. Reject explicitly.
+	switch req.Verdict {
+	case "allow", "malicious", "alert", "suppress":
+		// ok
+	default:
+		jsonError(w, "Invalid verdict. Must be one of: allow, malicious, alert, suppress", http.StatusBadRequest)
 		return
 	}
 
@@ -448,11 +561,23 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			// Clamp to sane bounds: 1..500. strconv.Atoi happily parses negatives,
+			// which would either choke the SQL driver or panic on negative slice
+			// allocations downstream.
+			if n < 1 {
+				n = 1
+			}
+			if n > 500 {
+				n = 500
+			}
 			filter.Limit = n
 		}
 	}
 	if v := r.URL.Query().Get("offset"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				n = 0
+			}
 			filter.Offset = n
 		}
 	}
@@ -493,11 +618,10 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ID     int64            `json:"id"`
-		Review store.LLMReview  `json:"review"`
+		ID     int64           `json:"id"`
+		Review store.LLMReview `json:"review"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -505,8 +629,14 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "id is required", http.StatusBadRequest)
 		return
 	}
-	if req.Review.Status == "" {
-		jsonError(w, "review.status is required (confirmed, corrected, ignored)", http.StatusBadRequest)
+	// Validate status against the documented enum. The previous "Status != ''"
+	// check let arbitrary strings into the database — confusing dashboards and
+	// breaking any future query that filters on status.
+	switch req.Review.Status {
+	case "confirmed", "corrected", "ignored":
+		// ok
+	default:
+		jsonError(w, "review.status must be one of: confirmed, corrected, ignored", http.StatusBadRequest)
 		return
 	}
 
@@ -566,14 +696,26 @@ func (s *Server) addTrustedIP(w http.ResponseWriter, r *http.Request) {
 		CIDR        string `json:"cidr"`
 		Description string `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "Invalid JSON", http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.IP == "" && req.CIDR == "" {
 		jsonError(w, "Either 'ip' or 'cidr' is required", http.StatusBadRequest)
 		return
+	}
+	// Validate IP/CIDR format up front. Without this, "ip": "pancakes" gets
+	// happily stored, then crashes whichever consumer (firewall, policy
+	// engine) tries to interpret it later.
+	if req.IP != "" && net.ParseIP(req.IP) == nil {
+		jsonError(w, "Invalid IP address format", http.StatusBadRequest)
+		return
+	}
+	if req.CIDR != "" {
+		if _, _, err := net.ParseCIDR(req.CIDR); err != nil {
+			jsonError(w, "Invalid CIDR format: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	entry := &store.TrustedIP{
@@ -609,8 +751,7 @@ func (s *Server) handleDeleteTrustedIP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID int64 `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "Invalid JSON", http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -663,8 +804,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 		Reason        string `json:"reason"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -962,6 +1102,27 @@ func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Cont
 // =============================================================================
 // JSON Helpers
 // =============================================================================
+
+// maxRequestBody bounds JSON request bodies for control-plane endpoints.
+// Corrections, pattern deletes, trusted-IP add/remove all fit easily under
+// this limit. Prevents OOM from oversized request abuse.
+const maxRequestBody = 64 * 1024 // 64 KB
+
+// decodeJSON reads a bounded request body and decodes it into v with strict
+// schema enforcement. Unknown fields are rejected — typos in client requests
+// surface as errors instead of silently corrupting control-plane semantics.
+//
+// Returns true on success, or false after writing an error response.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		jsonError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
 
 func jsonOK(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

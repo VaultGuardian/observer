@@ -136,8 +136,10 @@ func main() {
 	// ------- Start Dashboard API -------
 	apiServer, err := api.NewServer(
 		api.ServerConfig{
-			Port:    cfg.DashboardPort,
-			KeyFile: cfg.DashboardKeyFile,
+			Port:           cfg.DashboardPort,
+			KeyFile:        cfg.DashboardKeyFile,
+			BindAddr:       cfg.DashboardBindAddr,
+			AllowedOrigins: cfg.DashboardAllowedOrigins,
 		},
 		db, patterns, a, collector,
 	)
@@ -699,7 +701,12 @@ func makeVerifyCallback(
 				continue
 			}
 
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			// design consensus follow-up fix (2026-05): read exactly the same
+			// byte budget REC uses for its body preview. REC stores the first
+			// rec.DefaultMaxBodyBytes (2KB) of the response and hashes that
+			// preview slice. If we read more bytes here, the hashes diverge
+			// for any response in the gap range and verification silently fails.
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, rec.DefaultMaxBodyBytes))
 			resp.Body.Close()
 
 			bodyLen := int64(len(body))
