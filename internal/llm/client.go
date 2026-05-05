@@ -74,12 +74,12 @@ type VariableField struct {
 
 // Client handles communication with an LLM inference server (local or cloud).
 type Client struct {
-	baseURL      string
-	httpClient   *http.Client
-	model        string
-	apiKey       string
-	tier1Effort  string // reasoning_effort for Tier 1 (AnalyzeLog) — "low", "medium", "high"
-	tier2Effort  string // reasoning_effort for Tier 2 (ReclassifyWithEvidence)
+	baseURL     string
+	httpClient  *http.Client
+	model       string
+	apiKey      string
+	tier1Effort string // reasoning_effort for Tier 1 (AnalyzeLog) — "low", "medium", "high"
+	tier2Effort string // reasoning_effort for Tier 2 (ReclassifyWithEvidence)
 }
 
 func NewClient(baseURL, model, apiKey, tier1Effort, tier2Effort string) *Client {
@@ -130,13 +130,13 @@ INTENT × OUTCOME IS EVERYTHING. The request path tells you what the attacker WA
 - "recon_failed" + "suppress": Attacker probed and GOT NOTHING (error response codes on suspicious paths)
 - "recon_success" + "alert": Attacker probed something sensitive and GOT A REAL RESPONSE (200 on /.env, /.git, /config, etc.) — this is URGENT
 - "suspicious" + "alert": Unusual activity that is NOT a simple failed probe (unexpected auth, abnormal response sizes, legitimate paths with abnormal behavior)
-- "malicious" + "malicious": Confirmed attack payloads in the request itself, regardless of status code (SQL injection, shell injection, PHP wrappers, encoded exploits)
+- "malicious" + "malicious": Confirmed attack payloads in the request when the response did NOT clearly reject the request (200/301/500/etc.), OR when the line contains command output / disclosure evidence (root:x:0:0:root, BEGIN PRIVATE KEY, AWS_SECRET_ACCESS_KEY, uid=0(root))
 
 KEY RULES:
 - ALWAYS look at the HTTP status code
 - Status 200 on a sensitive path = recon_success = alert
 - Status 302 to login = recon_failed. Status 302 to content = recon_success
-- Attack payloads in the URL (UNION SELECT, ;ls, php://) = malicious regardless of status code
+- Attack payloads in the URL (UNION SELECT, ;ls, php://) on a 200/ambiguous response = malicious. On a clearly rejected response (400/403/404/405/410), classify as recon_failed + suppress — the server didn't process the payload
 
 EXPLICIT EDGE CASES — THESE HAVE BEEN INCORRECTLY CLASSIFIED BEFORE:
 
@@ -160,7 +160,7 @@ DO NOT contradict yourself:
 
 Status 200 is the ONLY ambiguous case:
 - Status 200 on a sensitive path (.env, .git, /config, /admin, /wp-admin) = recon_success + alert. The server served SOMETHING. We need evidence to know what.
-- Status 200 on a normal path with attack payload in query = malicious + malicious. The payload is the attack, regardless of what the server returned.
+- Status 200 on a normal path with attack payload in query = malicious + malicious. The payload was processed by the server (200 means the server didn't reject it).
 
 NOTE: Stack traces, failed 404/403/405 probes, nginx file-not-found errors, and framework noise are pre-filtered before reaching you. You will NOT see these. Focus on genuinely ambiguous lines.
 
@@ -210,9 +210,10 @@ IMPORTANT: For system logs, be confident. These patterns are well-understood. Us
 PATTERN RULES:
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "malicious".
 - PREFER "prefix" — fastest and safest.
-- Use "regex" only when variable content is in the MIDDLE. Always anchor with ^. Be specific.
-- Use "contains" only as last resort. Minimum 10 characters.
+- Use "regex" only when variable content is in the MIDDLE. Always anchor with ^. Be specific. Minimum 10 characters.
+- DO NOT use "contains". Auto-learned contains patterns are rejected by the validator. Only human/seeded rules may use contains. If a prefix or anchored regex won't fit the case, omit the pattern entirely and let the system hash-cache the exact line.
 - PATTERN MUST match the NORMALIZED version (timestamps=<TS>, IPs=<IP>, numbers=<NUM>, UUIDs=<UUID>).
+- For prefix patterns: the value MUST be a literal prefix of the normalized line. Minimum 20 characters.
 
 VARIABLE FIELDS:
 - Identify parts of the RAW log line that change between structurally identical lines.
@@ -236,7 +237,7 @@ CRITICAL JSON RULES:
 			{"role": "user", "content": userPrompt},
 		},
 		"max_completion_tokens": 4096,
-		"reasoning_effort":     c.tier1Effort,
+		"reasoning_effort":      c.tier1Effort,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -319,24 +320,19 @@ CRITICAL JSON RULES:
 		}
 	}
 
-	// Sanitize: don't trust malicious patterns from the LLM.
-	// They can be suggested but should not be auto-learned.
-	if verdict.Action == "malicious" {
-		verdict.PatternType = ""
-		verdict.Pattern = ""
-	}
-
-	// Sanitize: alert shouldn't have patterns either —
-	// suspicious lines need continued scrutiny, not auto-classification.
-	if verdict.Action == "alert" {
-		verdict.PatternType = ""
-		verdict.Pattern = ""
-	}
-
 	// Consistency check: if the LLM says classification=safe but action=malicious/alert,
 	// or classification=malicious but action=allow, override the action to match
 	// the classification. GPT-5 nano hallucinations can produce contradictory fields.
 	verdict.Action = reconcileClassificationAction(verdict.Classification, verdict.Action, verdict.Reason)
+
+	// Sanitize: don't trust malicious or alert patterns from the LLM.
+	// They can be suggested but should not be auto-learned. Done AFTER reconcile
+	// so we use the final action — if reconcile flipped allow→alert (because the
+	// classification was suspicious), we still want to drop the proposed pattern.
+	if verdict.Action == "malicious" || verdict.Action == "alert" {
+		verdict.PatternType = ""
+		verdict.Pattern = ""
+	}
 
 	// Attach call metadata for the audit trail
 	verdict.PromptTokens = chatResp.Usage.PromptTokens
@@ -435,9 +431,9 @@ type ReclassifyVerdict struct {
 
 // ReclassifyWithEvidence asks the LLM to re-evaluate a verdict given captured
 // response evidence. Only called when:
-//   1. Initial verdict was malicious/alert (suspicious/malicious)
-//   2. REC captured the response with high correlation confidence
-//   3. Redaction passed (SafeBodyPreview is populated)
+//  1. Initial verdict was malicious/alert (suspicious/malicious)
+//  2. REC captured the response with high correlation confidence
+//  3. Redaction passed (SafeBodyPreview is populated)
 //
 // Returns the updated verdict. If the LLM confirms the original severity,
 // Downgraded=false. If it reduces severity, Downgraded=true.
@@ -517,7 +513,7 @@ Based on this response evidence, did the attack succeed or did the server ignore
 			{"role": "user", "content": userPrompt},
 		},
 		"max_completion_tokens": 4096,
-		"reasoning_effort":     c.tier2Effort,
+		"reasoning_effort":      c.tier2Effort,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

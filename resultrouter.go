@@ -369,7 +369,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			// HTTPPath stores RAW path. The evidence-check callback in main.go
 			// reads this directly (no re-parsing of NormalizedLine) so REC
 			// lookups always get the wire path, not the <NUM>-substituted one.
-			HTTPPath:       rawPath,
+			HTTPPath: rawPath,
 			// Fix 2: BodyPreviewHash for catch-all matching.
 			// Intentionally empty at routing time — evidence callback in
 			// tryEvidenceCheck() populates this when REC captures a response

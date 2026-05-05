@@ -16,11 +16,11 @@ import (
 type Verdict string
 
 const (
-	VerdictAllow    Verdict = "allow"    // Known-good, skip silently
-	VerdictMalicious     Verdict = "malicious"     // Known-bad, alert with high severity
-	VerdictAlert    Verdict = "alert"    // Suspicious, alert with lower severity, exact-hash memoized
-	VerdictSuppress Verdict = "suppress" // Known-noise, don't alert, don't send to LLM
-	VerdictUnknown  Verdict = "unknown"  // No match — forward to LLM
+	VerdictAllow     Verdict = "allow"     // Known-good, skip silently
+	VerdictMalicious Verdict = "malicious" // Known-bad, alert with high severity
+	VerdictAlert     Verdict = "alert"     // Suspicious, alert with lower severity, exact-hash memoized
+	VerdictSuppress  Verdict = "suppress"  // Known-noise, don't alert, don't send to LLM
+	VerdictUnknown   Verdict = "unknown"   // No match — forward to LLM
 )
 
 // PatternType controls which matching tier a learned pattern uses.
@@ -32,6 +32,94 @@ const (
 	PatternRegex    PatternType = "regex"    // Pre-compiled regexp
 	PatternContains PatternType = "contains" // strings.Contains (guarded, rare)
 )
+
+// =============================================================================
+// Auto-Learning Safety Caps (v0.47, the design review ZD#2)
+// =============================================================================
+//
+// Without these caps the hash bucket grows without bound. An attacker spraying
+// novel-hash payloads through any path that reaches LLM classification (alerts,
+// LLM-suppressed sensitive paths before F1 lands, encoded payloads bypassing
+// deterministic gates) can fill memory until the OOM-killer drops Observer.
+//
+// Policy:
+//   - "auto" (LLM-learned) and "llm" hashes are capped per bucket.
+//   - "human", "human_validated", and "seeded" patterns are NEVER capped or
+//     rejected. Operator intent always wins.
+//   - When the cap is hit, new auto-learned hashes are rejected (logged once
+//     per minute per bucket). Eviction is deferred to post-v1 — reject is
+//     simpler, and a cap of 100K per bucket × 4 buckets × N scopes is plenty
+//     of headroom for legitimate operation.
+const (
+	MaxAutoHashesPerBucket   = 100000
+	MaxAutoPrefixesPerBucket = 1000
+	MaxAutoRegexesPerBucket  = 1000
+	MaxAutoContainsPerBucket = 500
+)
+
+// genericPrefixBlocklist holds the prefix values that LLM auto-learning is
+// never allowed to use, even when length validation passes. These are tokens
+// so common across log streams that suppressing/allowing them effectively
+// blinds the analyzer for that scope. Human/seeded sources may use anything.
+//
+// Matching semantics (v0.47, code review review): the candidate prefix is
+// "stripped" — whitespace and normalizer placeholders (anything inside <...>
+// like <TS>, <NUM>, <PID>, <UUID>) are removed — and the result is compared
+// case-insensitively for EQUALITY against each blocklist entry.
+//
+// This means:
+//   "ERROR"                         → blocked (stripped="ERROR")
+//   "ERROR "                        → blocked (stripped="ERROR")
+//   "ERROR <NUM>"                   → blocked (stripped="ERROR")
+//   "ERROR <TS> <PID> <CONN>"       → blocked (stripped="ERROR")
+//   "ERROR opening database conn"   → allowed (stripped has real content)
+//   "Failed password for "          → allowed (no entry matches "Failedpasswordfor")
+//
+// "Failed" and "Exception" intentionally NOT listed — the Tier-1 prompt
+// recommends prefixes like "Failed password for " for SSH brute-force
+// suppression. Length+must-prefix-original kills the bare-word case.
+var genericPrefixBlocklist = []string{
+	"ERROR",
+	"WARN",
+	"WARNING",
+	"INFO",
+	"DEBUG",
+	"TRACE",
+	"NOTICE",
+	"FATAL",
+	"GET /",
+	"POST /",
+	"PUT /",
+	"DELETE /",
+	"HEAD /",
+	"PATCH /",
+	"OPTIONS /",
+	"panic:",
+}
+
+// rePlaceholder matches normalizer placeholders like <TS>, <NUM>, <UUID>,
+// <PID:1234>, etc. — any angle-bracketed token. Used to "strip" prefixes
+// down to their meaningful structural content for blocklist comparison.
+var rePlaceholder = regexp.MustCompile(`<[^>]*>`)
+
+// stripPrefixForBlocklist removes whitespace and normalizer placeholders
+// from a prefix value so the blocklist can compare meaningful content only.
+func stripPrefixForBlocklist(value string) string {
+	stripped := rePlaceholder.ReplaceAllString(value, "")
+	return strings.Join(strings.Fields(stripped), "")
+}
+
+// isHumanOrSeededSource returns true for pattern sources that should bypass
+// the auto-learning safety caps and stricter validation. Operator intent
+// always wins over heuristics.
+func isHumanOrSeededSource(source string) bool {
+	switch source {
+	case "human", "human_validated", "seeded":
+		return true
+	default:
+		return false
+	}
+}
 
 // LearnedPattern is a single pattern entry learned from the LLM or seeded manually.
 type LearnedPattern struct {
@@ -73,10 +161,10 @@ type PatternBucket struct {
 
 // ScopeEntry holds all four buckets for a single source scope key.
 type ScopeEntry struct {
-	Allow    PatternBucket `json:"allow"`
+	Allow     PatternBucket `json:"allow"`
 	Malicious PatternBucket `json:"malicious"`
-	Alert    PatternBucket `json:"alert"`
-	Suppress PatternBucket `json:"suppress"`
+	Alert     PatternBucket `json:"alert"`
+	Suppress  PatternBucket `json:"suppress"`
 }
 
 // MatchResult is returned when a pattern matches, with context about what matched.
@@ -108,30 +196,37 @@ type Store struct {
 // Stats tracks pattern matching statistics for monitoring.
 // All fields use atomic operations for thread safety.
 type Stats struct {
-	TotalChecked atomic.Int64
-	HashHits     atomic.Int64
-	PrefixHits   atomic.Int64
-	RegexHits    atomic.Int64
-	ContainsHits atomic.Int64
-	MaliciousHits     atomic.Int64
-	AlertHits    atomic.Int64
-	SuppressHits atomic.Int64
-	Misses       atomic.Int64
-	PatternCount atomic.Int64
+	TotalChecked  atomic.Int64
+	HashHits      atomic.Int64
+	PrefixHits    atomic.Int64
+	RegexHits     atomic.Int64
+	ContainsHits  atomic.Int64
+	MaliciousHits atomic.Int64
+	AlertHits     atomic.Int64
+	SuppressHits  atomic.Int64
+	Misses        atomic.Int64
+	PatternCount  atomic.Int64
+
+	// v0.47 — auto-learning safety caps (the design review ZD#2)
+	AutoLearnRejected atomic.Int64 // bumped when cap hit or validation rejects auto pattern
+	AutoLearnCapped   atomic.Int64 // bumped specifically on bucket-size cap (subset of Rejected)
 }
 
 // StatsSnapshot is a plain copy for logging/serialization.
 type StatsSnapshot struct {
-	TotalChecked int64 `json:"total_checked"`
-	HashHits     int64 `json:"hash_hits"`
-	PrefixHits   int64 `json:"prefix_hits"`
-	RegexHits    int64 `json:"regex_hits"`
-	ContainsHits int64 `json:"contains_hits"`
-	MaliciousHits     int64 `json:"malicious_hits"`
-	AlertHits    int64 `json:"alert_hits"`
-	SuppressHits int64 `json:"suppress_hits"`
-	Misses       int64 `json:"misses"`
-	PatternCount int64 `json:"pattern_count"`
+	TotalChecked  int64 `json:"total_checked"`
+	HashHits      int64 `json:"hash_hits"`
+	PrefixHits    int64 `json:"prefix_hits"`
+	RegexHits     int64 `json:"regex_hits"`
+	ContainsHits  int64 `json:"contains_hits"`
+	MaliciousHits int64 `json:"malicious_hits"`
+	AlertHits     int64 `json:"alert_hits"`
+	SuppressHits  int64 `json:"suppress_hits"`
+	Misses        int64 `json:"misses"`
+	PatternCount  int64 `json:"pattern_count"`
+
+	AutoLearnRejected int64 `json:"auto_learn_rejected"`
+	AutoLearnCapped   int64 `json:"auto_learn_capped"`
 }
 
 // NewStore creates a pattern store with the given data directory for persistence.
@@ -280,9 +375,16 @@ func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *Match
 //   - regex patterns must compile
 //   - regex patterns must match the original line
 //   - contains patterns require minimum length (anti-overgeneralization)
+//   - LLM-source patterns face stricter validation than human/seeded patterns
+//
+// v0.47 (the design review ZD#2): per-bucket caps prevent unbounded auto-hash growth.
+// Human and seeded patterns bypass caps; only "auto"/"llm" sources are capped.
 func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) error {
-	// Validate
+	// Validate (uses pattern.Source to apply LLM-stricter rules)
 	if err := s.validatePattern(&pattern); err != nil {
+		if !isHumanOrSeededSource(pattern.Source) {
+			s.stats.AutoLearnRejected.Add(1)
+		}
 		return fmt.Errorf("invalid pattern: %w", err)
 	}
 
@@ -291,6 +393,16 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 
 	scope := s.getOrCreateScope(scopeKey)
 	bucket := s.getBucket(scope, verdict)
+
+	// Cap check — only applies to non-human, non-seeded sources.
+	// Operator-curated patterns are never capped.
+	if !isHumanOrSeededSource(pattern.Source) {
+		if reason, capped := s.bucketAtCap(bucket, pattern.Type); capped {
+			s.stats.AutoLearnRejected.Add(1)
+			s.stats.AutoLearnCapped.Add(1)
+			return fmt.Errorf("auto-learn cap reached for %s/%s: %s", scopeKey, verdict, reason)
+		}
+	}
 
 	switch pattern.Type {
 	case PatternHash:
@@ -309,6 +421,30 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 	return nil
 }
 
+// bucketAtCap returns a non-empty reason and true when the relevant tier of
+// the bucket has reached its auto-learn cap. Caller must hold s.mu.
+func (s *Store) bucketAtCap(bucket *PatternBucket, pt PatternType) (string, bool) {
+	switch pt {
+	case PatternHash:
+		if len(bucket.Hashes) >= MaxAutoHashesPerBucket {
+			return fmt.Sprintf("hashes=%d >= %d", len(bucket.Hashes), MaxAutoHashesPerBucket), true
+		}
+	case PatternPrefix:
+		if len(bucket.Prefixes) >= MaxAutoPrefixesPerBucket {
+			return fmt.Sprintf("prefixes=%d >= %d", len(bucket.Prefixes), MaxAutoPrefixesPerBucket), true
+		}
+	case PatternRegex:
+		if len(bucket.Regexes) >= MaxAutoRegexesPerBucket {
+			return fmt.Sprintf("regexes=%d >= %d", len(bucket.Regexes), MaxAutoRegexesPerBucket), true
+		}
+	case PatternContains:
+		if len(bucket.Contains) >= MaxAutoContainsPerBucket {
+			return fmt.Sprintf("contains=%d >= %d", len(bucket.Contains), MaxAutoContainsPerBucket), true
+		}
+	}
+	return "", false
+}
+
 // LearnHash is a convenience method for adding an exact hash match.
 func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, originalLine string) {
 	_ = s.Learn(scopeKey, verdict, LearnedPattern{
@@ -321,7 +457,30 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 	})
 }
 
+// validatePattern enforces structural and safety rules on patterns.
+//
+// Rules differ by source (v0.47, code review F3):
+//
+//   - human / human_validated / seeded sources are permissive — operator
+//     intent always wins. Minimum lengths still apply (defends against
+//     accidental empty values).
+//
+//   - "auto" / "llm" / anything else (LLM-driven auto-learning) faces
+//     stricter rules:
+//       * prefix length >= 20 chars
+//       * prefix must be a literal prefix of OriginalLine
+//       * prefix must not be on the generic-token blocklist (ERROR, GET /, etc.)
+//       * regex must compile, must match OriginalLine, must be anchored with ^
+//       * regex must not appear on the generic-pattern blocklist
+//       * contains is forbidden (only human/seeded may use contains)
+//
+// The point of a strict validator is that "no" means no — there is no
+// fallback to a softer pattern type. Callers that previously relied on a
+// regex-fallback-to-prefix path (analyzer v0.19.1) must now learn the
+// exact-hash only and return.
 func (s *Store) validatePattern(p *LearnedPattern) error {
+	human := isHumanOrSeededSource(p.Source)
+
 	switch p.Type {
 	case PatternHash:
 		if len(p.Value) != 64 { // SHA-256 hex
@@ -329,8 +488,39 @@ func (s *Store) validatePattern(p *LearnedPattern) error {
 		}
 
 	case PatternPrefix:
-		if len(p.Value) < 5 {
-			return fmt.Errorf("prefix too short (%d chars), minimum 5", len(p.Value))
+		// Length floor: human/seeded 5, auto 20.
+		minLen := 20
+		if human {
+			minLen = 5
+		}
+		if len(p.Value) < minLen {
+			return fmt.Errorf("prefix too short (%d chars), minimum %d for source=%q", len(p.Value), minLen, p.Source)
+		}
+
+		// Auto-learned prefixes must literally prefix OriginalLine. This
+		// catches LLM hallucinations where the proposed prefix doesn't
+		// correspond to the line that was just classified.
+		if !human && p.OriginalLine != "" {
+			if !strings.HasPrefix(p.OriginalLine, p.Value) {
+				return fmt.Errorf("auto-learned prefix does not literally prefix the original line")
+			}
+		}
+
+		// Generic-token blocklist (auto only). The prefix is "stripped" —
+		// whitespace and <...> placeholders removed — and compared case-
+		// insensitively for equality against each blocked token. This catches
+		// "ERROR <TS> <PID>" (stripped to "ERROR") but allows specific
+		// extensions like "ERROR opening database connection at" (stripped
+		// to "ERRORopeningdatabaseconnectionat" — no match).
+		if !human {
+			stripped := stripPrefixForBlocklist(p.Value)
+			lowerStripped := strings.ToLower(stripped)
+			for _, banned := range genericPrefixBlocklist {
+				lowerBanned := strings.ToLower(strings.Join(strings.Fields(banned), ""))
+				if lowerStripped == lowerBanned {
+					return fmt.Errorf("auto-learned prefix is structurally just generic token %q", banned)
+				}
+			}
 		}
 
 	case PatternRegex:
@@ -340,21 +530,46 @@ func (s *Store) validatePattern(p *LearnedPattern) error {
 		}
 		p.compiled = compiled
 
-		// If we have the original line, verify the regex matches it
+		// Must match the line it was generated from
 		if p.OriginalLine != "" && !compiled.MatchString(p.OriginalLine) {
 			return fmt.Errorf("regex does not match the original line it was generated from")
 		}
 
-		// Reject overly broad patterns
+		// Reject overly broad literal patterns (always)
 		if p.Value == ".*" || p.Value == ".+" || p.Value == "^.*$" {
 			return fmt.Errorf("regex is too broad: %s", p.Value)
 		}
 
+		// Auto-learned regex must be anchored to ^.
+		// Human/seeded regex may be anywhere.
+		if !human {
+			if !strings.HasPrefix(p.Value, "^") {
+				return fmt.Errorf("auto-learned regex must be anchored with ^ (got %q)", p.Value)
+			}
+			// Reject patterns that begin with "^.*" (effectively unanchored)
+			// or that are too short to carry useful structure.
+			if strings.HasPrefix(p.Value, "^.*") {
+				return fmt.Errorf("auto-learned regex begins with ^.* — effectively unanchored")
+			}
+			if len(p.Value) < 10 {
+				return fmt.Errorf("auto-learned regex too short (%d chars), minimum 10", len(p.Value))
+			}
+		}
+
 	case PatternContains:
-		// Contains is the most dangerous — require minimum length
+		// Contains is the most dangerous type — substring match anywhere in
+		// the line. LLM auto-learning is FORBIDDEN from creating these.
+		// Human/seeded sources may create contains patterns (used by the
+		// curated malicious seeds in seeds.go).
+		if !human {
+			return fmt.Errorf("auto-learned contains patterns are forbidden (source=%q); use prefix or regex", p.Source)
+		}
 		if len(p.Value) < 10 {
 			return fmt.Errorf("contains pattern too short (%d chars), minimum 10 for safety", len(p.Value))
 		}
+
+	default:
+		return fmt.Errorf("unknown pattern type: %s", p.Type)
 	}
 
 	return nil
@@ -406,16 +621,19 @@ func (s *Store) SeedMaliciousPattern(pattern, reason string) {
 // GetStats returns a snapshot of current pattern store statistics.
 func (s *Store) GetStats() StatsSnapshot {
 	return StatsSnapshot{
-		TotalChecked: s.stats.TotalChecked.Load(),
-		HashHits:     s.stats.HashHits.Load(),
-		PrefixHits:   s.stats.PrefixHits.Load(),
-		RegexHits:    s.stats.RegexHits.Load(),
-		ContainsHits: s.stats.ContainsHits.Load(),
-		MaliciousHits:     s.stats.MaliciousHits.Load(),
-		AlertHits:    s.stats.AlertHits.Load(),
-		SuppressHits: s.stats.SuppressHits.Load(),
-		Misses:       s.stats.Misses.Load(),
-		PatternCount: s.stats.PatternCount.Load(),
+		TotalChecked:  s.stats.TotalChecked.Load(),
+		HashHits:      s.stats.HashHits.Load(),
+		PrefixHits:    s.stats.PrefixHits.Load(),
+		RegexHits:     s.stats.RegexHits.Load(),
+		ContainsHits:  s.stats.ContainsHits.Load(),
+		MaliciousHits: s.stats.MaliciousHits.Load(),
+		AlertHits:     s.stats.AlertHits.Load(),
+		SuppressHits:  s.stats.SuppressHits.Load(),
+		Misses:        s.stats.Misses.Load(),
+		PatternCount:  s.stats.PatternCount.Load(),
+
+		AutoLearnRejected: s.stats.AutoLearnRejected.Load(),
+		AutoLearnCapped:   s.stats.AutoLearnCapped.Load(),
 	}
 }
 
@@ -432,11 +650,11 @@ func (s *Store) ScopeCount() int {
 
 // ScopeSummary is a compact view of one scope for the dashboard.
 type ScopeSummary struct {
-	ScopeKey     string        `json:"scope_key"`
-	AllowCount   int           `json:"allow_count"`
-	MaliciousCount    int           `json:"malicious_count"`
-	AlertCount   int           `json:"alert_count"`
-	SuppressCount int          `json:"suppress_count"`
+	ScopeKey       string `json:"scope_key"`
+	AllowCount     int    `json:"allow_count"`
+	MaliciousCount int    `json:"malicious_count"`
+	AlertCount     int    `json:"alert_count"`
+	SuppressCount  int    `json:"suppress_count"`
 }
 
 // ListScopes returns a summary of every scope in the store.
@@ -448,20 +666,20 @@ func (s *Store) ListScopes() []ScopeSummary {
 
 	// Global scope
 	summaries = append(summaries, ScopeSummary{
-		ScopeKey:      "__global__",
-		AllowCount:    bucketSize(&s.global.Allow),
-		MaliciousCount:     bucketSize(&s.global.Malicious),
-		AlertCount:    bucketSize(&s.global.Alert),
-		SuppressCount: bucketSize(&s.global.Suppress),
+		ScopeKey:       "__global__",
+		AllowCount:     bucketSize(&s.global.Allow),
+		MaliciousCount: bucketSize(&s.global.Malicious),
+		AlertCount:     bucketSize(&s.global.Alert),
+		SuppressCount:  bucketSize(&s.global.Suppress),
 	})
 
 	for key, scope := range s.scopes {
 		summaries = append(summaries, ScopeSummary{
-			ScopeKey:      key,
-			AllowCount:    bucketSize(&scope.Allow),
-			MaliciousCount:     bucketSize(&scope.Malicious),
-			AlertCount:    bucketSize(&scope.Alert),
-			SuppressCount: bucketSize(&scope.Suppress),
+			ScopeKey:       key,
+			AllowCount:     bucketSize(&scope.Allow),
+			MaliciousCount: bucketSize(&scope.Malicious),
+			AlertCount:     bucketSize(&scope.Alert),
+			SuppressCount:  bucketSize(&scope.Suppress),
 		})
 	}
 	return summaries
