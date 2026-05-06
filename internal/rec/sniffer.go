@@ -195,6 +195,47 @@ var httpMethodPrefixes = [][]byte{
 	[]byte("TRACE "),
 }
 
+// httpResponsePrefixes covers HTTP/1.x response status lines on the wire.
+// Used by the port-learning fallback in processFrame to identify response
+// segments arriving on a port we don't yet know about. HTTP/2's binary
+// preface ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") is intentionally out of
+// scope — this sniffer is built for plaintext HTTP/1.x backends.
+var httpResponsePrefixes = [][]byte{
+	[]byte("HTTP/1.1 "),
+	[]byte("HTTP/1.0 "),
+}
+
+// hasHTTPRequestPrefix reports whether a TCP payload begins with a
+// recognized HTTP/1.x method token. Cheap fixed-prefix check; no parsing.
+// Used by the port-learning fallback in processFrame.
+func hasHTTPRequestPrefix(payload []byte) bool {
+	if len(payload) < 4 { // shortest method ("GET ")
+		return false
+	}
+	for _, p := range httpMethodPrefixes {
+		if bytes.HasPrefix(payload, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHTTPResponsePrefix reports whether a TCP payload begins with an
+// HTTP/1.x response status line ("HTTP/1.1 ", "HTTP/1.0 "). Cheap
+// fixed-prefix check; no parsing. Used by the port-learning fallback
+// in processFrame.
+func hasHTTPResponsePrefix(payload []byte) bool {
+	if len(payload) < 9 { // "HTTP/1.x "
+		return false
+	}
+	for _, p := range httpResponsePrefixes {
+		if bytes.HasPrefix(payload, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // inlineParseRequest extracts HTTP request metadata from a raw TCP payload.
 // Returns nil if the payload is not a valid HTTP request start.
 //
@@ -327,7 +368,12 @@ type sniffer struct {
 
 	// HTTP ports — request direction: dstPort in set. Response direction:
 	// srcPort in set.
-	knownPorts map[int]bool
+	//
+	// Backed by an atomic-snapshot registry that supports runtime port
+	// learning from payload prefixes (HTTP method tokens / "HTTP/1.x").
+	// Reads on the hot path are lock-free; writes are rare and
+	// copy-on-write under a mutex. See portregistry.go.
+	ports *portRegistry
 
 	// Bidirectional flow pairing state. Keyed by client→server direction.
 	// Request side uses the key as-is. Response side reverses its key.
@@ -373,18 +419,15 @@ type sniffer struct {
 	verbose bool
 }
 
-func newSniffer(buffer *RingBuffer, iface string, ports []int, maxBody int, vxlanPort uint16, verbose bool, reasm ReassemblyConfig, flowCfg FlowConfig) *sniffer {
-	knownPorts := make(map[int]bool, len(ports))
-	for _, p := range ports {
-		knownPorts[p] = true
-	}
+func newSniffer(buffer *RingBuffer, iface string, ports []int, learnedPortCap int, maxBody int, vxlanPort uint16, verbose bool, reasm ReassemblyConfig, flowCfg FlowConfig) *sniffer {
+	registry := newPortRegistry(ports, learnedPortCap)
 	if vxlanPort == 0 {
 		vxlanPort = DefaultVXLANPort
 	}
 	s := &sniffer{
 		buffer:           buffer,
 		iface:            iface,
-		knownPorts:       knownPorts,
+		ports:            registry,
 		flows:            make(map[streamKey]*flowPair),
 		maxBody:          maxBody,
 		vxlanPort:        vxlanPort,
@@ -550,8 +593,60 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 		return
 	}
 
-	isRequest := s.knownPorts[int(dstPort)]
-	isResponse := s.knownPorts[int(srcPort)]
+	isRequest := s.ports.has(int(dstPort))
+	isResponse := s.ports.has(int(srcPort))
+
+	// Payload-shape fallback (port learning).
+	//
+	// If neither port is in the registry, peek at the first few bytes of
+	// the payload. If the bytes identify the segment as an HTTP/1.x
+	// request line or response status line, learn the corresponding port
+	// (dst for requests, src for responses) and continue processing.
+	//
+	// This is what turns the registry from a hard correctness gate into
+	// a performance hint. The configured/Docker-discovered set still
+	// covers the common case lock-free; the learned path catches
+	// services on undeclared or non-default ports the first time real
+	// HTTP traffic flows.
+	//
+	// Bounded by portRegistry.cap. Safe even on hostile traffic: the
+	// peek is a fixed-size byte-prefix check and the cap stops bloat.
+	//
+	// CRITICAL (code review review): processing must be gated on registry
+	// admission (has(port)), NOT on learn()'s return value. learn()
+	// returns false in cases that should still be processed (race —
+	// another goroutine learned the same port a moment earlier) AND in
+	// cases that should NOT be processed (cap=0 disables learning,
+	// cap full refuses, invalid port). The post-learn has() check
+	// distinguishes these correctly: race-learned → has=true → proceed;
+	// cap-refused → has=false → drop. Earlier code unconditionally set
+	// isRequest/isResponse after learn() and let cap-refused packets
+	// through anyway, defeating the purpose of the cap as a safety
+	// boundary.
+	if !isRequest && !isResponse {
+		switch {
+		case hasHTTPRequestPrefix(payload):
+			port := int(dstPort)
+			if s.ports.learn(port) {
+				log.Printf("[rec:portlearn] Learned request port %d (HTTP method prefix)", port)
+			}
+			if !s.ports.has(port) {
+				return // refused (cap=0 / cap full / invalid) — not safe to process
+			}
+			isRequest = true
+		case hasHTTPResponsePrefix(payload):
+			port := int(srcPort)
+			if s.ports.learn(port) {
+				log.Printf("[rec:portlearn] Learned response port %d (HTTP/1.x status line)", port)
+			}
+			if !s.ports.has(port) {
+				return // refused — not safe to process
+			}
+			isResponse = true
+		default:
+			return // not HTTP-shaped, nothing to learn
+		}
+	}
 
 	if isRequest {
 		// Request direction: inline parse, synchronous registration.

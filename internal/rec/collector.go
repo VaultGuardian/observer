@@ -103,6 +103,19 @@ type CollectorConfig struct {
 	// Set REC_VERBOSE=true for debugging packet capture issues.
 	Verbose bool
 
+	// LearnedPortCap bounds runtime port learning by the sniffer.
+	//
+	// When a TCP segment arrives on a port not in Ports, the sniffer
+	// peeks at the payload — if it looks like an HTTP/1.x request line
+	// or response status line, the port is learned and used for
+	// subsequent traffic. This catches backends on non-default ports
+	// (e.g. CapRover's captain-captain on 3000) without operator config.
+	//
+	// Bounded to prevent unbounded growth from pathological traffic.
+	// Default 64 is comfortably more than any realistic deployment
+	// needs. Set to 0 to disable runtime learning entirely.
+	LearnedPortCap int
+
 	// Reassembly configures the response-only TCP reassembly path (v0.42.7+).
 	Reassembly ReassemblyConfig
 
@@ -113,15 +126,16 @@ type CollectorConfig struct {
 // DefaultCollectorConfig returns the design team-agreed defaults.
 func DefaultCollectorConfig() CollectorConfig {
 	return CollectorConfig{
-		Enabled:      false, // opt-in, not surprise packet capture
-		Interface:    "",
-		Ports:        []int{80, 8080},
-		Buffer:       DefaultBufferConfig(),
-		VXLANPort:    0, // 0 = auto-detect from Docker API
-		DockerSocket: "/var/run/docker.sock",
-		NSContainer:  "", // empty = host namespace
-		Reassembly:   DefaultReassemblyConfig(),
-		Flow:         DefaultFlowConfig(),
+		Enabled:        false, // opt-in, not surprise packet capture
+		Interface:      "",
+		Ports:          []int{80, 8080},
+		Buffer:         DefaultBufferConfig(),
+		VXLANPort:      0, // 0 = auto-detect from Docker API
+		DockerSocket:   "/var/run/docker.sock",
+		NSContainer:    "", // empty = host namespace
+		LearnedPortCap: 64, // bounded runtime port learning
+		Reassembly:     DefaultReassemblyConfig(),
+		Flow:           DefaultFlowConfig(),
 	}
 }
 
@@ -158,11 +172,11 @@ type noOpCollector struct {
 	reason EvidenceStatus
 }
 
-func (n *noOpCollector) Start(ctx context.Context) error                            { return nil }
-func (n *noOpCollector) Enabled() bool                                              { return false }
-func (n *noOpCollector) Stats() RECStats                                            { return RECStats{} }
+func (n *noOpCollector) Start(ctx context.Context) error                                 { return nil }
+func (n *noOpCollector) Enabled() bool                                                   { return false }
+func (n *noOpCollector) Stats() RECStats                                                 { return RECStats{} }
 func (n *noOpCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {}
-func (n *noOpCollector) SetVIPCallback(fn func(correlationKey string))               {}
+func (n *noOpCollector) SetVIPCallback(fn func(correlationKey string))                   {}
 
 func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 	return &Evidence{
@@ -188,7 +202,7 @@ func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 //      for the next poll cycle.
 
 const (
-	vipMaxEntries = 200           // max pending VIP pins
+	vipMaxEntries = 200               // max pending VIP pins
 	vipTTL        = 120 * time.Second // 120s > coordinator's 5s window — catches late evidence
 )
 
@@ -222,15 +236,15 @@ type vipPin struct {
 type liveCollector struct {
 	config  CollectorConfig
 	buffer  *RingBuffer
-	sniffer *sniffer      // stored for stats access
-	running atomic.Bool   // atomic — Start() and Lookup() can race (code review's fix)
+	sniffer *sniffer    // stored for stats access
+	running atomic.Bool // atomic — Start() and Lookup() can race (code review's fix)
 
 	// Fix 1: VIP lane for malicious evidence
-	vipMu        sync.Mutex
-	vipPins      map[string]*vipPin         // eventID → pending match criteria
-	vipEvidence  map[string]CapturedResponse // eventID → matched response (protected)
-	onVIPMatch   func(correlationKey string)  // push callback → coordinator
-	vipMatches   int64                        // telemetry counter
+	vipMu       sync.Mutex
+	vipPins     map[string]*vipPin          // eventID → pending match criteria
+	vipEvidence map[string]CapturedResponse // eventID → matched response (protected)
+	onVIPMatch  func(correlationKey string) // push callback → coordinator
+	vipMatches  int64                       // telemetry counter
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
@@ -251,7 +265,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	iface := lc.config.Interface
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.LearnedPortCap, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
 
 	// Fix 1: Wire sniffer capture callback for VIP lane.
 	// Every successfully parsed response fires this callback.
@@ -319,11 +333,12 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	if ifaceDesc == "" {
 		ifaceDesc = "(all interfaces)"
 	}
-	log.Printf("[rec] Response Evidence Capture started — capture=%s interface=%s ports=%v vxlanPort=%d "+
+	log.Printf("[rec] Response Evidence Capture started — capture=%s interface=%s ports=%v learnedPortCap=%d vxlanPort=%d "+
 		"buffer=[maxEntries=%d maxBytes=%d maxAge=%s maxBody=%d]",
 		captureMode,
 		ifaceDesc,
 		lc.config.Ports,
+		lc.config.LearnedPortCap,
 		vxlanPort,
 		lc.config.Buffer.MaxEntries,
 		lc.config.Buffer.MaxTotalBytes,
@@ -476,6 +491,17 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.FlowEvictions = atomic.LoadInt64(&lc.sniffer.flowEvictions)
 
 		stats.FeedHTTP = atomic.LoadInt64(&lc.sniffer.feedHTTP)
+
+		// Port registry telemetry (v0.47.1)
+		if lc.sniffer.ports != nil {
+			ps := lc.sniffer.ports.stats()
+			stats.PortConfiguredCount = ps.ConfiguredCount
+			stats.PortLearnedCount = ps.LearnedCount
+			stats.PortLearnAttempts = ps.LearnedAttempts
+			stats.PortLearnAdded = ps.LearnedAdded
+			stats.PortLearnRefused = ps.LearnedRefused
+			stats.PortLearnCap = ps.LearnCap
+		}
 
 		// Dashboard backward compat
 		stats.HTTPRequests = stats.InlineRequests

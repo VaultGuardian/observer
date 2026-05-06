@@ -96,6 +96,8 @@ func main() {
 	recCfg.VXLANPort = cfg.RECVXLANPort
 	recCfg.NSContainer = cfg.RECNSContainer
 	recCfg.Verbose = cfg.RECVerbose
+	recCfg.Ports = cfg.RECPorts
+	recCfg.LearnedPortCap = cfg.RECLearnedPortCap
 	recCfg.Reassembly = rec.ReassemblyConfig{
 		MaxBody:                 cfg.RECReassemblyMaxBody,
 		StreamTTL:               cfg.RECReassemblyStreamTTL,
@@ -439,8 +441,9 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 // coordinator to check if REC evidence can downgrade a pending alert.
 //
 // Two downgrade paths (design consensus, 2026-03-25):
-//   Path 1 — Transport-only downgrade (403/404/405/410)
-//   Path 2 — Body-aware re-classification (200, 3xx, 5xx)
+//
+//	Path 1 — Transport-only downgrade (403/404/405/410)
+//	Path 2 — Body-aware re-classification (200, 3xx, 5xx)
 //
 // =============================================================================
 // PATH SOURCE — design consensus P0 fix (2026-05)
@@ -1106,6 +1109,9 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				log.Printf("[observer] REC inline: requests=%d seq_dedup=%d body_skip=%d feed_http=%d",
 					rStats.InlineRequests, rStats.InlineDuplicateDrops,
 					rStats.InlineBodySkips, rStats.FeedHTTP)
+				log.Printf("[observer] REC ports: configured=%d learned=%d cap=%d attempts=%d added=%d refused=%d",
+					rStats.PortConfiguredCount, rStats.PortLearnedCount, rStats.PortLearnCap,
+					rStats.PortLearnAttempts, rStats.PortLearnAdded, rStats.PortLearnRefused)
 			}
 
 			caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed := coord.CatchAllStats()

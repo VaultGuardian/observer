@@ -20,11 +20,26 @@ type Config struct {
 	ExcludeContainers map[string]bool
 
 	// Response Evidence Capture
-	RECEnabled    bool
-	RECInterface  string
-	RECVXLANPort  uint16 // 0 = auto-detect
+	RECEnabled     bool
+	RECInterface   string
+	RECVXLANPort   uint16 // 0 = auto-detect
 	RECNSContainer string
 	RECVerbose     bool
+
+	// REC port discovery.
+	//
+	// RECPorts seeds the port set REC treats as HTTP-bearing. The sniffer
+	// also learns ports at runtime from payload prefixes, so this is a
+	// hint, not a hard gate. Default {80, 8080} covers the common case
+	// (nginx → backend on 80). Override with REC_PORTS=80,8080,3000,...
+	// to seed non-default backends explicitly.
+	RECPorts []int
+
+	// RECLearnedPortCap bounds runtime port learning. Once this many
+	// ports have been learned beyond the seeded set, additional learns
+	// are silently refused. Set REC_LEARNED_PORT_CAP=0 to disable
+	// runtime learning entirely.
+	RECLearnedPortCap int
 
 	// REC reassembly tuning (response-only as of v0.42.7)
 	RECReassemblyMaxBody                 int
@@ -53,30 +68,33 @@ type Config struct {
 	Tier2Effort string // "low", "medium", "high" — default "medium"
 
 	// Dashboard API
-	DashboardPort int
-	DashboardKeyFile string
-	DashboardBindAddr string
+	DashboardPort           int
+	DashboardKeyFile        string
+	DashboardBindAddr       string
 	DashboardAllowedOrigins []string
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
 func LoadConfig() Config {
 	cfg := Config{
-		DockerSocket:     getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
-		DataDir:          getEnv("DATA_DIR", "/data"),
-		LLMURL:           getEnv("LLM_URL", "http://llm:11434"),
-		LLMModel:         getEnv("LLM_MODEL", "qwen2.5:7b"),
-		LLMAPIKey:        getEnv("LLM_API_KEY", ""),
-		SelfID:           getEnv("HOSTNAME", ""),
-		RECEnabled:       getEnv("REC_ENABLED", "") == "true",
-		RECInterface:     getEnv("REC_INTERFACE", ""),
-		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
-		RECVerbose:       getEnv("REC_VERBOSE", "") == "true",
-		MaxConcurrentLLM: getEnvInt("LLM_SLOTS", 4),
-		Tier1Effort:      getEnv("LLM_TIER1_EFFORT", "low"),
-		Tier2Effort:      getEnv("LLM_TIER2_EFFORT", "medium"),
-		DashboardPort:    9090,
-		DashboardKeyFile: getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+		DockerSocket:   getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
+		DataDir:        getEnv("DATA_DIR", "/data"),
+		LLMURL:         getEnv("LLM_URL", "http://llm:11434"),
+		LLMModel:       getEnv("LLM_MODEL", "qwen2.5:7b"),
+		LLMAPIKey:      getEnv("LLM_API_KEY", ""),
+		SelfID:         getEnv("HOSTNAME", ""),
+		RECEnabled:     getEnv("REC_ENABLED", "") == "true",
+		RECInterface:   getEnv("REC_INTERFACE", ""),
+		RECNSContainer: getEnv("REC_NS_CONTAINER", ""),
+		RECVerbose:     getEnv("REC_VERBOSE", "") == "true",
+		// REC_LEARNED_PORT_CAP allows zero (= disable learning).
+		// Resolved below since getEnvInt rejects non-positive values.
+		RECLearnedPortCap: 64,
+		MaxConcurrentLLM:  getEnvInt("LLM_SLOTS", 4),
+		Tier1Effort:       getEnv("LLM_TIER1_EFFORT", "low"),
+		Tier2Effort:       getEnv("LLM_TIER2_EFFORT", "medium"),
+		DashboardPort:     9090,
+		DashboardKeyFile:  getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
 		DashboardBindAddr: getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
 		// REC reassembly tuning — response-only, bounds are tunable.
@@ -131,6 +149,51 @@ func LoadConfig() Config {
 			cfg.RECVXLANPort = uint16(port)
 		} else {
 			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q — using auto-detect", portStr)
+		}
+	}
+
+	// Parse REC HTTP port set.
+	//
+	// Default {80, 8080} matches the historical hardcoded behavior.
+	// Operators with backends on non-default ports (e.g. CapRover's
+	// captain-captain on 3000, app servers on 5000/8000) can seed
+	// the registry explicitly: REC_PORTS=80,8080,3000.
+	//
+	// The sniffer learns additional ports at runtime from payload
+	// prefixes, so this list is a seed/hint — getting it exactly
+	// right is not required for correctness.
+	cfg.RECPorts = []int{80, 8080}
+	if raw := getEnv("REC_PORTS", ""); raw != "" {
+		var parsed []int
+		var bad []string
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			n, err := strconv.Atoi(p)
+			if err != nil || n <= 0 || n > 65535 {
+				bad = append(bad, p)
+				continue
+			}
+			parsed = append(parsed, n)
+		}
+		if len(parsed) > 0 {
+			cfg.RECPorts = parsed
+			log.Printf("[observer] REC_PORTS override: %v", cfg.RECPorts)
+		}
+		if len(bad) > 0 {
+			log.Printf("[observer] REC_PORTS skipped invalid entries: %v", bad)
+		}
+	}
+
+	// Parse REC learned-port cap. Allows zero (= disable runtime
+	// learning entirely; configured set becomes a hard gate again).
+	if raw := getEnv("REC_LEARNED_PORT_CAP", ""); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			cfg.RECLearnedPortCap = n
+		} else {
+			log.Printf("[observer] Invalid REC_LEARNED_PORT_CAP=%q — using default %d", raw, cfg.RECLearnedPortCap)
 		}
 	}
 

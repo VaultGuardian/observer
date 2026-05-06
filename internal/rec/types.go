@@ -14,13 +14,13 @@ import (
 type EvidenceStatus string
 
 const (
-	EvidenceAvailableHighConfidence      EvidenceStatus = "available_high_confidence"
-	EvidenceAvailableLowConfidence       EvidenceStatus = "available_low_confidence"
+	EvidenceAvailableHighConfidence       EvidenceStatus = "available_high_confidence"
+	EvidenceAvailableLowConfidence        EvidenceStatus = "available_low_confidence"
 	EvidenceNotAvailableCollectorDisabled EvidenceStatus = "not_available_collector_disabled"
-	EvidenceNotAvailableNoMatch          EvidenceStatus = "not_available_no_match"
-	EvidenceNotAvailableEvicted          EvidenceStatus = "not_available_evicted"
-	EvidenceNotAvailableEdgeGenerated    EvidenceStatus = "not_available_edge_generated"
-	EvidenceNotAvailableEncryptedPath    EvidenceStatus = "not_available_encrypted_path"
+	EvidenceNotAvailableNoMatch           EvidenceStatus = "not_available_no_match"
+	EvidenceNotAvailableEvicted           EvidenceStatus = "not_available_evicted"
+	EvidenceNotAvailableEdgeGenerated     EvidenceStatus = "not_available_edge_generated"
+	EvidenceNotAvailableEncryptedPath     EvidenceStatus = "not_available_encrypted_path"
 )
 
 // =============================================================================
@@ -89,8 +89,8 @@ func (d *DisclosureAnalysis) RedactedPreview() string {
 // =============================================================================
 
 type Evidence struct {
-	Status                EvidenceStatus `json:"status"`
-	CorrelationConfidence Confidence     `json:"correlation_confidence"`
+	Status                EvidenceStatus      `json:"status"`
+	CorrelationConfidence Confidence          `json:"correlation_confidence"`
 	Transport             *TransportEvidence  `json:"transport,omitempty"`
 	Disclosure            *DisclosureAnalysis `json:"disclosure,omitempty"`
 	SafeBodyPreview       string              `json:"safe_body_preview,omitempty"`
@@ -162,7 +162,7 @@ type RECStats struct {
 	ReassemblyStreamsActive   int64
 	ReassemblyStreamsTotal    int64
 	ReassemblyStreamsTimedOut int64
-	ReassemblyStreamDrops    int64 // MaxActiveStreams cap hit
+	ReassemblyStreamDrops     int64 // MaxActiveStreams cap hit
 	ReassemblyResponses       int64
 	ReassemblyParseErrors     int64
 
@@ -182,6 +182,18 @@ type RECStats struct {
 
 	FeedHTTP   int64
 	VIPMatches int64
+
+	// Port registry telemetry (v0.47.1).
+	// Useful for debugging "why isn't REC seeing this port?" — operator
+	// can confirm the port made it into the configured set, or watch
+	// the learn counter rise as new HTTP-shaped traffic discovers ports
+	// at runtime.
+	PortConfiguredCount int   // ports seeded from CollectorConfig.Ports
+	PortLearnedCount    int   // ports added at runtime from payload prefix detection
+	PortLearnAttempts   int64 // total times learn() was called (incl. duplicates and refusals)
+	PortLearnAdded      int64 // successful learns (subset of attempts)
+	PortLearnRefused    int64 // refused due to cap, cap=0, or invalid port
+	PortLearnCap        int   // configured upper bound on PortLearnedCount
 }
 
 // =============================================================================
