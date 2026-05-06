@@ -191,8 +191,41 @@ func (s *httpStream) flowKey() streamKey {
 }
 
 // run consumes the reassembled response byte stream. Lives in its own goroutine.
+//
+// =============================================================================
+// v0.47.2 hotfix — symmetric read-side close-race recover
+// =============================================================================
+// gopacket's tcpreader.ReaderStream.Read sends on its internal `next` channel
+// as part of its read protocol (signaling "ready for more data"). If
+// ReassemblyComplete fires while Read is mid-iteration — either via the
+// streamTTL deadline below OR via FlushOlderThan from the assembler — the
+// `next` channel is closed and the next send panics:
+//
+//   panic: send on closed channel
+//   gopacket/tcpassembly/tcpreader.(*ReaderStream).Read
+//     reader.go:178
+//   bufio.(*Reader).fill
+//   net/http.ReadResponse
+//   internal/rec.(*httpStream).runResponse  stream.go:228
+//   internal/rec.(*httpStream).run          stream.go:212
+//
+// safeReaderStream.Reassembled already has a `defer recover()` for the
+// assembler-side version of this race (v0.43.1 fix). This is the symmetric
+// READ-side version — same shape, opposite goroutine, same recovery pattern.
+// The v0.43.1 fix only guarded one side; production showed twice in 12h
+// that the read side needed it too.
+// =============================================================================
 func (s *httpStream) run() {
 	defer atomic.AddInt64(&s.sniffer.reassemblyStreamsActive, -1)
+
+	// Read-side close-race recover. Counter reuses reassemblyParseErrors;
+	// distinguishable in logs by the "Read close-race panic" tag.
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&s.sniffer.reassemblyParseErrors, 1)
+			log.Printf("[rec:reassembly] recovered from Read close-race panic: %v", r)
+		}
+	}()
 
 	// Landmine 3: deadline-triggered EOF.
 	// CRITICAL: ReassemblyComplete can also be called by FlushOlderThan
