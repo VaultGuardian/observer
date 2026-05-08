@@ -86,10 +86,10 @@ type CapturedResponse struct {
 	// HTTP status code. Used as a HARD FILTER in correlation.
 	// A 404 and a 200 for the same path are definitively different
 	// transactions. ( + code review agreed: not a soft downgrade.)
-	StatusCode    int
-	ContentType   string
-	ContentLength int64
-	BodyPreview   []byte // truncated to MaxBodyBytes
+	StatusCode      int
+	ContentType     string
+	ContentLength   int64
+	BodyPreview     []byte // truncated to MaxBodyBytes
 	BodyPreviewHash string // SHA-256 of captured body PREVIEW (not full body)
 
 	// Source container/service that generated the response (if identifiable)
@@ -192,7 +192,11 @@ type LookupRequest struct {
 //   - Path (raw, including query string)
 //   - StatusCode (if > 0 in request — a 404 and 200 are NOT the same transaction)
 //   - Host (if non-empty on both sides)
-//   - SourceContainer (if non-empty on both sides)
+//
+// Section 3 / Finding 10: SourceContainer is no longer filtered on. The
+// AF_PACKET sniffer never populates entry.SourceContainer (it sees wire
+// packets, not container attribution), so the filter was always a no-op.
+// req.SourceContainer is still accepted by callers but currently unused.
 //
 // Returns all matching candidates — the caller decides confidence based on count
 // and uses UserAgent as a tie-breaker if needed.
@@ -270,11 +274,12 @@ func (rb *RingBuffer) Lookup(req LookupRequest) []CapturedResponse {
 			continue
 		}
 
-		// Source container — hard filter if identifiable on both sides
-		if req.SourceContainer != "" && entry.SourceContainer != "" &&
-			entry.SourceContainer != req.SourceContainer {
-			continue
-		}
+		// Section 3 / Finding 10: the SourceContainer filter that used to
+		// live here was dead code — the AF_PACKET sniffer never populates
+		// CapturedResponse.SourceContainer (it sees wire packets, not
+		// container attribution), so the inner condition was always false.
+		// Removed entirely. If we ever wire container attribution at the
+		// packet layer, restore the filter and a real assignment together.
 
 		candidates = append(candidates, entry)
 	}
@@ -314,6 +319,7 @@ func (rb *RingBuffer) evictOldest() {
 	rb.entries[oldestIdx] = emptyResponse // zero for GC (code review's fix)
 	rb.count--
 }
+
 // orphanBytesCompatible decides whether an orphan response (no Method/Path)
 // could plausibly be the response to a request whose access log says
 // expectedBytes. Used as a sanity gate to prevent tiny healthcheck bodies

@@ -389,6 +389,21 @@ func (s *Store) migrate() error {
 				  ALTER TABLE findings ADD COLUMN matched_pattern_bucket TEXT DEFAULT '';
 				  ALTER TABLE findings ADD COLUMN matched_pattern_value TEXT DEFAULT '';`,
 		},
+		{
+			// Section 3 / Landmine A (v1.0 hardening): the design review catch.
+			// CheckFallbackByBytes was suppressing ANY response under 10KB on
+			// a (host, method, status) tuple if any verified entry existed,
+			// regardless of the verified entry's actual response size. We now
+			// store response_bytes at verification time and require log
+			// responseBytes to be byte-similar to it before suppressing.
+			//
+			// Existing rows get response_bytes=0 by default. The runtime
+			// fallback skips byte-compatible matching when the stored value
+			// is <=0 (conservative — re-verifies before suppressing).
+			version: 11,
+			desc:    "Section 3 / Landmine A: response_bytes on catchall_verified_v2 for byte-similarity check",
+			sql:     `ALTER TABLE catchall_verified_v2 ADD COLUMN response_bytes INTEGER DEFAULT 0;`,
+		},
 	}
 
 	for _, m := range migrations {

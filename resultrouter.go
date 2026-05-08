@@ -85,15 +85,15 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 // =============================================================================
 // We compute TWO HTTP identities here:
 //
-//   normalized identity (parseNormalizedLine on evt.NormalizedLine)
-//     → drives coordinator correlation key. Numbers are collapsed to <NUM>
-//       so nginx and backend logs for the same request join the same huddle.
+//	normalized identity (parseNormalizedLine on evt.NormalizedLine)
+//	  → drives coordinator correlation key. Numbers are collapsed to <NUM>
+//	    so nginx and backend logs for the same request join the same huddle.
 //
-//   raw identity (parseRawHTTPLine on evt.Line)
-//     → drives REC evidence lookup, PinVIP, alertBuilder closure, and the
-//       HTTPPath stored on the PendingAlert / Finding records. REC's
-//       AF_PACKET sniffer captures the literal wire path; matching against
-//       a <NUM>-substituted path fails for any URL with 4+ digit numbers.
+//	raw identity (parseRawHTTPLine on evt.Line)
+//	  → drives REC evidence lookup, PinVIP, alertBuilder closure, and the
+//	    HTTPPath stored on the PendingAlert / Finding records. REC's
+//	    AF_PACKET sniffer captures the literal wire path; matching against
+//	    a <NUM>-substituted path fails for any URL with 4+ digit numbers.
 //
 // Method, status, and host don't differ between normalized and raw, so we
 // take them from whichever parse succeeded (raw preferred, normalized as
@@ -292,9 +292,17 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 
 	// --- HTTP alerts: route through coordinator for evidence huddle ---
 	if isHTTP && r.collector.Enabled() {
-		// Coordinator key uses NORMALIZED+canonicalized path so nginx (raw)
-		// and backend (<NUM>) events for the same request join the same huddle.
-		correlationKey := fmt.Sprintf("%s|%s|%d", method, canonicalPath(normPath), statusCode)
+		// Section 3 / Finding 2 fix: include host in the correlation key.
+		// Two services on the same nginx hitting the same path/status
+		// must NOT join the same investigation huddle. extractPath() in
+		// the coordinator is gone — the coordinator reads pending.HTTPPath
+		// directly, so the key format is purely an opaque identity token.
+		// Hostless logs use a stable placeholder so they still correlate.
+		hostKey := host
+		if hostKey == "" {
+			hostKey = "<unknown-host>"
+		}
+		correlationKey := fmt.Sprintf("%s|%s|%s|%d", hostKey, method, canonicalPath(normPath), statusCode)
 
 		// Fix 1: Pin VIP evidence for malicious events.
 		// The collector stores match criteria in a protected map that
@@ -320,18 +328,22 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		evtCopy := evt
 		resultCopy := result
 		lineCopy := line
-		recPathCopy := rawPath
 
-		alertBuilder := func() interface{} {
-			evidence := r.collector.Lookup(rec.LookupRequest{
-				Method:          method,
-				Path:            recPathCopy,
-				SourceContainer: evtCopy.SourceName,
-				StatusCode:      statusCode,
-				Timestamp:       evtCopy.Timestamp,
-				Window:          5 * time.Second,
-				ExpectedBytes:   respBytes,
-			})
+		// Section 3 / Finding 7 fix: alertBuilder now receives evidence as
+		// a parameter rather than doing a fresh REC lookup at dispatch time.
+		// The previous version (a) duplicated the evidence query the
+		// coordinator already performed and (b) omitted Host from its
+		// LookupRequest, so the dispatch-time enrichment used different
+		// criteria than the coordinator's host-aware decision. Now we just
+		// adapt whatever evidence the coordinator attached to the
+		// FinalAlert into a notifier.Alert.
+		alertBuilder := func(evidence interface{}) interface{} {
+			var typed *rec.Evidence
+			if evidence != nil {
+				if v, ok := evidence.(*rec.Evidence); ok {
+					typed = v
+				}
+			}
 			return notifier.Alert{
 				EventID:        evtCopy.ID,
 				Severity:       notifSeverity,
@@ -344,7 +356,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 				Classification: resultCopy.LLMClassification,
 				Confidence:     resultCopy.LLMConfidence,
 				Timestamp:      evtCopy.Timestamp,
-				Evidence:       evidence,
+				Evidence:       typed,
 			}
 		}
 

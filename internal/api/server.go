@@ -57,11 +57,11 @@ type ServerConfig struct {
 
 // Server is the dashboard API server.
 type Server struct {
-	config   ServerConfig
-	token    string
-	store    *store.Store
-	patterns *patternstore.Store
-	analyzer *analyzer.Analyzer
+	config    ServerConfig
+	token     string
+	store     *store.Store
+	patterns  *patternstore.Store
+	analyzer  *analyzer.Analyzer
 	collector rec.EvidenceCollector
 
 	// Pre-computed CORS origin lookup for O(1) allowlist checks.
@@ -70,8 +70,13 @@ type Server struct {
 	// Human correction callbacks — narrow interfaces to avoid coupling
 	// the API package to coordinator/reclassCache internals.
 	// Set via SetCorrectionCallbacks() after construction.
+	//
+	// Section 3 / Landmine A: onSeedCatchAll now also takes responseBytes
+	// so the live coordinator entry can participate in the byte-aware
+	// Phase 3 fallback. Pre-existing rules with response_bytes=0 in the
+	// DB are skipped by the fallback path until re-verified.
 	onInvalidateReclassCache func(bodyHash string)
-	onSeedCatchAll           func(host, method string, status int, bodyHash, reason string)
+	onSeedCatchAll           func(host, method string, status int, bodyHash, reason string, responseBytes int64)
 }
 
 // NewServer creates the API server and loads (or generates) the auth token.
@@ -115,9 +120,12 @@ func NewServer(
 
 // SetCorrectionCallbacks wires the human correction system to the coordinator
 // and reclass cache. Called from main.go after both are initialized.
+//
+// Section 3 / Landmine A: seedCatchAll now takes responseBytes so the
+// byte-aware Phase 3 fallback works for human-confirmed catch-alls too.
 func (s *Server) SetCorrectionCallbacks(
 	invalidateCache func(bodyHash string),
-	seedCatchAll func(host, method string, status int, bodyHash, reason string),
+	seedCatchAll func(host, method string, status int, bodyHash, reason string, responseBytes int64),
 ) {
 	s.onInvalidateReclassCache = invalidateCache
 	s.onSeedCatchAll = seedCatchAll
@@ -415,11 +423,11 @@ func (s *Server) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	// Scope provided but no verdict → return all four buckets
 	if verdictStr == "" {
 		result := map[string]interface{}{
-			"scope":    scopeKey,
-			"allow":    s.patterns.ListPatterns(scopeKey, patternstore.VerdictAllow),
-			"malicious":     s.patterns.ListPatterns(scopeKey, patternstore.VerdictMalicious),
-			"alert":    s.patterns.ListPatterns(scopeKey, patternstore.VerdictAlert),
-			"suppress": s.patterns.ListPatterns(scopeKey, patternstore.VerdictSuppress),
+			"scope":     scopeKey,
+			"allow":     s.patterns.ListPatterns(scopeKey, patternstore.VerdictAllow),
+			"malicious": s.patterns.ListPatterns(scopeKey, patternstore.VerdictMalicious),
+			"alert":     s.patterns.ListPatterns(scopeKey, patternstore.VerdictAlert),
+			"suppress":  s.patterns.ListPatterns(scopeKey, patternstore.VerdictSuppress),
 		}
 		jsonOK(w, result)
 		return
@@ -999,6 +1007,11 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 	}
 
 	// Step 1: Save to catchall_verified_v2 (persistent)
+	//
+	// Section 3 / Landmine A: persist finding.ResponseBytes so the byte-aware
+	// Phase 3 fallback can use it. If the finding has no recorded
+	// response_bytes (legacy or non-HTTP case), we save 0 — fallback will
+	// skip until something re-verifies with a real measurement.
 	err := s.store.SaveVerifiedCatchAll(ctx, &store.CatchAllRule{
 		Host:                host,
 		HTTPMethod:          method,
@@ -1008,6 +1021,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 		ContentType:         contentType,
 		VerificationVerdict: "benign",
 		VerificationReason:  humanReason,
+		ResponseBytes:       finding.ResponseBytes,
 	})
 	if err != nil {
 		jsonError(w, "failed to save catch-all rule: "+err.Error(), http.StatusInternalServerError)
@@ -1016,7 +1030,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 
 	// Step 2: Seed into live coordinator (active immediately, no restart)
 	if s.onSeedCatchAll != nil {
-		s.onSeedCatchAll(host, method, status, bodyHash, humanReason)
+		s.onSeedCatchAll(host, method, status, bodyHash, humanReason, finding.ResponseBytes)
 	}
 
 	// Step 3: Invalidate reclass cache.
@@ -1094,7 +1108,12 @@ func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Cont
 	}
 
 	log.Printf("[correction:confirm] scope=%s hash=%.16s event=%s decision=%d",
-		sourceScope, finding.NormalizedHash, finding.EventID, func() int64 { if decision != nil { return decision.ID }; return 0 }())
+		sourceScope, finding.NormalizedHash, finding.EventID, func() int64 {
+			if decision != nil {
+				return decision.ID
+			}
+			return 0
+		}())
 
 	jsonOK(w, map[string]string{"status": "ok", "type": "confirm"})
 }

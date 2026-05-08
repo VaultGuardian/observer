@@ -199,6 +199,11 @@ func main() {
 	// The API server needs to reach the coordinator's catch-all tracker and
 	// the reclass cache for human corrections. We pass narrow callbacks
 	// instead of the full objects to avoid coupling. (code review suggestion.)
+	//
+	// Section 3 / Landmine A: seedCatchAll now takes responseBytes from the
+	// finding. Human-confirmed entries with responseBytes=0 will be skipped
+	// by the byte-aware fallback (conservative — they'll still match exact
+	// body-hash via Check(), just not the byte-similarity Phase 3 path).
 	if apiServer != nil {
 		apiServer.SetCorrectionCallbacks(
 			// Invalidate reclass cache entry
@@ -206,14 +211,14 @@ func main() {
 				reclassCache.delete(bodyHash)
 			},
 			// Seed a verified catch-all fingerprint (live, no restart needed)
-			func(host, method string, status int, bodyHash, reason string) {
+			func(host, method string, status int, bodyHash, reason string, responseBytes int64) {
 				fps := []coordinator.CatchAllFingerprint{{
 					Host:            host,
 					Method:          method,
 					StatusCode:      status,
 					BodyPreviewHash: bodyHash,
 				}}
-				alertCoordinator.CatchAllTracker().SeedVerified(fps, []string{reason})
+				alertCoordinator.CatchAllTracker().SeedVerified(fps, []string{reason}, []int64{responseBytes})
 			},
 		)
 	}
@@ -317,11 +322,39 @@ func main() {
 // Coordinator Callbacks
 // =============================================================================
 
+// evidenceFields extracts the persistence fields from a coordinator-attached
+// rec.Evidence value. Returns zero values when evidence is missing or the
+// transport layer is absent. Used to populate finding rows so the dashboard
+// correction workflow has body hash + transport metadata to work with.
+//
+// Section 3 follow-up (code review review item #4): coordinator findings used to
+// drop these fields, leaving the correction endpoint to fall back to the
+// LLMDecision table — which doesn't exist for every finding, especially
+// catch-all auto-downgrades that never invoke the LLM.
+func evidenceFields(e interface{}) (status string, code int, contentType string, bodyHash string, mode string) {
+	ev, ok := e.(*rec.Evidence)
+	if !ok || ev == nil {
+		return "", 0, "", "", ""
+	}
+	status = string(ev.Status)
+	if ev.Transport != nil {
+		code = ev.Transport.StatusCode
+		contentType = ev.Transport.ContentType
+		bodyHash = ev.Transport.BodyPreviewHash
+		mode = ev.Transport.CaptureMode
+	}
+	return
+}
+
 func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordinator.DispatchFunc {
 	return func(alert coordinator.FinalAlert) {
+		// Extract evidence fields once per dispatch — used by all three
+		// finding-write branches below.
+		evStatus, evCode, evCT, evHash, evMode := evidenceFields(alert.Evidence)
+
 		if alert.Downgraded {
 			log.Printf("[DOWNGRADED] EventID=%s key=%s events=%d Original→recon_failed Reason=%s",
-				alert.EventID, alert.ScopeKey, alert.EventCount, alert.DowngradeReason)
+				alert.EventID, alert.Key, alert.EventCount, alert.DowngradeReason)
 			log.Printf("[INFO] EventID=%s Source=%s OriginalReason=%s DowngradedReason=%s %s Line=%s",
 				alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
@@ -329,43 +362,51 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			// Fix 4: Set resolution status on downgraded findings
 			now := time.Now()
 			db.SubmitFinding(&store.Finding{
-				EventID:           alert.EventID,
-				Timestamp:         alert.Timestamp,
-				SourceType:        alert.SourceType,
-				SourceName:        alert.ScopeKey,
-				DestHost:          alert.Host,
-				HTTPMethod:        alert.HTTPMethod,
-				HTTPPath:          alert.HTTPPath,
-				HTTPStatus:        alert.StatusCode,
-				ResponseBytes:     alert.ResponseBytes,
-				Verdict:           "downgraded",
-				Classification:    alert.Severity,
-				Reason:            alert.Reason,
-				MatchedVia:        alert.MatchedVia,
-				RawLine:           alert.Line,
-				NormalizedHash:    alert.Hash,
-				CoordinatorKey:    alert.ScopeKey,
-				CoordinatorEvents: alert.EventCount,
-				Downgraded:        true,
-				DowngradeReason:   alert.DowngradeReason,
-				Notified:          false,
-				ResolutionStatus:  "resolved",
-				ResolvedAt:        &now,
-				ResolutionMethod:  "rec_evidence",
-				PreviousVerdict:   alert.Verdict,
+				EventID:             alert.EventID,
+				Timestamp:           alert.Timestamp,
+				SourceType:          alert.SourceType,
+				SourceName:          alert.ScopeKey,
+				DestHost:            alert.Host,
+				HTTPMethod:          alert.HTTPMethod,
+				HTTPPath:            alert.HTTPPath,
+				HTTPStatus:          alert.StatusCode,
+				ResponseBytes:       alert.ResponseBytes,
+				Verdict:             "downgraded",
+				Classification:      alert.Severity,
+				Reason:              alert.Reason,
+				MatchedVia:          alert.MatchedVia,
+				RawLine:             alert.Line,
+				NormalizedHash:      alert.Hash,
+				CoordinatorKey:      alert.Key, // Real correlation key, not source identity
+				CoordinatorEvents:   alert.EventCount,
+				EvidenceStatus:      evStatus,
+				EvidenceStatusCode:  evCode,
+				EvidenceContentType: evCT,
+				EvidenceBodyHash:    evHash,
+				EvidenceCaptureMode: evMode,
+				Downgraded:          true,
+				DowngradeReason:     alert.DowngradeReason,
+				Notified:            false,
+				ResolutionStatus:    "resolved",
+				ResolvedAt:          &now,
+				ResolutionMethod:    "rec_evidence",
+				PreviousVerdict:     alert.Verdict,
 			})
 			return
 		}
 
 		if alert.Escalated {
 			log.Printf("[ESCALATED] EventID=%s key=%s events=%d →%s Reason=%s",
-				alert.EventID, alert.ScopeKey, alert.EventCount, alert.Severity, alert.EscalateReason)
+				alert.EventID, alert.Key, alert.EventCount, alert.Severity, alert.EscalateReason)
 			log.Printf("[INFO] EventID=%s Source=%s EscalatedReason=%s %s Line=%s",
 				alert.EventID, alert.ScopeKey, alert.EscalateReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
 			if alert.BuildAlert != nil {
-				if builtAlert, ok := alert.BuildAlert().(notifier.Alert); ok {
+				// Section 3 / Finding 7: pass the coordinator's already-attached
+				// evidence to the closure instead of doing a second host-less
+				// REC lookup at dispatch time.
+				if builtAlert, ok := alert.BuildAlert(alert.Evidence).(notifier.Alert); ok {
 					builtAlert.Severity = notifier.SeverityMalicious
 					builtAlert.Reason = alert.EscalateReason
 					dispatch.Dispatch(context.Background(), builtAlert)
@@ -374,28 +415,33 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 
 			now := time.Now()
 			db.SubmitFinding(&store.Finding{
-				EventID:           alert.EventID,
-				Timestamp:         alert.Timestamp,
-				SourceType:        alert.SourceType,
-				SourceName:        alert.ScopeKey,
-				DestHost:          alert.Host,
-				HTTPMethod:        alert.HTTPMethod,
-				HTTPPath:          alert.HTTPPath,
-				HTTPStatus:        alert.StatusCode,
-				ResponseBytes:     alert.ResponseBytes,
-				Verdict:           "malicious",
-				Classification:    "malicious",
-				Reason:            alert.EscalateReason,
-				MatchedVia:        alert.MatchedVia,
-				RawLine:           alert.Line,
-				NormalizedHash:    alert.Hash,
-				CoordinatorKey:    alert.ScopeKey,
-				CoordinatorEvents: alert.EventCount,
-				Notified:          true,
-				ResolutionStatus:  "resolved",
-				ResolvedAt:        &now,
-				ResolutionMethod:  "rec_evidence",
-				PreviousVerdict:   "alert",
+				EventID:             alert.EventID,
+				Timestamp:           alert.Timestamp,
+				SourceType:          alert.SourceType,
+				SourceName:          alert.ScopeKey,
+				DestHost:            alert.Host,
+				HTTPMethod:          alert.HTTPMethod,
+				HTTPPath:            alert.HTTPPath,
+				HTTPStatus:          alert.StatusCode,
+				ResponseBytes:       alert.ResponseBytes,
+				Verdict:             "malicious",
+				Classification:      "malicious",
+				Reason:              alert.EscalateReason,
+				MatchedVia:          alert.MatchedVia,
+				RawLine:             alert.Line,
+				NormalizedHash:      alert.Hash,
+				CoordinatorKey:      alert.Key, // Real correlation key, not source identity
+				CoordinatorEvents:   alert.EventCount,
+				EvidenceStatus:      evStatus,
+				EvidenceStatusCode:  evCode,
+				EvidenceContentType: evCT,
+				EvidenceBodyHash:    evHash,
+				EvidenceCaptureMode: evMode,
+				Notified:            true,
+				ResolutionStatus:    "resolved",
+				ResolvedAt:          &now,
+				ResolutionMethod:    "rec_evidence",
+				PreviousVerdict:     "alert",
 			})
 			return
 		}
@@ -408,31 +454,36 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 		if alert.Severity == "suspicious" {
 			severity = "SUSPICIOUS"
 		}
-		log.Printf("[%s] EventID=%s Source=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
-			severity, alert.EventID, alert.ScopeKey, alert.Reason,
+		log.Printf("[%s] EventID=%s Source=%s key=%s Reason=%s MatchedVia=%s Hash=%s %s Line=%s",
+			severity, alert.EventID, alert.ScopeKey, alert.Key, alert.Reason,
 			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
 		// Fix 4: Non-resolved findings get "pending" resolution status
 		db.SubmitFinding(&store.Finding{
-			EventID:           alert.EventID,
-			Timestamp:         alert.Timestamp,
-			SourceType:        alert.SourceType,
-			SourceName:        alert.ScopeKey,
-			DestHost:          alert.Host,
-			HTTPMethod:        alert.HTTPMethod,
-			HTTPPath:          alert.HTTPPath,
-			HTTPStatus:        alert.StatusCode,
-			ResponseBytes:     alert.ResponseBytes,
-			Verdict:           alert.Verdict,
-			Classification:    alert.Severity,
-			Reason:            alert.Reason,
-			MatchedVia:        alert.MatchedVia,
-			RawLine:           alert.Line,
-			NormalizedHash:    alert.Hash,
-			CoordinatorKey:    alert.ScopeKey,
-			CoordinatorEvents: alert.EventCount,
-			Notified:          false,
-			ResolutionStatus:  "pending",
+			EventID:             alert.EventID,
+			Timestamp:           alert.Timestamp,
+			SourceType:          alert.SourceType,
+			SourceName:          alert.ScopeKey,
+			DestHost:            alert.Host,
+			HTTPMethod:          alert.HTTPMethod,
+			HTTPPath:            alert.HTTPPath,
+			HTTPStatus:          alert.StatusCode,
+			ResponseBytes:       alert.ResponseBytes,
+			Verdict:             alert.Verdict,
+			Classification:      alert.Severity,
+			Reason:              alert.Reason,
+			MatchedVia:          alert.MatchedVia,
+			RawLine:             alert.Line,
+			NormalizedHash:      alert.Hash,
+			CoordinatorKey:      alert.Key, // Real correlation key, not source identity
+			CoordinatorEvents:   alert.EventCount,
+			EvidenceStatus:      evStatus,
+			EvidenceStatusCode:  evCode,
+			EvidenceContentType: evCT,
+			EvidenceBodyHash:    evHash,
+			EvidenceCaptureMode: evMode,
+			Notified:            false,
+			ResolutionStatus:    "pending",
 		})
 	}
 }
@@ -471,55 +522,61 @@ func makeEvidenceCheckCallback(
 		403: true, 404: true, 405: true, 410: true,
 	}
 
-	return func(pending *coordinator.PendingAlert) (bool, bool, string, string) {
-		// Read HTTP identity directly from the PendingAlert struct.
-		// pending.HTTPPath is the RAW wire path stored at routing time
-		// (resultrouter.go) and preserved across joins (coordinator.go).
-		method := pending.HTTPMethod
-		path := pending.HTTPPath
-		host := pending.Host
-		statusCode := pending.StatusCode
+	return func(snapshot *coordinator.PendingAlert) coordinator.EvidenceDecision {
+		// Section 3 / Findings 4+5: snapshot is a value-typed snapshot of the
+		// pending alert. We never mutate it. All state to apply (evidence,
+		// journal, body preview hash) flows back through EvidenceDecision
+		// and the coordinator applies it under its own lock.
+		method := snapshot.HTTPMethod
+		path := snapshot.HTTPPath
+		host := snapshot.Host
+		statusCode := snapshot.StatusCode
 
 		if method == "" {
 			log.Printf("[coordinator] Evidence check SKIP: no HTTP identity on pending key=%s normalized=%s",
-				pending.Key, truncate(pending.NormalizedLine, 120))
-			return false, false, "", ""
+				snapshot.Key, truncate(snapshot.NormalizedLine, 120))
+			return coordinator.EvidenceDecision{}
 		}
 
 		evidence := collector.Lookup(rec.LookupRequest{
 			Method:          method,
 			Path:            path,
 			Host:            host,
-			SourceContainer: pending.SourceName,
+			SourceContainer: snapshot.SourceName,
 			StatusCode:      statusCode,
-			Timestamp:       pending.Timestamp,
+			Timestamp:       snapshot.Timestamp,
 			Window:          10 * time.Second, // Matches coordinator finalize window (v0.43.2+)
-			ExpectedBytes:   extractResponseBytes(pending.Line),
+			// Section 3 follow-up (code review review item #1): prefer the
+			// merged ResponseBytes off the pending alert. mergePendingMetadata
+			// upgrades this from sibling events with stronger byte data;
+			// extractResponseBytes(snapshot.Line) is a fallback for the
+			// first-arrival event before any merge has happened.
+			ExpectedBytes: func() int64 {
+				if snapshot.ResponseBytes > 0 {
+					return snapshot.ResponseBytes
+				}
+				return extractResponseBytes(snapshot.Line)
+			}(),
 		})
 
 		// --- Path 1: Transport-only downgrade ---
 		if evidence != nil && evidence.Transport != nil {
-			// Phase 2 re-arm: populate BodyPreviewHash from REC evidence.
-			// This was hardcoded empty at routing time (resultrouter.go) because
-			// the hash only exists after REC captures the response. Now that
-			// evidence has arrived, arm the field so catch-all can use it.
-			if evidence.Transport.BodyPreviewHash != "" {
-				pending.BodyPreviewHash = evidence.Transport.BodyPreviewHash
-			}
-
 			code := evidence.Transport.StatusCode
 			if transportDowngradeCodes[code] {
-				pending.EvidenceResult = evidence
-				pending.EvidenceJournal = evidence.ForJournal()
-
 				reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
 				log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
-					pending.Key, code, evidence.CandidateCount)
-				return true, false, reason, ""
+					snapshot.Key, code, evidence.CandidateCount)
+				return coordinator.EvidenceDecision{
+					Downgraded:      true,
+					Reason:          reason,
+					Evidence:        evidence,
+					EvidenceJournal: evidence.ForJournal(),
+					BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+				}
 			}
 		}
 
-		// --- Diagnostic logging ---
+		// --- Diagnostic logging on REC miss ---
 		if evidence == nil || evidence.Transport == nil {
 			evStatus := "nil"
 			evCandidates := 0
@@ -536,29 +593,33 @@ func makeEvidenceCheckCallback(
 				}
 			}
 			log.Printf("[coordinator] Evidence check MISS: key=%s lookup=%s/%s?status=%d candidates=%d transport=%v preview_len=%d format=%s status=%s",
-				pending.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
-			return false, false, "", ""
+				snapshot.Key, method, path, statusCode, evCandidates, hasTransport, previewLen, evFormat, evStatus)
+			return coordinator.EvidenceDecision{}
 		}
 
 		// --- Path 2: Body-aware re-classification ---
+		// Even if we can't reclassify (no body preview), surface what we have
+		// so the coordinator's Phase 2 catch-all re-arm can fire on the
+		// transport-side BodyPreviewHash if appropriate.
 		if evidence.SafeBodyPreview == "" {
 			log.Printf("[coordinator] Evidence check: transport available (HTTP %d) but ambiguous status, no body preview — key=%s candidates=%d format=%s",
-				evidence.Transport.StatusCode, pending.Key, evidence.CandidateCount,
+				evidence.Transport.StatusCode, snapshot.Key, evidence.CandidateCount,
 				func() string {
 					if evidence.Disclosure != nil {
 						return string(evidence.Disclosure.Format)
 					}
 					return "n/a"
 				}())
-			return false, false, "", ""
+			return coordinator.EvidenceDecision{
+				Evidence:        evidence,
+				EvidenceJournal: evidence.ForJournal(),
+				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+			}
 		}
 
-		pending.EvidenceResult = evidence
-		pending.EvidenceJournal = evidence.ForJournal()
-
-		classification := pending.Classification
+		classification := snapshot.Classification
 		if classification == "" {
-			if pending.Verdict == "malicious" {
+			if snapshot.Verdict == "malicious" {
 				classification = "malicious"
 			} else {
 				classification = "suspicious"
@@ -574,19 +635,32 @@ func makeEvidenceCheckCallback(
 				log.Printf("[reclassify] Cache hit (redacted_body=%s): escalated → %s → %s",
 					bodyHash[:16], cached.newSeverity, cached.reason)
 			}
-			return cached.downgraded, cached.escalated, cached.reason, cached.newSeverity
+			return coordinator.EvidenceDecision{
+				Downgraded:      cached.downgraded,
+				Escalated:       cached.escalated,
+				Reason:          cached.reason,
+				NewSeverity:     cached.newSeverity,
+				Evidence:        evidence,
+				EvidenceJournal: evidence.ForJournal(),
+				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+			}
 		}
 
 		release, ok := scheduler.AcquireBlocking(ctx)
 		if !ok {
 			log.Printf("[reclassify] Context cancelled waiting for LLM slot")
-			return false, false, "", ""
+			// Return what evidence we have so catch-all re-arm can still fire.
+			return coordinator.EvidenceDecision{
+				Evidence:        evidence,
+				EvidenceJournal: evidence.ForJournal(),
+				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+			}
 		}
 		reclass, err := llmClient.ReclassifyWithEvidence(
 			ctx,
 			classification,
-			pending.Reason,
-			pending.Line,
+			snapshot.Reason,
+			snapshot.Line,
 			evidence.Transport.StatusCode,
 			evidence.Transport.ContentType,
 			evidence.Transport.ContentLength,
@@ -595,13 +669,17 @@ func makeEvidenceCheckCallback(
 		release()
 		if err != nil {
 			log.Printf("[reclassify] Error: %v — not changing verdict", err)
-			return false, false, "", ""
+			return coordinator.EvidenceDecision{
+				Evidence:        evidence,
+				EvidenceJournal: evidence.ForJournal(),
+				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+			}
 		}
 
 		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
 
 		db.RecordLLMDecision(context.Background(), &store.LLMDecision{
-			EventID:          pending.EventID,
+			EventID:          snapshot.EventID,
 			Timestamp:        time.Now(),
 			Tier:             "reclassify",
 			Model:            cfg.LLMModel,
@@ -609,9 +687,9 @@ func makeEvidenceCheckCallback(
 			PromptTokens:     reclass.PromptTokens,
 			CompletionTokens: reclass.CompletionTokens,
 			LatencyMs:        reclass.LatencyMs,
-			SourceScope:      pending.ScopeKey,
-			RawLine:          pending.Line,
-			NormalizedLine:   pending.NormalizedLine,
+			SourceScope:      snapshot.ScopeKey,
+			RawLine:          snapshot.Line,
+			NormalizedLine:   snapshot.NormalizedLine,
 			EvidencePreview:  evidence.SafeBodyPreview,
 			EvidenceStatus:   evidence.Transport.StatusCode,
 			EvidenceType:     evidence.Transport.ContentType,
@@ -634,7 +712,15 @@ func makeEvidenceCheckCallback(
 			log.Printf("[ESCALATED] Original=%s→%s Reason=%s",
 				classification, reclass.Classification, reclass.Reason)
 		}
-		return reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification
+		return coordinator.EvidenceDecision{
+			Downgraded:      reclass.Downgraded,
+			Escalated:       reclass.Escalated,
+			Reason:          reclass.Reason,
+			NewSeverity:     reclass.Classification,
+			Evidence:        evidence,
+			EvidenceJournal: evidence.ForJournal(),
+			BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+		}
 	}
 }
 
@@ -651,10 +737,20 @@ func makeVerifyCallback(
 	ctx context.Context,
 ) coordinator.VerifyFunc {
 
+	// Section 3 follow-up (code review review item #3): DisableCompression: true
+	// on both transports, and Accept-Encoding: identity on every request.
+	// REC hashes wire-byte response previews; Go's default http.Client requests
+	// gzip and silently decompresses, so the verifier would hash decompressed
+	// bytes while REC hashed compressed bytes — body hashes would never match
+	// for any response that nginx gzipped (catch-all verification fails
+	// silently). Belt-and-suspenders: header + transport flag.
 	httpClient := &http.Client{
 		Timeout: 2 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DisableCompression: true,
 		},
 	}
 	httpsClient := &http.Client{
@@ -663,7 +759,8 @@ func makeVerifyCallback(
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DisableCompression: true,
+			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
@@ -679,6 +776,16 @@ func makeVerifyCallback(
 
 		userAgent, _ := selfSuppress.GenerateToken()
 
+		// Section 3 follow-up (code review review item #5): use the fingerprint's
+		// method instead of hardcoded GET. catchall.Check accepts both GET and
+		// HEAD; verifying a HEAD-method fingerprint with a GET request would
+		// produce a different body hash (HEAD has no body, GET does) and the
+		// verification would fail even when the page is identical.
+		verifyMethod := fp.Method
+		if verifyMethod == "" {
+			verifyMethod = "GET"
+		}
+
 		schemes := []struct {
 			scheme string
 			client *http.Client
@@ -690,13 +797,14 @@ func makeVerifyCallback(
 		for _, s := range schemes {
 			url := fmt.Sprintf("%s://127.0.0.1%s", s.scheme, path)
 
-			httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			httpReq, err := http.NewRequestWithContext(ctx, verifyMethod, url, nil)
 			if err != nil {
 				log.Printf("[verify] Failed to create request: %v", err)
 				continue
 			}
 			httpReq.Host = fp.Host
 			httpReq.Header.Set("User-Agent", userAgent)
+			httpReq.Header.Set("Accept-Encoding", "identity")
 
 			resp, err := s.client.Do(httpReq)
 			if err != nil {
@@ -704,19 +812,47 @@ func makeVerifyCallback(
 				continue
 			}
 
-			// design consensus follow-up fix (2026-05): read exactly the same
-			// byte budget REC uses for its body preview. REC stores the first
-			// rec.DefaultMaxBodyBytes (2KB) of the response and hashes that
-			// preview slice. If we read more bytes here, the hashes diverge
-			// for any response in the gap range and verification silently fails.
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, rec.DefaultMaxBodyBytes))
-			resp.Body.Close()
+			// Section 3 / Finding 6: hash budget must match REC's actual capture
+			// limit, not the package default constant. cfg.RECReassemblyMaxBody
+			// is the runtime knob the sniffer uses; if a customer ever sets
+			// REC_REASSEMBLY_MAX_BODY=4096, REC hashes 4096 bytes and the verifier
+			// must hash exactly that range or every catch-all verification fails
+			// silently. This was a latent bug as long as the env defaulted to 2048.
+			maxHash := int64(cfg.RECReassemblyMaxBody)
+			if maxHash <= 0 {
+				maxHash = int64(rec.DefaultMaxBodyBytes)
+			}
 
+			// Section 3 / Landmine A: read past the hash budget so we can persist
+			// the actual response size on the verified catch-all entry. The
+			// Phase 3 fallback (CheckFallbackByBytes) needs this to bound
+			// suppression to byte-similar responses only.
+			const maxByteCountRead int64 = 64 * 1024 // 64KB sanity cap
+			readLimit := maxByteCountRead
+			if maxHash > readLimit {
+				readLimit = maxHash
+			}
+			fullBody, _ := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+			resp.Body.Close()
+			fullBodyLen := int64(len(fullBody))
+
+			// Truncate to maxHash for fingerprint match — REC's sniffer hashes
+			// the first maxHash bytes; we must compare hashes over the same range.
+			body := fullBody
+			if int64(len(body)) > maxHash {
+				body = body[:maxHash]
+			}
 			bodyLen := int64(len(body))
 			contentType := resp.Header.Get("Content-Type")
-
-			// Fix 2: Match by body hash, not response bytes.
 			bodyHash := rec.HashBody(body)
+
+			// Use Content-Length header when known and larger than what we
+			// actually read (response was bigger than readLimit). Falls back
+			// to fullBodyLen when chunked or unknown.
+			responseBytes := fullBodyLen
+			if resp.ContentLength > responseBytes {
+				responseBytes = resp.ContentLength
+			}
 
 			if resp.StatusCode != fp.StatusCode {
 				log.Printf("[verify] Status mismatch: expected=%d got=%d (scheme=%s)",
@@ -724,31 +860,32 @@ func makeVerifyCallback(
 				continue
 			}
 
-			// Fix 2: Compare body preview hash instead of response bytes
 			if bodyHash != fp.BodyPreviewHash {
-				log.Printf("[verify] Body hash mismatch: expected=%.16s got=%.16s (scheme=%s)",
-					fp.BodyPreviewHash, bodyHash, s.scheme)
+				log.Printf("[verify] Body hash mismatch: expected=%.16s got=%.16s (scheme=%s, maxHash=%d)",
+					fp.BodyPreviewHash, bodyHash, s.scheme, maxHash)
 				continue
 			}
 
-			log.Printf("[verify] Response matched: scheme=%s status=%d bytes=%d hash=%.16s",
-				s.scheme, resp.StatusCode, bodyLen, bodyHash)
+			log.Printf("[verify] Response matched: scheme=%s status=%d hashed_bytes=%d total_bytes=%d hash=%.16s",
+				s.scheme, resp.StatusCode, bodyLen, responseBytes, bodyHash)
 
-			// Redact the body using existing REC pipeline
+			// Redact the body using existing REC pipeline (over the maxHash slice
+			// — that matches what REC redacts and what we hashed).
 			disclosure := rec.ClassifyAndRedact(body, contentType)
 			safePreview := disclosure.RedactedPreview()
 
 			if safePreview == "" {
 				if bodyLen <= 200 {
 					safePreview = string(body)
-				} else if bodyLen <= 2048 {
-					reason := fmt.Sprintf("Verified: %s %d response (%d bytes), format=%s, body hash %.16s, consistent across %d+ paths",
-						s.scheme, resp.StatusCode, bodyLen, disclosure.Format, bodyHash, coordinator.DefaultCatchAllThreshold)
+				} else if bodyLen <= maxHash {
+					reason := fmt.Sprintf("Verified: %s %d response (%d bytes hashed, %d total), format=%s, body hash %.16s, consistent across %d+ paths",
+						s.scheme, resp.StatusCode, bodyLen, responseBytes, disclosure.Format, bodyHash, coordinator.DefaultCatchAllThreshold)
 					result := &coordinator.VerifyResult{
-						Confirmed:   true,
-						Reason:      reason,
-						ContentType: contentType,
-						BodyHash:    bodyHash,
+						Confirmed:     true,
+						Reason:        reason,
+						ContentType:   contentType,
+						BodyHash:      bodyHash,
+						ResponseBytes: responseBytes,
 					}
 					persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
 					return result
@@ -765,7 +902,7 @@ func makeVerifyCallback(
 			reclass, err := llmClient.ReclassifyWithEvidence(ctx,
 				"suspicious",
 				"Catch-all verification probe",
-				fmt.Sprintf("GET %s → %d", path, resp.StatusCode),
+				fmt.Sprintf("%s %s → %d", verifyMethod, path, resp.StatusCode),
 				resp.StatusCode, contentType, bodyLen, safePreview,
 			)
 			release()
@@ -784,7 +921,7 @@ func makeVerifyCallback(
 				CompletionTokens: reclass.CompletionTokens,
 				LatencyMs:        reclass.LatencyMs,
 				SourceScope:      fp.Host,
-				RawLine:          fmt.Sprintf("GET %s → %d", path, resp.StatusCode),
+				RawLine:          fmt.Sprintf("%s %s → %d", verifyMethod, path, resp.StatusCode),
 				EvidencePreview:  safePreview,
 				EvidenceStatus:   resp.StatusCode,
 				EvidenceType:     contentType,
@@ -802,10 +939,11 @@ func makeVerifyCallback(
 			if reclass.Downgraded {
 				reason := fmt.Sprintf("LLM confirmed benign: %s", reclass.Reason)
 				result := &coordinator.VerifyResult{
-					Confirmed:   true,
-					Reason:      reason,
-					ContentType: contentType,
-					BodyHash:    bodyHash,
+					Confirmed:     true,
+					Reason:        reason,
+					ContentType:   contentType,
+					BodyHash:      bodyHash,
+					ResponseBytes: responseBytes,
 				}
 				persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
 				return result
@@ -824,7 +962,8 @@ func makeVerifyCallback(
 }
 
 // persistVerifiedCatchAll saves a confirmed catch-all to SQLite.
-// Fix 2: Uses BodyPreviewHash instead of ResponseBytes.
+// Section 3 / Landmine A: persists ResponseBytes so the byte-aware Phase 3
+// fallback can use it after a restart.
 func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinator.CatchAllFingerprint, path string, result *coordinator.VerifyResult, contentType string) {
 	err := db.SaveVerifiedCatchAll(ctx, &store.CatchAllRule{
 		Host:                fp.Host,
@@ -837,17 +976,20 @@ func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinato
 		BodyHash:            result.BodyHash,
 		VerificationVerdict: "benign",
 		VerificationReason:  result.Reason,
+		ResponseBytes:       result.ResponseBytes,
 	})
 	if err != nil {
 		log.Printf("[verify] Failed to persist verified catch-all: %v", err)
 	} else {
-		log.Printf("[verify] Persisted verified catch-all: host=%s method=%s status=%d hash=%.16s",
-			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash)
+		log.Printf("[verify] Persisted verified catch-all: host=%s method=%s status=%d hash=%.16s bytes=%d",
+			fp.Host, fp.Method, fp.StatusCode, fp.BodyPreviewHash, result.ResponseBytes)
 	}
 }
 
 // seedCatchAllsFromDB loads previously verified catch-all fingerprints.
-// Fix 2: Seeds with BodyPreviewHash instead of ResponseBytes.
+// Section 3 / Landmine A: also seeds ResponseBytes for the byte-aware fallback.
+// Pre-migration rows have response_bytes=0 — those entries will be skipped by
+// CheckFallbackByBytes until they're re-verified with a real measurement.
 func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 	rules, err := db.LoadVerifiedCatchAlls(context.Background())
 	if err != nil {
@@ -860,6 +1002,7 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 
 	fps := make([]coordinator.CatchAllFingerprint, len(rules))
 	reasons := make([]string, len(rules))
+	bytesList := make([]int64, len(rules))
 	for i, r := range rules {
 		fps[i] = coordinator.CatchAllFingerprint{
 			Host:            r.Host,
@@ -868,9 +1011,10 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 			BodyPreviewHash: r.BodyPreviewHash,
 		}
 		reasons[i] = r.VerificationReason
+		bytesList[i] = r.ResponseBytes
 	}
 
-	coord.CatchAllTracker().SeedVerified(fps, reasons)
+	coord.CatchAllTracker().SeedVerified(fps, reasons, bytesList)
 }
 
 // =============================================================================
@@ -1118,6 +1262,12 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			if caTotal > 0 {
 				log.Printf("[observer] CatchAll: fingerprints=%d candidates=%d pending=%d verified=%d rejected=%d suppressed=%d",
 					caTotal, caCandidates, caPending, caVerified, caRejected, caSuppressed)
+			}
+
+			// Section 3 follow-up telemetry: hostless coordinator keys.
+			// Logged only when non-zero to avoid noise on healthy boxes.
+			if hk := coord.HostlessKeys(); hk > 0 {
+				log.Printf("[observer] Coordinator: hostless_keys=%d (events with no parseable Host — investigate normalizer if growing fast)", hk)
 			}
 
 			policyMatches, policyEscalations, policyAllows, policyAlerts := policyEngine.Stats()
