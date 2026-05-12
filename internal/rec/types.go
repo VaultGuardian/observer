@@ -153,6 +153,15 @@ type RECStats struct {
 	BufferEntries  int
 	BufferBytes    int64
 
+	// Buffer eviction pressure (v1.0 burst hardening).
+	// Split by reason so operators can immediately diagnose which
+	// constraint is binding: "I need more entries" vs "I need more bytes"
+	// vs "I need a longer age window."
+	BufferEvictionsTotal    int64
+	BufferEvictionsCapacity int64 // entry cap hit
+	BufferEvictionsAge      int64 // MaxAge expired
+	BufferEvictionsBytes    int64 // byte cap hit
+
 	// Inline request parser (synchronous in processFrame)
 	InlineRequests       int64 // successful inline parses
 	InlineDuplicateDrops int64 // TCP seq dedupe caught retransmit

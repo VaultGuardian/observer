@@ -10,10 +10,18 @@ import (
 // =============================================================================
 //
 // Constraints (whichever hits first wins):
-//   - MaxEntries:       1000 (default)
-//   - MaxTotalBytes:    16MB (default)
-//   - MaxAge:           30s  (default) — must exceed worst-case LLM latency for first-encounter evidence
-//   - MaxBodyPreview:   2KB  (default) — per-entry body cap
+//   - MaxEntries:       10,000 (default, v1.0 — was 1,000)
+//   - MaxTotalBytes:    128MB  (default, v1.0 — was 16MB)
+//   - MaxAge:           30s    (default) — must exceed worst-case LLM latency for first-encounter evidence
+//   - MaxBodyPreview:   2KB    (default) — per-entry body cap
+//
+// v1.0 bump rationale: 10,000 × ~3KB avg = ~30MB working set, 128MB cap = 4x
+// headroom. Handles ~333 req/sec sustained for 30s without evidence loss.
+// Previous 1,000-entry cap was defeated by any standard scanner (Nuclei, ffuf,
+// gobuster) at default rates (~50 req/sec for 30s = 1,500 requests).
+//
+// All four parameters are overridable via REC_BUFFER_* env vars for operator
+// tuning without rebuilds.
 //
 // Thread safety: sync.RWMutex
 //   - Sniffer goroutine writes constantly (Lock)
@@ -25,8 +33,8 @@ import (
 // memory for GC (code review's catch).
 
 const (
-	DefaultMaxEntries    = 1000
-	DefaultMaxTotalBytes = 16 * 1024 * 1024 // 16MB
+	DefaultMaxEntries    = 10000
+	DefaultMaxTotalBytes = 128 * 1024 * 1024 // 128MB
 	DefaultMaxAge        = 30 * time.Second
 	DefaultMaxBodyBytes  = 2 * 1024 // 2KB per entry body preview
 )
@@ -103,6 +111,23 @@ type CapturedResponse struct {
 // emptyResponse is the zero value used to clear evicted slots for GC.
 var emptyResponse CapturedResponse
 
+// BufferStats is a snapshot of ring buffer utilization and eviction pressure.
+// All fields are populated under RLock in Stats() — no atomics needed.
+type BufferStats struct {
+	Entries    int
+	TotalBytes int64
+
+	// Eviction counters — split by reason so operators can immediately
+	// diagnose which constraint is binding under burst load.
+	// Plain int64, NOT atomic.Int64 — incremented only inside Insert()
+	// under the existing rb.mu.Lock(). Atomic ops would be redundant
+	// memory-barrier overhead inside an already-locked critical section.
+	EvictionsTotal    int64 // total evictions across all reasons
+	EvictionsCapacity int64 // evicted because entry cap hit
+	EvictionsAge      int64 // evicted because MaxAge expired
+	EvictionsBytes    int64 // evicted because byte cap hit
+}
+
 // RingBuffer is a thread-safe, multi-constraint bounded circular buffer.
 type RingBuffer struct {
 	mu     sync.RWMutex
@@ -112,6 +137,13 @@ type RingBuffer struct {
 	head    int   // next write position
 	count   int   // current number of valid entries
 	total   int64 // current total bytes across all entries
+
+	// Eviction counters (v1.0 burst hardening). Plain int64 — only
+	// touched inside Insert() under rb.mu.Lock(). See BufferStats.
+	evictionsTotal    int64
+	evictionsCapacity int64
+	evictionsAge      int64
+	evictionsBytes    int64
 }
 
 // NewRingBuffer creates a ring buffer with the given configuration.
@@ -155,6 +187,8 @@ func (rb *RingBuffer) Insert(resp CapturedResponse) {
 	// Evict oldest entries until we're under the total byte cap
 	for rb.total+resp.entryBytes > rb.config.MaxTotalBytes && rb.count > 0 {
 		rb.evictOldest()
+		rb.evictionsBytes++
+		rb.evictionsTotal++
 	}
 
 	// If buffer is at max count, the circular write overwrites the oldest.
@@ -162,6 +196,8 @@ func (rb *RingBuffer) Insert(resp CapturedResponse) {
 	if rb.count == rb.config.MaxEntries {
 		rb.total -= rb.entries[rb.head].entryBytes
 		rb.entries[rb.head] = emptyResponse // zero for GC
+		rb.evictionsCapacity++
+		rb.evictionsTotal++
 	} else {
 		rb.count++
 	}
@@ -287,11 +323,18 @@ func (rb *RingBuffer) Lookup(req LookupRequest) []CapturedResponse {
 	return candidates
 }
 
-// Stats returns current buffer utilization (for monitoring/debugging).
-func (rb *RingBuffer) Stats() (entries int, totalBytes int64) {
+// Stats returns current buffer utilization and eviction pressure (for monitoring/debugging).
+func (rb *RingBuffer) Stats() BufferStats {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
-	return rb.count, rb.total
+	return BufferStats{
+		Entries:           rb.count,
+		TotalBytes:        rb.total,
+		EvictionsTotal:    rb.evictionsTotal,
+		EvictionsCapacity: rb.evictionsCapacity,
+		EvictionsAge:      rb.evictionsAge,
+		EvictionsBytes:    rb.evictionsBytes,
+	}
 }
 
 // evictExpired removes entries older than MaxAge. Must hold write lock.
@@ -303,6 +346,8 @@ func (rb *RingBuffer) evictExpired() {
 			rb.total -= rb.entries[oldestIdx].entryBytes
 			rb.entries[oldestIdx] = emptyResponse // zero for GC (code review's fix)
 			rb.count--
+			rb.evictionsAge++
+			rb.evictionsTotal++
 		} else {
 			break
 		}

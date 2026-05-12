@@ -41,6 +41,14 @@ type Config struct {
 	// runtime learning entirely.
 	RECLearnedPortCap int
 
+	// REC evidence buffer tuning (v1.0 burst hardening).
+	// Overridable via REC_BUFFER_* env vars so operators can tune
+	// without rebuilds. Defaults handle ~333 req/sec for 30s.
+	RECBufferMaxEntries int
+	RECBufferMaxBytes   int64
+	RECBufferMaxAge     time.Duration
+	RECBufferMaxBody    int
+
 	// REC reassembly tuning (response-only as of v0.42.7)
 	RECReassemblyMaxBody                 int
 	RECReassemblyStreamTTL               time.Duration
@@ -90,6 +98,12 @@ func LoadConfig() Config {
 		// REC_LEARNED_PORT_CAP allows zero (= disable learning).
 		// Resolved below since getEnvInt rejects non-positive values.
 		RECLearnedPortCap: 64,
+
+		// REC evidence buffer (v1.0 burst hardening).
+		RECBufferMaxEntries: getEnvInt("REC_BUFFER_MAX_ENTRIES", 10000),
+		RECBufferMaxBytes:   getEnvInt64("REC_BUFFER_MAX_BYTES", 128*1024*1024),
+		RECBufferMaxAge:     getEnvDuration("REC_BUFFER_MAX_AGE", 30*time.Second),
+		RECBufferMaxBody:    getEnvInt("REC_BUFFER_MAX_BODY", 2048),
 		MaxConcurrentLLM:  getEnvInt("LLM_SLOTS", 4),
 		Tier1Effort:       getEnv("LLM_TIER1_EFFORT", "low"),
 		Tier2Effort:       getEnv("LLM_TIER2_EFFORT", "medium"),
@@ -223,6 +237,15 @@ func getEnv(key, fallback string) string {
 func getEnvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			return n
 		}
 	}

@@ -98,6 +98,12 @@ func main() {
 	recCfg.Verbose = cfg.RECVerbose
 	recCfg.Ports = cfg.RECPorts
 	recCfg.LearnedPortCap = cfg.RECLearnedPortCap
+	recCfg.Buffer = rec.BufferConfig{
+		MaxEntries:    cfg.RECBufferMaxEntries,
+		MaxTotalBytes: cfg.RECBufferMaxBytes,
+		MaxAge:        cfg.RECBufferMaxAge,
+		MaxBodyBytes:  cfg.RECBufferMaxBody,
+	}
 	recCfg.Reassembly = rec.ReassemblyConfig{
 		MaxBody:                 cfg.RECReassemblyMaxBody,
 		StreamTTL:               cfg.RECReassemblyStreamTTL,
@@ -1354,10 +1360,13 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)
 			if collector.Enabled() {
 				rStats := collector.Stats()
-				log.Printf("[observer] REC: packets=%d inline_req=%d resp=%d pair_immediate=%d orphan_resp=%d req_expired=%d vxlan=%d buf_entries=%d buf_bytes=%d vip_matches=%d",
+				log.Printf("[observer] REC: packets=%d inline_req=%d resp=%d pair_immediate=%d orphan_resp=%d req_expired=%d vxlan=%d buf_entries=%d buf_bytes=%d buf_evictions_total=%d buf_evictions_capacity=%d buf_evictions_age=%d buf_evictions_bytes=%d vip_matches=%d",
 					rStats.PacketsSeen, rStats.InlineRequests, rStats.ReassemblyResponses,
 					rStats.PairImmediate, rStats.OrphanResponses, rStats.RequestsExpired,
-					rStats.VXLANUnwrapped, rStats.BufferEntries, rStats.BufferBytes, rStats.VIPMatches)
+					rStats.VXLANUnwrapped, rStats.BufferEntries, rStats.BufferBytes,
+					rStats.BufferEvictionsTotal, rStats.BufferEvictionsCapacity,
+					rStats.BufferEvictionsAge, rStats.BufferEvictionsBytes,
+					rStats.VIPMatches)
 				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d stream_drops=%d parse_errors=%d flows=%d flow_evictions=%d",
 					rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
 					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyStreamDrops,

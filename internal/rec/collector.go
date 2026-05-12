@@ -191,11 +191,11 @@ func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 //
 // When the classifier flags a request as malicious, we pin its tracking
 // metadata in a separate high-priority map that CANNOT be evicted by
-// traffic floods. The ring buffer has 1000 entries and 30s TTL — an
-// attacker flooding 50K garbage requests evicts malicious evidence before
-// the coordinator can look it up.
+// traffic floods. The standard ring buffer is still a bounded best-effort
+// evidence cache; under sufficiently large bursts, older evidence can still
+// be evicted before the coordinator looks it up.
 //
-// The VIP lane solves both problems:
+// The VIP lane protects high-value malicious-request correlation separately:
 //   1. Anti-eviction: VIP evidence has its own map (120s TTL, max 200 entries)
 //   2. Push notification: when a response matches VIP criteria, a callback
 //      fires immediately so the coordinator can re-check without waiting
@@ -509,7 +509,13 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.PairMisses = stats.OrphanResponses
 	}
 	if lc.buffer != nil {
-		stats.BufferEntries, stats.BufferBytes = lc.buffer.Stats()
+		bs := lc.buffer.Stats()
+		stats.BufferEntries = bs.Entries
+		stats.BufferBytes = bs.TotalBytes
+		stats.BufferEvictionsTotal = bs.EvictionsTotal
+		stats.BufferEvictionsCapacity = bs.EvictionsCapacity
+		stats.BufferEvictionsAge = bs.EvictionsAge
+		stats.BufferEvictionsBytes = bs.EvictionsBytes
 	}
 	stats.VIPMatches = atomic.LoadInt64(&lc.vipMatches)
 	return stats
