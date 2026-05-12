@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/vaultguardian/observer/internal/analyzer"
+	"github.com/vaultguardian/observer/internal/coordinator"
 	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/rec"
 	"github.com/vaultguardian/observer/internal/store"
@@ -75,8 +76,18 @@ type Server struct {
 	// so the live coordinator entry can participate in the byte-aware
 	// Phase 3 fallback. Pre-existing rules with response_bytes=0 in the
 	// DB are skipped by the fallback path until re-verified.
+	//
+	// v1.0 Card 4: onSeedExpectedEndpoint wires the new path-scoped
+	// operator-confirmed expected-response tracker. Signature includes
+	// http_status because the tracker keys on it (P1 lock-in, May 11
+	// 2026). bodyHash here is the REDACTED shape hash (decision.CacheKey),
+	// NEVER the raw transport hash. getExpectedEndpointStats exposes
+	// tracker counters to /api/stats without coupling the API server type
+	// to the tracker type or the coordinator type.
 	onInvalidateReclassCache func(bodyHash string)
 	onSeedCatchAll           func(host, method string, status int, bodyHash, reason string, responseBytes int64)
+	onSeedExpectedEndpoint   func(host, method string, status int, path, bodyHash, reason string)
+	getExpectedEndpointStats func() (total int, suppressed int64)
 }
 
 // NewServer creates the API server and loads (or generates) the auth token.
@@ -123,12 +134,22 @@ func NewServer(
 //
 // Section 3 / Landmine A: seedCatchAll now takes responseBytes so the
 // byte-aware Phase 3 fallback works for human-confirmed catch-alls too.
+//
+// v1.0 Card 4: seedExpectedEndpoint wires Option 4 ("Expected sensitive
+// response") clicks into the live tracker. Signature includes http_status
+// (P1 lock-in, May 11 2026). bodyHash here is the REDACTED response-shape
+// hash, NEVER the raw transport hash. expectedEndpointStats exposes the
+// tracker's counters to /api/stats.
 func (s *Server) SetCorrectionCallbacks(
 	invalidateCache func(bodyHash string),
 	seedCatchAll func(host, method string, status int, bodyHash, reason string, responseBytes int64),
+	seedExpectedEndpoint func(host, method string, status int, path, bodyHash, reason string),
+	expectedEndpointStats func() (total int, suppressed int64),
 ) {
 	s.onInvalidateReclassCache = invalidateCache
 	s.onSeedCatchAll = seedCatchAll
+	s.onSeedExpectedEndpoint = seedExpectedEndpoint
+	s.getExpectedEndpointStats = expectedEndpointStats
 }
 
 // Start begins serving the API. Blocks until the server shuts down.
@@ -372,6 +393,16 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"patterns_learned": aStats.PatternsLearned,
 		},
 		"patterns": pStats,
+	}
+
+	// v1.0 Card 4: surface ExpectedEndpoint tracker counters. Nil-safe so
+	// the API doesn't break if the coordinator/tracker failed to start.
+	if s.getExpectedEndpointStats != nil {
+		eeTotal, eeSuppressed := s.getExpectedEndpointStats()
+		result["expected_endpoints"] = map[string]interface{}{
+			"total":      eeTotal,
+			"suppressed": eeSuppressed,
+		}
 	}
 
 	if s.collector.Enabled() {
@@ -805,7 +836,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Type          string `json:"type"`           // "noise", "failed_probe", or "confirm"
+		Type          string `json:"type"`           // "noise", "failed_probe", "expected_endpoint", or "confirm"
 		EventID       string `json:"event_id"`       // finding lookup key
 		DecisionID    int64  `json:"decision_id"`    // LLM decision lookup key (0 = cache hit, no decision)
 		TargetVerdict string `json:"target_verdict"` // for noise: "suppress" or "allow"
@@ -854,10 +885,12 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 		s.handleNoiseCorrection(w, ctx, finding, decision, sourceScope, req.TargetVerdict, req.Reason)
 	case "failed_probe":
 		s.handleFailedProbeCorrection(w, ctx, finding, decision, req.Reason)
+	case "expected_endpoint":
+		s.handleExpectedEndpointCorrection(w, ctx, finding, decision, req.Reason)
 	case "confirm":
 		s.handleConfirmCorrection(w, ctx, finding, decision, sourceScope)
 	default:
-		jsonError(w, "invalid correction type: must be 'noise', 'failed_probe', or 'confirm'", http.StatusBadRequest)
+		jsonError(w, "invalid correction type: must be 'noise', 'failed_probe', 'expected_endpoint', or 'confirm'", http.StatusBadRequest)
 	}
 }
 
@@ -1066,6 +1099,165 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 	jsonOK(w, map[string]string{"status": "ok", "type": "failed_probe"})
 }
 
+// handleExpectedEndpointCorrection — "Expected sensitive response" (Card 4).
+//
+// Path-scoped operator confirmation that an endpoint is supposed to return
+// sensitive-looking data (login/token/reset/OAuth flows). The match is keyed
+// on the REDACTED response-shape hash (decision.CacheKey), NOT the raw
+// transport body hash. This is critical: auth endpoints return rotating
+// tokens, so raw hashes change every login while redacted shape hashes stay
+// stable. (code review P0 catch + Drew lock-in, May 11 2026.)
+//
+// SECURITY INVARIANT: This NEVER creates a request-line pattern. The match
+// is strictly (host, method, path, status, shape_hash). The endpoint stays
+// under inspection — same shape downgrades, novel shape (CVE, data leak,
+// misconfig) still escalates correctly. That's the safety net.
+//
+// Architectural distinction from failed_probe:
+//   failed_probe         → catchall_verified_v2  — path-agnostic, statistical
+//   expected_endpoint    → expected_endpoints    — path-scoped, deterministic
+//
+// CRITICAL: this handler REQUIRES decision != nil && decision.CacheKey != "".
+// The redacted shape hash lives on decision.CacheKey; without it, we can't
+// build a stable match key and we can't invalidate the stale reclass cache
+// entry that would otherwise re-escalate the next matching response. Findings
+// produced from cache-hit classifications don't carry a fresh decision row,
+// so they get rejected with an operator-readable explanation pointing them
+// to the right correction path.
+func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx context.Context,
+	finding *store.Finding, decision *store.LLMDecision, reason string) {
+
+	// HARD GUARD #1: this correction is ONLY valid for fresh Tier-2 reclassify
+	// decisions where decision.CacheKey is rec.HashBody(SafeBodyPreview) — i.e.
+	// the redacted response-shape hash. Other LLMDecision rows (Tier-1
+	// classify, classify_retry, catchall_verify) ALSO have CacheKey populated,
+	// but with completely different content: Tier-1 stores the learned pattern
+	// value (regex / string) in CacheKey, and catchall_verify uses it for the
+	// catch-all body fingerprint. Accepting any of those for Card 4 would
+	// store a bogus key in the expected_endpoints table; future evidence
+	// callbacks computing rec.HashBody(SafeBodyPreview) would never match
+	// the stored row, and the API would have lied to the operator about
+	// saving an effective rule. (code review P0 catch, May 11 2026.)
+	//
+	// Strict invariant: Tier == "reclassify" AND evidence-backed fields all
+	// populated. Cache-hit findings (no fresh decision) and Tier-1 findings
+	// both get the same operator-readable rejection so the frontend can
+	// surface a single recovery path.
+	if decision == nil ||
+		decision.Tier != "reclassify" ||
+		decision.CacheKey == "" ||
+		decision.EvidenceStatus == 0 ||
+		decision.EvidencePreview == "" {
+		jsonError(w,
+			"Expected endpoint corrections require a fresh response-evidence reclassification decision. This finding does not include the redacted response-shape fingerprint needed for this correction. Re-run analysis (delete the cached pattern via the patterns view, then re-trigger the request) before marking the endpoint as expected.",
+			http.StatusBadRequest)
+		return
+	}
+
+	// Sanity check the shape of CacheKey: rec.HashBody returns a 64-char
+	// lowercase hex SHA-256 digest. Anything else means we're holding a
+	// non-hash value that slipped past the Tier filter (defensive — should
+	// be impossible given the Tier check above, but cheap to verify).
+	if !isHexHash64(decision.CacheKey) {
+		jsonError(w,
+			"Expected endpoint correction has an invalid response-shape fingerprint (expected 64-character hex hash).",
+			http.StatusBadRequest)
+		return
+	}
+
+	// Build fingerprint from server-side data only — never trust frontend.
+	host := finding.DestHost
+	rawMethod := finding.HTTPMethod
+	rawPath := finding.HTTPPath
+	shapeHash := decision.CacheKey // = rec.HashBody(SafeBodyPreview), the redacted shape hash
+
+	// Status source consistency (code review P1, May 11 2026): prefer the status
+	// captured AT THE EVIDENCE LAYER (same layer that produced the shape
+	// hash). decision.EvidenceStatus is the wire-observed code; finding.HTTPStatus
+	// can be merged from sibling events with a weak default. Falling back to
+	// finding.HTTPStatus only when EvidenceStatus is 0 (zero-value sentinel
+	// for "not captured") keeps us safe if a future code path skips the
+	// evidence step.
+	status := decision.EvidenceStatus
+	if status == 0 {
+		status = finding.HTTPStatus
+	}
+
+	// Normalize method/path to match the tracker's canonical key shape
+	// (code review P2, May 11 2026). Without this, two clicks with different
+	// query strings would create two DB rows but one live tracker entry,
+	// producing audit-trail confusion in the future pattern-review UI.
+	// Shared helper means handler and tracker can't drift over time.
+	method, path := coordinator.NormalizeMethodPath(rawMethod, rawPath)
+
+	// HARD GUARD #2: all five fingerprint components must be present.
+	// Path-scoping is the whole point — without path or status there's
+	// nothing meaningful to match against.
+	if host == "" || method == "" || path == "" || status == 0 {
+		jsonError(w, "Cannot mark as expected endpoint: finding is missing required fingerprint fields (host/method/path/status)", http.StatusBadRequest)
+		return
+	}
+
+	humanReason := "human: " + reason
+	if reason == "" {
+		humanReason = "human: endpoint expected to return sensitive-looking response by design"
+	}
+
+	// Step 1: Persist (UPSERT on full key tuple — idempotent re-click).
+	// Normalized fields go to DB so rows match runtime tracker keys 1:1.
+	err := s.store.SaveExpectedEndpoint(ctx, &store.ExpectedEndpoint{
+		Host:             host,
+		HTTPMethod:       method,
+		HTTPPath:         path,
+		HTTPStatus:       status,
+		BodyPreviewHash:  shapeHash,
+		CreatedAt:        time.Now(),
+		CreatedByEventID: finding.EventID,
+		Description:      humanReason,
+	})
+	if err != nil {
+		jsonError(w, "failed to save expected endpoint: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 2: Seed into live tracker (active immediately, no restart needed)
+	if s.onSeedExpectedEndpoint != nil {
+		s.onSeedExpectedEndpoint(host, method, status, path, shapeHash, humanReason)
+	}
+
+	// Step 3: Invalidate the reclass cache. The reclass cache is keyed on the
+	// REDACTED shape hash (rec.HashBody(SafeBodyPreview), which is exactly
+	// what we have in decision.CacheKey). Without this invalidation, a stale
+	// "malicious" verdict could re-fire on the next matching request before
+	// the new ExpectedEndpoint rule gets a turn. (code review review answer:
+	// the only cache key that matters is the redacted shape hash.)
+	if s.onInvalidateReclassCache != nil {
+		s.onInvalidateReclassCache(shapeHash)
+	}
+
+	// Step 4: Update finding verdict to "allow" — semantically distinct from
+	// failed_probe's "recon". The request was LEGITIMATE (not a hostile probe
+	// that happened to fail).
+	if err := s.store.UpdateFindingVerdict(ctx, finding.EventID, "allow", humanReason); err != nil {
+		log.Printf("[correction] Warning: finding update failed: %v", err)
+	}
+
+	// Step 5: Mark LLM decision as corrected
+	if err := s.store.UpdateLLMDecisionReview(ctx, decision.ID, store.LLMReview{
+		Status:     "corrected",
+		ReviewedBy: "dashboard",
+		Verdict:    "allow",
+		Reason:     humanReason,
+	}); err != nil {
+		log.Printf("[correction] Warning: decision review update failed: %v", err)
+	}
+
+	log.Printf("[correction:expected_endpoint] host=%s method=%s path=%s status=%d shape_hash=%.16s event=%s",
+		host, method, path, status, shapeHash, finding.EventID)
+
+	jsonOK(w, map[string]string{"status": "ok", "type": "expected_endpoint"})
+}
+
 // handleConfirmCorrection — "The AI got it right"
 // Marks the matched pattern as human-validated AND updates the LLM decision review.
 func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Context,
@@ -1152,4 +1344,29 @@ func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// isHexHash64 returns true iff s is exactly 64 characters of lowercase or
+// uppercase hex — the shape of a SHA-256 hex digest. Used as a sanity check
+// in handleExpectedEndpointCorrection to catch non-hash values that slipped
+// past the Tier filter. (code review defensive guard, May 11 2026.)
+//
+// Intentionally tolerant of both cases because rec.HashBody currently emits
+// lowercase via "%x", but if that ever changes to "%X" we don't want this
+// check to start failing silently.
+func isHexHash64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }

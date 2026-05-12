@@ -174,12 +174,23 @@ func main() {
 	// ------- Self-Suppression Token Registry -------
 	selfSuppress := coordinator.NewSelfSuppressor()
 
+	// ------- ExpectedEndpoint Tracker (v1.0 Card 4) -------
+	// Built BEFORE the coordinator and evidence callback because both need
+	// access (evidence callback for the hot-path Check, API server for
+	// SeedVerified + Stats via the correction handler). The tracker lives
+	// in main.go's lifecycle, not inside the coordinator — the coordinator
+	// itself never invokes Check(); the check runs inside the evidence
+	// callback after redaction so it can short-circuit reclass cache + LLM
+	// using the redacted shape hash. (Committee lock-in, May 11 2026.)
+	expectedEndpointTracker := coordinator.NewExpectedEndpointTracker(coordinator.DefaultExpectedEndpointCap)
+	seedExpectedEndpointsFromDB(db, expectedEndpointTracker)
+
 	// ------- Alert Coordinator -------
 	alertCoordinator := coordinator.New(
 		ctx,
 		coordinator.DefaultConfig(),
 		makeDispatchCallback(dispatch, db),
-		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, llmScheduler, ctx),
+		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, llmScheduler, ctx, expectedEndpointTracker),
 		makeVerifyCallback(db, llmClient, selfSuppress, cfg, llmScheduler, ctx),
 		selfSuppress,
 	)
@@ -204,6 +215,13 @@ func main() {
 	// finding. Human-confirmed entries with responseBytes=0 will be skipped
 	// by the byte-aware fallback (conservative — they'll still match exact
 	// body-hash via Check(), just not the byte-similarity Phase 3 path).
+	//
+	// v1.0 Card 4: seedExpectedEndpoint wires the new path-scoped tracker.
+	// Signature includes http_status (P1 lock-in). bodyHash here is the
+	// REDACTED shape hash (decision.CacheKey on the API side), NEVER the
+	// raw transport hash. expectedEndpointStats exposes tracker counters
+	// to /api/stats without forcing the API server to import the tracker
+	// type.
 	if apiServer != nil {
 		apiServer.SetCorrectionCallbacks(
 			// Invalidate reclass cache entry
@@ -219,6 +237,23 @@ func main() {
 					BodyPreviewHash: bodyHash,
 				}}
 				alertCoordinator.CatchAllTracker().SeedVerified(fps, []string{reason}, []int64{responseBytes})
+			},
+			// v1.0 Card 4: Seed an expected-endpoint fingerprint (live).
+			// bodyHash is the REDACTED shape hash; the API handler reads it
+			// from decision.CacheKey before calling this.
+			func(host, method string, status int, path, bodyHash, reason string) {
+				fps := []coordinator.ExpectedEndpointFingerprint{{
+					Host:            host,
+					Method:          method,
+					Path:            path,
+					Status:          status,
+					BodyPreviewHash: bodyHash,
+				}}
+				expectedEndpointTracker.SeedVerified(fps, []string{reason})
+			},
+			// v1.0 Card 4: Expose tracker counters for /api/stats
+			func() (total int, suppressed int64) {
+				return expectedEndpointTracker.Stats()
 			},
 		)
 	}
@@ -517,6 +552,7 @@ func makeEvidenceCheckCallback(
 	cfg Config,
 	scheduler *LLMScheduler,
 	ctx context.Context,
+	expectedEndpointTracker *coordinator.ExpectedEndpointTracker,
 ) coordinator.EvidenceCheckFunc {
 	transportDowngradeCodes := map[int]bool{
 		403: true, 404: true, 405: true, 410: true,
@@ -627,6 +663,45 @@ func makeEvidenceCheckCallback(
 		}
 
 		bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
+
+		// --- Path 2a: ExpectedEndpoint short-circuit (v1.0 Card 4) ---
+		// Operator-explicit truth beats reclass cache and LLM inference.
+		// Runs AFTER redaction (need the shape hash) but BEFORE reclass
+		// cache so a stale "token-looking = malicious" verdict can't
+		// pre-empt the operator's approval. Without this ordering, Card 4
+		// silently fails for the exact case it was built for. (code review P0
+		// catch + design lock-in, May 11 2026.)
+		//
+		// bodyHash here is the REDACTED response-shape hash — same value
+		// used as the reclass cache key below, stable across token rotations
+		// because redaction replaces secret values with markers before
+		// hashing. The correction handler stores decision.CacheKey (which
+		// equals this bodyHash) so live traffic and stored rules match.
+		//
+		// Status source consistency (code review P1, May 11 2026): use the
+		// status captured AT THE EVIDENCE LAYER (same layer that produced
+		// the shape hash) so the key is internally consistent. snapshot.StatusCode
+		// is the fallback if evidence didn't carry a code (defensive — by
+		// this point in the function evidence.Transport is non-nil, but the
+		// fallback keeps us safe under refactor).
+		statusForKey := evidence.Transport.StatusCode
+		if statusForKey == 0 {
+			statusForKey = statusCode
+		}
+		if expectedEndpointTracker != nil {
+			if matched, reason := expectedEndpointTracker.Check(host, method, statusForKey, path, bodyHash); matched {
+				log.Printf("[reclassify] ExpectedEndpoint match: host=%s method=%s path=%s status=%d shape=%.16s — operator-confirmed downgrade",
+					host, method, path, statusForKey, bodyHash)
+				return coordinator.EvidenceDecision{
+					Downgraded:      true,
+					Reason:          reason,
+					Evidence:        evidence,
+					EvidenceJournal: evidence.ForJournal(),
+					BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+				}
+			}
+		}
+
 		if cached, ok := cache.get(bodyHash); ok {
 			if cached.downgraded {
 				log.Printf("[reclassify] Cache hit (redacted_body=%s): downgraded → %s",
@@ -1015,6 +1090,43 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 	}
 
 	coord.CatchAllTracker().SeedVerified(fps, reasons, bytesList)
+}
+
+// seedExpectedEndpointsFromDB loads previously confirmed expected-endpoint
+// rules (Card 4 / "Expected sensitive response") into the in-memory tracker.
+// Takes the tracker directly rather than going through the coordinator
+// because the coordinator doesn't own the tracker — both the evidence
+// callback and the API server reference it independently.
+//
+// Boot graceful degradation (design decision, May 11 2026): log loudly
+// and continue on error. Missing seeds mean prior Card 4 corrections don't
+// apply until the operator re-clicks — annoying but not security-degrading
+// (CatchAll re-arm + Tier-2 LLM escalation still work).
+func seedExpectedEndpointsFromDB(db *store.Store, tracker *coordinator.ExpectedEndpointTracker) {
+	rules, err := db.LoadExpectedEndpoints(context.Background())
+	if err != nil {
+		log.Printf("[observer:warn] Failed to load expected-endpoint seeds: %v — prior Card 4 corrections are NOT active until re-clicked", err)
+		return
+	}
+	if len(rules) == 0 {
+		return
+	}
+
+	fps := make([]coordinator.ExpectedEndpointFingerprint, len(rules))
+	reasons := make([]string, len(rules))
+	for i, r := range rules {
+		fps[i] = coordinator.ExpectedEndpointFingerprint{
+			Host:            r.Host,
+			Method:          r.HTTPMethod,
+			Path:            r.HTTPPath,
+			Status:          r.HTTPStatus,
+			BodyPreviewHash: r.BodyPreviewHash, // redacted shape hash from DB
+		}
+		reasons[i] = r.Description
+	}
+
+	tracker.SeedVerified(fps, reasons)
+	log.Printf("[observer] Seeded %d expected-endpoint rules from DB", len(rules))
 }
 
 // =============================================================================

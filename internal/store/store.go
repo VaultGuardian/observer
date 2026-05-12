@@ -404,6 +404,49 @@ func (s *Store) migrate() error {
 			desc:    "Section 3 / Landmine A: response_bytes on catchall_verified_v2 for byte-similarity check",
 			sql:     `ALTER TABLE catchall_verified_v2 ADD COLUMN response_bytes INTEGER DEFAULT 0;`,
 		},
+		{
+			// v1.0 pre-launch — Correction Dialog Redesign, Card 4
+			// ("Expected sensitive response"). Path-scoped operator
+			// confirmations that an endpoint's response is supposed to look
+			// sensitive (login/token/reset/OAuth). Cannot reuse the CatchAll
+			// subsystem because CatchAll requires multiple paths sharing the
+			// same body hash before verification fires — a single login
+			// endpoint would never reach the threshold.
+			//
+			// Architectural distinction (the design review mandate, May 11 2026):
+			//   catchall_verified_v2  — emergent, statistical, path-agnostic
+			//   expected_endpoints    — explicit, deterministic, path-scoped
+			//
+			// Key: (host, http_method, http_path, http_status, body_preview_hash)
+			//
+			// body_preview_hash is the REDACTED response-shape hash
+			// (rec.HashBody(SafeBodyPreview), surfaced as decision.CacheKey).
+			// NEVER the raw transport hash — that would break the feature for
+			// auth/token endpoints with rotating values. (code review P0 catch +
+			// design lock-in, May 11 2026.)
+			//
+			// http_status is part of the key (code review P1, locked May 11 2026):
+			// cheap guard against 200/401/500 responses with similar body
+			// shapes collapsing into the same row.
+			version: 12,
+			desc:    "v1.0 Card 4: expected_endpoints for path-scoped operator confirmations",
+			sql: `CREATE TABLE IF NOT EXISTS expected_endpoints (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				host TEXT NOT NULL,
+				http_method TEXT NOT NULL,
+				http_path TEXT NOT NULL,
+				http_status INTEGER NOT NULL,
+				body_preview_hash TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				created_by_event_id TEXT NOT NULL DEFAULT '',
+				description TEXT NOT NULL DEFAULT '',
+
+				UNIQUE(host, http_method, http_path, http_status, body_preview_hash)
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_expected_endpoints_lookup
+				ON expected_endpoints(host, http_method, http_path, http_status);`,
+		},
 	}
 
 	for _, m := range migrations {
