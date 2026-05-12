@@ -430,8 +430,43 @@ func isSensitiveKey(key string) bool {
 }
 
 // looksLikeBase64 checks if a string looks like base64-encoded data.
+//
+// v0.48.x hotfix (2026-05-11): false-positive trigger on English sentences.
+// Before: ratio threshold 0.85 with no whitespace check. A 41-char string
+// like "This captain instance only accepts API v2" scored 35/41 ≈ 0.854 —
+// just above 0.85 — and got `[REDACTED:encoded]`, which then poisoned the
+// body preview, hashed differently than the actual response, and surfaced
+// as a false positive in the Option-4 investigation (kovicloud.com upload
+// log line, May 8 2026).
+//
+// Two changes:
+//   1. Early-out if `s` contains any whitespace. In the contexts this
+//      function actually runs (HTTP response bodies as JSON string values,
+//      header values, query parameters), base64 payloads are contiguous
+//      tokens — no spaces, tabs, or embedded newlines. Whitespace is the
+//      strongest signal that the string is human text masquerading as a
+//      high-density alphabet. Note: MIME/PEM-style base64 IS line-wrapped
+//      with newlines (76-char chunks), but those forms travel as document
+//      bodies rather than inline string values; we don't see them in the
+//      contexts this check runs against. If that ever changes, we'd want a
+//      context-aware variant rather than relaxing this check.
+//   2. Tighten ratio 0.85 → 0.95. Defense-in-depth for whitespace-free
+//      false positives (URL slugs, long identifiers, hex IDs). Real base64
+//      strings are essentially 100% alphabet-valid; any meaningful gap
+//      below that means it's something else.
+//
+// Known limitation (not fixed here): pure-alphanumeric English words
+// ("hello123world") still score 100%. The proper fix is entropy-based
+// detection, which is scope creep for a hotfix. Whitespace + 0.95 catches
+// the documented false-positive class. Entropy-based detection is v1.x.
 func looksLikeBase64(s string) bool {
 	if len(s) < 20 {
+		return false
+	}
+	// Whitespace early-out — in the contexts this runs (inline JSON values,
+	// header values), real base64 payloads are contiguous tokens. MIME/PEM
+	// line-wrapped base64 is a different shape we don't encounter here.
+	if strings.ContainsAny(s, " \t\n\r\v\f") {
 		return false
 	}
 	b64Chars := 0
@@ -440,7 +475,7 @@ func looksLikeBase64(s string) bool {
 			b64Chars++
 		}
 	}
-	return float64(b64Chars)/float64(len(s)) > 0.85
+	return float64(b64Chars)/float64(len(s)) > 0.95
 }
 
 // =============================================================================
