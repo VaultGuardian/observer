@@ -46,6 +46,13 @@ type EvidenceCollector interface {
 	// The push callback (if set) fires immediately on match.
 	PinVIP(eventID string, correlationKey string, req LookupRequest)
 
+	// PrePin preserves REC evidence before LLM classification delay.
+	// Called when an event enters the LLM path (pattern miss). Checks
+	// the existing ring buffer for a matching response and promotes it
+	// to VIP (protected from eviction). If no match yet, registers a
+	// VIP pin for future responses.
+	PrePin(eventID string, req LookupRequest)
+
 	// SetVIPCallback registers the push notification function.
 	// Called from main.go with a function that has access to the coordinator.
 	// Fires with the correlation key when VIP evidence is matched.
@@ -176,6 +183,7 @@ func (n *noOpCollector) Start(ctx context.Context) error                        
 func (n *noOpCollector) Enabled() bool                                                   { return false }
 func (n *noOpCollector) Stats() RECStats                                                 { return RECStats{} }
 func (n *noOpCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {}
+func (n *noOpCollector) PrePin(eventID string, req LookupRequest)                        {}
 func (n *noOpCollector) SetVIPCallback(fn func(correlationKey string))                   {}
 
 func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
@@ -531,19 +539,19 @@ func (lc *liveCollector) PinVIP(eventID string, correlationKey string, req Looku
 	lc.vipMu.Lock()
 	defer lc.vipMu.Unlock()
 
-	// Enforce max entries — evict oldest if full
-	if len(lc.vipPins) >= vipMaxEntries {
-		var oldestID string
-		var oldestTime time.Time
-		for id, pin := range lc.vipPins {
-			if oldestID == "" || pin.createdAt.Before(oldestTime) {
-				oldestID = id
-				oldestTime = pin.createdAt
-			}
-		}
-		if oldestID != "" {
-			delete(lc.vipPins, oldestID)
-		}
+	// If PrePin already promoted evidence for this event, do not add a
+	// redundant future pin. The coordinator will find the VIP evidence
+	// during normal Lookup.
+	if _, exists := lc.vipEvidence[eventID]; exists {
+		log.Printf("[rec:vip] Evidence already VIP-promoted for %s; skipping future pin", eventID)
+		return
+	}
+
+	// If PrePin already created a future pin, overwrite it below to add the
+	// coordinator correlationKey. If this is a brand-new pin, enforce the
+	// combined pins+evidence cap first.
+	if _, alreadyPinned := lc.vipPins[eventID]; !alreadyPinned {
+		lc.enforceVIPCapLocked()
 	}
 
 	lc.vipPins[eventID] = &vipPin{
@@ -555,6 +563,113 @@ func (lc *liveCollector) PinVIP(eventID string, correlationKey string, req Looku
 
 	log.Printf("[rec:vip] Pinned evidence for %s: method=%s path=%s host=%s status=%d",
 		eventID, req.Method, req.Path, req.Host, req.StatusCode)
+}
+
+// PrePin preserves REC evidence before LLM classification delay.
+//
+// Called when an event enters the LLM path (pattern store miss). At this
+// point the HTTP response is almost certainly still in the 30-second ring
+// buffer. PrePin promotes it to VIP (120s TTL, protected from eviction)
+// so the coordinator can find it after the LLM call completes.
+//
+// Two paths:
+//  1. Response already in buffer → promote to vipEvidence immediately
+//  2. Response not yet captured  → register VIP pin for future match
+//
+// Lock ordering: vipMu → buffer.mu (RLock). Safe because the sniffer's
+// onCapture callback releases buffer.mu before calling handleCapturedResponse
+// which takes vipMu. No deadlock cycle.
+func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
+	if !lc.running.Load() {
+		return
+	}
+
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+
+	// Don't double-pin the same event
+	if _, exists := lc.vipEvidence[eventID]; exists {
+		return
+	}
+	if _, exists := lc.vipPins[eventID]; exists {
+		return
+	}
+
+	// Step 1: Check existing ring buffer for a matching response
+	candidates := lc.buffer.Lookup(req)
+	if len(candidates) > 0 {
+		// Promote best candidate to VIP (protected from eviction)
+		best := candidates[0]
+		bestScore := candidateScore(best, req)
+		for _, c := range candidates[1:] {
+			if score := candidateScore(c, req); score < bestScore {
+				best = c
+				bestScore = score
+			}
+		}
+
+		lc.enforceVIPCapLocked()
+		lc.vipEvidence[eventID] = best
+		atomic.AddInt64(&lc.vipMatches, 1)
+
+		log.Printf("[rec:prepin] Evidence promoted from buffer for %s: status=%d method=%s path=%s candidates=%d",
+			eventID, best.StatusCode, best.Method, best.Path, len(candidates))
+		return
+	}
+
+	// Step 2: Response not in buffer yet — register pin for future match
+	// No correlationKey at this stage (coordinator key hasn't been built yet).
+	// The coordinator will find the evidence via lookupVIPEvidence during
+	// its normal Lookup call.
+	lc.enforceVIPCapLocked()
+	lc.vipPins[eventID] = &vipPin{
+		eventID:   eventID,
+		criteria:  req,
+		createdAt: time.Now(),
+	}
+
+	log.Printf("[rec:prepin] Watching for future evidence for %s: method=%s path=%s host=%s status=%d",
+		eventID, req.Method, req.Path, req.Host, req.StatusCode)
+}
+
+// enforceVIPCapLocked evicts the oldest VIP entry (pin or evidence) when
+// the combined count reaches the cap. Must be called with vipMu held.
+//
+// With PrePin, VIP is no longer "malicious-only" — all LLM-path events
+// can get temporary VIP slots. The cap prevents unbounded memory growth
+// from benign events that get pre-pinned but classified as suppress/allow.
+func (lc *liveCollector) enforceVIPCapLocked() {
+	for len(lc.vipPins)+len(lc.vipEvidence) >= vipMaxEntries {
+		var oldestID string
+		var oldestTime time.Time
+		var oldestKind string
+
+		for id, pin := range lc.vipPins {
+			if oldestID == "" || pin.createdAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = pin.createdAt
+				oldestKind = "pin"
+			}
+		}
+
+		for id, resp := range lc.vipEvidence {
+			if oldestID == "" || resp.Timestamp.Before(oldestTime) {
+				oldestID = id
+				oldestTime = resp.Timestamp
+				oldestKind = "evidence"
+			}
+		}
+
+		if oldestID == "" {
+			return
+		}
+
+		if oldestKind == "pin" {
+			delete(lc.vipPins, oldestID)
+		} else {
+			delete(lc.vipEvidence, oldestID)
+		}
+	}
 }
 
 // SetVIPCallback registers the push notification callback.
@@ -582,8 +697,11 @@ func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
 			log.Printf("[rec:vip] Evidence matched for %s: status=%d method=%s path=%s",
 				eventID, resp.StatusCode, resp.Method, resp.Path)
 
-			// Fire push callback (non-blocking)
-			if lc.onVIPMatch != nil {
+			// Fire push callback (non-blocking).
+			// Guard: PrePin registers pins without a correlationKey (coordinator
+			// key hasn't been built yet). Only fire the callback when the key
+			// is known, otherwise we'd push empty strings to the coordinator.
+			if correlationKey != "" && lc.onVIPMatch != nil {
 				go lc.onVIPMatch(correlationKey)
 			}
 			return

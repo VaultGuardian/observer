@@ -121,6 +121,50 @@ func main() {
 	}
 	collector := rec.NewCollector(recCfg)
 
+	// Wire REC evidence pre-pinning into the analyzer.
+	// When the analyzer hits a pattern-store miss (event entering LLM path),
+	// it calls this to promote any matching ring buffer evidence to VIP
+	// before LLM queue delay can cause eviction. Parses HTTP identity the
+	// same way routeAlert() does — raw path for REC, normalized host.
+	a.SetPrePinFunc(func(evt *event.Event) {
+		if !collector.Enabled() {
+			return
+		}
+
+		nMethod, nPath, nHost, nStatus := parseNormalizedLine(evt.NormalizedLine)
+		rMethod, rPath, _, rStatus := parseRawHTTPLine(evt.Line)
+
+		method := rMethod
+		if method == "" {
+			method = nMethod
+		}
+
+		rawPath := rPath
+		if rawPath == "" {
+			rawPath = nPath
+		}
+
+		statusCode := rStatus
+		if statusCode == 0 {
+			statusCode = nStatus
+		}
+
+		if method == "" || rawPath == "" {
+			return // non-HTTP event, no REC evidence to pin
+		}
+
+		collector.PrePin(evt.ID, rec.LookupRequest{
+			Method:          method,
+			Path:            rawPath,
+			Host:            nHost,
+			SourceContainer: evt.SourceName,
+			StatusCode:      statusCode,
+			Timestamp:       evt.Timestamp,
+			Window:          10 * time.Second,
+			ExpectedBytes:   extractResponseBytes(evt.Line),
+		})
+	})
+
 	// ------- Context with graceful shutdown -------
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

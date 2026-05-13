@@ -60,8 +60,21 @@ type Analyzer struct {
 	// Shared with T2 evidence and catch-all verification paths.
 	llmScheduler LLMScheduler
 
+	// prePinEvidence is called before an event enters the LLM path
+	// (pattern store miss). Promotes any matching REC ring buffer entry
+	// to VIP so evidence survives the LLM classification delay.
+	// Optional — nil means no pre-pinning (REC disabled or not wired).
+	prePinEvidence func(evt *event.Event)
+
 	// stats uses atomic counters — safe for concurrent goroutines.
 	stats Stats
+}
+
+// SetPrePinFunc registers the REC evidence pre-pin callback.
+// Called from main.go after the collector is created. The callback
+// parses HTTP identity from the event and calls collector.PrePin().
+func (a *Analyzer) SetPrePinFunc(fn func(evt *event.Event)) {
+	a.prePinEvidence = fn
 }
 
 // Stats tracks pipeline performance metrics.
@@ -236,6 +249,15 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	}
 
 	// --- Step 3: Unknown → consult LLM (with backpressure) ---
+
+	// Pre-pin REC evidence before the LLM path. At this point the HTTP
+	// response is almost certainly still in the 30-second ring buffer.
+	// Whether TryAcquire succeeds (immediate LLM call, ~5s) or fails
+	// (deferred to retry queue, 60-90+ seconds), the evidence is promoted
+	// to VIP (120s TTL) and protected from eviction.
+	if a.prePinEvidence != nil {
+		a.prePinEvidence(evt)
+	}
 
 	// Try to acquire a slot from the global LLM scheduler.
 	// Non-blocking: if all slots are busy, return deferred.
