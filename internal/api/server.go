@@ -319,6 +319,7 @@ func (s *Server) handleFindings(w http.ResponseWriter, r *http.Request) {
 
 	verdict := r.URL.Query().Get("verdict")
 	ip := r.URL.Query().Get("ip")
+	eventID := r.URL.Query().Get("event_id")
 	limitStr := r.URL.Query().Get("limit")
 
 	limit := 50
@@ -329,6 +330,18 @@ func (s *Server) handleFindings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+
+	// Single finding by event_id — used by Event Detail Page
+	if eventID != "" {
+		finding, err := s.store.GetFindingByEventID(ctx, eventID)
+		if err != nil {
+			jsonError(w, fmt.Sprintf("Finding not found: %v", err), http.StatusNotFound)
+			return
+		}
+		jsonOK(w, []store.Finding{*finding})
+		return
+	}
+
 	var findings []store.Finding
 	var err error
 
@@ -582,6 +595,7 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	filter.Classification = r.URL.Query().Get("classification")
 	filter.ReviewStatus = r.URL.Query().Get("review_status")
 	filter.SourceScope = r.URL.Query().Get("source_scope")
+	filter.EventID = r.URL.Query().Get("event_id")
 
 	if v := r.URL.Query().Get("min_confidence"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -1115,8 +1129,9 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 // misconfig) still escalates correctly. That's the safety net.
 //
 // Architectural distinction from failed_probe:
-//   failed_probe         → catchall_verified_v2  — path-agnostic, statistical
-//   expected_endpoint    → expected_endpoints    — path-scoped, deterministic
+//
+//	failed_probe         → catchall_verified_v2  — path-agnostic, statistical
+//	expected_endpoint    → expected_endpoints    — path-scoped, deterministic
 //
 // CRITICAL: this handler REQUIRES decision != nil && decision.CacheKey != "".
 // The redacted shape hash lives on decision.CacheKey; without it, we can't

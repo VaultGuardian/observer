@@ -34,12 +34,12 @@ type LLMDecision struct {
 	Timestamp time.Time `json:"timestamp"`
 
 	// Call metadata
-	Tier            string `json:"tier"` // "classify", "reclassify", "catchall_verify"
-	Model           string `json:"model"`
-	ReasoningEffort string `json:"reasoning_effort"`
-	PromptTokens    int    `json:"prompt_tokens"`
-	CompletionTokens int   `json:"completion_tokens"`
-	LatencyMs       int64  `json:"latency_ms"`
+	Tier             string `json:"tier"` // "classify", "reclassify", "catchall_verify"
+	Model            string `json:"model"`
+	ReasoningEffort  string `json:"reasoning_effort"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	LatencyMs        int64  `json:"latency_ms"`
 
 	// Input context
 	SourceScope     string `json:"source_scope"`
@@ -76,12 +76,12 @@ type LLMDecision struct {
 	CodeVersion   string `json:"code_version,omitempty"`   // Observer version
 
 	// Human review (gold layer — populated later via API)
-	ReviewStatus      string `json:"review_status"` // pending, confirmed, corrected, ignored
-	ReviewedBy        string `json:"reviewed_by,omitempty"`
-	ReviewedAt        string `json:"reviewed_at,omitempty"`
-	ReviewerVerdict   string `json:"reviewer_verdict,omitempty"`
-	ReviewerReason    string `json:"reviewer_reason,omitempty"`
-	PatternDeleted    bool   `json:"pattern_deleted"`
+	ReviewStatus       string `json:"review_status"` // pending, confirmed, corrected, ignored
+	ReviewedBy         string `json:"reviewed_by,omitempty"`
+	ReviewedAt         string `json:"reviewed_at,omitempty"`
+	ReviewerVerdict    string `json:"reviewer_verdict,omitempty"`
+	ReviewerReason     string `json:"reviewer_reason,omitempty"`
+	PatternDeleted     bool   `json:"pattern_deleted"`
 	ReplacementPattern string `json:"replacement_pattern,omitempty"`
 
 	// Derived (not stored, computed on query)
@@ -132,6 +132,7 @@ type LLMDecisionFilter struct {
 	Tier           string // "classify", "reclassify", "catchall_verify"
 	Classification string
 	ReviewStatus   string // "pending", "confirmed", "corrected", "ignored"
+	EventID        string // filter by specific event
 	MinConfidence  float64
 	MaxConfidence  float64
 	SourceScope    string
@@ -161,6 +162,10 @@ func (s *Store) ListLLMDecisions(ctx context.Context, f LLMDecisionFilter) ([]LL
 	if f.Tier != "" {
 		query += " AND tier = ?"
 		args = append(args, f.Tier)
+	}
+	if f.EventID != "" {
+		query += " AND event_id = ?"
+		args = append(args, f.EventID)
 	}
 	if f.Classification != "" {
 		query += " AND classification = ?"
@@ -377,21 +382,21 @@ func (s *Store) UpdateLLMDecisionReview(ctx context.Context, id int64, review LL
 
 // LLMReview is the human correction payload.
 type LLMReview struct {
-	Status             string `json:"status"`              // confirmed, corrected, ignored
+	Status             string `json:"status"` // confirmed, corrected, ignored
 	ReviewedBy         string `json:"reviewed_by"`
-	Verdict            string `json:"verdict,omitempty"`    // new verdict if corrected
-	Reason             string `json:"reason,omitempty"`     // why the correction was made
+	Verdict            string `json:"verdict,omitempty"` // new verdict if corrected
+	Reason             string `json:"reason,omitempty"`  // why the correction was made
 	PatternDeleted     bool   `json:"pattern_deleted"`
 	ReplacementPattern string `json:"replacement_pattern,omitempty"`
 }
 
 // LLMDecisionCounts returns summary counts for the dashboard.
 type LLMDecisionCounts struct {
-	Total       int64 `json:"total"`
-	Pending     int64 `json:"pending"`
-	Confirmed   int64 `json:"confirmed"`
-	Corrected   int64 `json:"corrected"`
-	ByTier      map[string]int64 `json:"by_tier"`
+	Total            int64            `json:"total"`
+	Pending          int64            `json:"pending"`
+	Confirmed        int64            `json:"confirmed"`
+	Corrected        int64            `json:"corrected"`
+	ByTier           map[string]int64 `json:"by_tier"`
 	ByClassification map[string]int64 `json:"by_classification"`
 }
 
