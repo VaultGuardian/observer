@@ -68,12 +68,13 @@ const (
 // case-insensitively for EQUALITY against each blocklist entry.
 //
 // This means:
-//   "ERROR"                         → blocked (stripped="ERROR")
-//   "ERROR "                        → blocked (stripped="ERROR")
-//   "ERROR <NUM>"                   → blocked (stripped="ERROR")
-//   "ERROR <TS> <PID> <CONN>"       → blocked (stripped="ERROR")
-//   "ERROR opening database conn"   → allowed (stripped has real content)
-//   "Failed password for "          → allowed (no entry matches "Failedpasswordfor")
+//
+//	"ERROR"                         → blocked (stripped="ERROR")
+//	"ERROR "                        → blocked (stripped="ERROR")
+//	"ERROR <NUM>"                   → blocked (stripped="ERROR")
+//	"ERROR <TS> <PID> <CONN>"       → blocked (stripped="ERROR")
+//	"ERROR opening database conn"   → allowed (stripped has real content)
+//	"Failed password for "          → allowed (no entry matches "Failedpasswordfor")
 //
 // "Failed" and "Exception" intentionally NOT listed — the Tier-1 prompt
 // recommends prefixes like "Failed password for " for SSH brute-force
@@ -144,6 +145,18 @@ type LearnedPattern struct {
 
 	// CreatedAt is when the pattern was learned.
 	CreatedAt time.Time `json:"created_at"`
+
+	// CreatedFromEventID links back to the event that triggered this pattern's
+	// creation. Powers the cache lineage feature: "Originally learned from evt_x".
+	// Empty for seeded patterns and patterns learned before this field existed.
+	CreatedFromEventID string `json:"created_from_event_id,omitempty"`
+
+	// RevokedAt / RevokedBy support soft-disable of patterns (append-only
+	// correction model). Revoked patterns are skipped by Match() but preserved
+	// in the store for audit trail. Physical deletion remains available via
+	// DeletePattern() for backward compatibility.
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy string     `json:"revoked_by,omitempty"`
 
 	// compiled is the pre-compiled regex (only for PatternRegex).
 	// Not serialized — rebuilt on load.
@@ -340,29 +353,32 @@ func (s *Store) getBucket(scope *ScopeEntry, v Verdict) *PatternBucket {
 }
 
 // matchTiers runs through the matching tiers in priority order.
+// Revoked patterns are skipped — they remain in the store for audit trail
+// but do not participate in matching. Future events matching a revoked
+// pattern will fall through to fresh LLM classification.
 func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *MatchResult {
 	// Tier 1: Exact hash (O(1), nanoseconds)
-	if p, ok := b.Hashes[hash]; ok {
+	if p, ok := b.Hashes[hash]; ok && p.RevokedAt == nil {
 		return &MatchResult{Verdict: v, Pattern: p, Tier: PatternHash}
 	}
 
 	// Tier 2: Prefix (strings.HasPrefix, sub-nanosecond each)
 	for _, p := range b.Prefixes {
-		if strings.HasPrefix(normalizedLine, p.Value) {
+		if p.RevokedAt == nil && strings.HasPrefix(normalizedLine, p.Value) {
 			return &MatchResult{Verdict: v, Pattern: p, Tier: PatternPrefix}
 		}
 	}
 
 	// Tier 3: Regex (pre-compiled, microseconds each)
 	for _, p := range b.Regexes {
-		if p.compiled != nil && p.compiled.MatchString(normalizedLine) {
+		if p.RevokedAt == nil && p.compiled != nil && p.compiled.MatchString(normalizedLine) {
 			return &MatchResult{Verdict: v, Pattern: p, Tier: PatternRegex}
 		}
 	}
 
 	// Tier 4: Contains (guarded, rare — checked last)
 	for _, p := range b.Contains {
-		if strings.Contains(normalizedLine, p.Value) {
+		if p.RevokedAt == nil && strings.Contains(normalizedLine, p.Value) {
 			return &MatchResult{Verdict: v, Pattern: p, Tier: PatternContains}
 		}
 	}
@@ -446,14 +462,15 @@ func (s *Store) bucketAtCap(bucket *PatternBucket, pt PatternType) (string, bool
 }
 
 // LearnHash is a convenience method for adding an exact hash match.
-func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, originalLine string) {
+func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, originalLine, eventID string) {
 	_ = s.Learn(scopeKey, verdict, LearnedPattern{
-		Type:         PatternHash,
-		Value:        hash,
-		Source:       "auto",
-		Reason:       reason,
-		OriginalLine: originalLine,
-		CreatedAt:    time.Now(),
+		Type:               PatternHash,
+		Value:              hash,
+		Source:             "auto",
+		Reason:             reason,
+		OriginalLine:       originalLine,
+		CreatedAt:          time.Now(),
+		CreatedFromEventID: eventID,
 	})
 }
 
@@ -467,12 +484,18 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 //
 //   - "auto" / "llm" / anything else (LLM-driven auto-learning) faces
 //     stricter rules:
-//       * prefix length >= 20 chars
-//       * prefix must be a literal prefix of OriginalLine
-//       * prefix must not be on the generic-token blocklist (ERROR, GET /, etc.)
-//       * regex must compile, must match OriginalLine, must be anchored with ^
-//       * regex must not appear on the generic-pattern blocklist
-//       * contains is forbidden (only human/seeded may use contains)
+//
+//   - prefix length >= 20 chars
+//
+//   - prefix must be a literal prefix of OriginalLine
+//
+//   - prefix must not be on the generic-token blocklist (ERROR, GET /, etc.)
+//
+//   - regex must compile, must match OriginalLine, must be anchored with ^
+//
+//   - regex must not appear on the generic-pattern blocklist
+//
+//   - contains is forbidden (only human/seeded may use contains)
 //
 // The point of a strict validator is that "no" means no — there is no
 // fallback to a softer pattern type. Callers that previously relied on a
@@ -754,6 +777,54 @@ func (s *Store) DeletePattern(scopeKey string, verdict Verdict, patternValue str
 		for i, p := range *list {
 			if p.Value == patternValue {
 				*list = append((*list)[:i], (*list)[i+1:]...)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RevokePattern soft-disables a pattern by setting RevokedAt and RevokedBy.
+// The pattern remains in the store for audit trail but is skipped by Match().
+// This is the append-only correction model: the original decision is immutable
+// history, the revocation is a new action layered on top.
+//
+// Returns true if the pattern was found and revoked.
+// Use DeletePattern() for hard removal (backward-compatible, pre-revoke flow).
+func (s *Store) RevokePattern(scopeKey string, verdict Verdict, patternValue, revokedBy string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var scope *ScopeEntry
+	if scopeKey == "__global__" {
+		scope = s.global
+	} else {
+		scope = s.scopes[scopeKey]
+	}
+	if scope == nil {
+		return false
+	}
+
+	bucket := s.getBucket(scope, verdict)
+	if bucket == nil {
+		return false
+	}
+
+	now := time.Now()
+
+	// Try hash first
+	if p, ok := bucket.Hashes[patternValue]; ok {
+		p.RevokedAt = &now
+		p.RevokedBy = revokedBy
+		return true
+	}
+
+	// Try prefix/regex/contains lists
+	for _, list := range []*[]*LearnedPattern{&bucket.Prefixes, &bucket.Regexes, &bucket.Contains} {
+		for _, p := range *list {
+			if p.Value == patternValue {
+				p.RevokedAt = &now
+				p.RevokedBy = revokedBy
 				return true
 			}
 		}

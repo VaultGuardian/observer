@@ -11,12 +11,13 @@ import "time"
 // classify; this remembers WHAT was classified and WHAT the outcome was.
 //
 // RESOLUTION LIFECYCLE (v1.0 hardening, Fix 4):
-//   Malicious HTTP findings now track resolution state:
-//     - NULL/""          = legacy finding or non-HTTP (no resolution tracking)
-//     - "pending"        = malicious HTTP, evidence lookup in progress
-//     - "resolved"       = evidence arrived, finding downgraded or escalated
-//     - "evidence_unavailable" = bounded window expired, evidence never arrived
-//   Resolution is append-only: original verdict is preserved in PreviousVerdict.
+//
+//	Malicious HTTP findings now track resolution state:
+//	  - NULL/""          = legacy finding or non-HTTP (no resolution tracking)
+//	  - "pending"        = malicious HTTP, evidence lookup in progress
+//	  - "resolved"       = evidence arrived, finding downgraded or escalated
+//	  - "evidence_unavailable" = bounded window expired, evidence never arrived
+//	Resolution is append-only: original verdict is preserved in PreviousVerdict.
 type Finding struct {
 	// Event identity
 	EventID    string    `json:"event_id"`
@@ -45,6 +46,12 @@ type Finding struct {
 	MatchedPatternScope  string `json:"matched_pattern_scope,omitempty"`
 	MatchedPatternBucket string `json:"matched_pattern_bucket,omitempty"` // allow, malicious, alert, suppress
 	MatchedPatternValue  string `json:"matched_pattern_value,omitempty"`
+
+	// OriginEventID is the event that originally taught the pattern this
+	// finding matched (cache lineage). Denormalized from the pattern store
+	// so the link survives pattern deletion/revocation. Empty for LLM-origin
+	// events and events classified before lineage tracking was added.
+	OriginEventID string `json:"origin_event_id,omitempty"`
 
 	// Raw/normalized data
 	RawLine        string `json:"raw_line,omitempty"`
@@ -87,7 +94,7 @@ type ScannerSession struct {
 	LastSeen    time.Time `json:"last_seen"`
 	ProbeCount  int       `json:"probe_count"`
 	SamplePaths string    `json:"sample_paths"` // JSON array of first N paths
-	Verdict     string    `json:"verdict"`       // recon_failed, recon_success, mixed
+	Verdict     string    `json:"verdict"`      // recon_failed, recon_success, mixed
 	Notified    bool      `json:"notified"`
 }
 

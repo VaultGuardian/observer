@@ -119,6 +119,8 @@ type FinalAlert struct {
 	PatternBucket string
 	PatternValue  string
 
+	OriginEventID string // event that taught the matched pattern (cache lineage)
+
 	EvidenceJournal string
 	Evidence        interface{}
 
@@ -162,6 +164,8 @@ type PendingAlert struct {
 	PatternScope  string
 	PatternBucket string
 	PatternValue  string
+
+	OriginEventID string // event that taught the matched pattern (cache lineage)
 
 	BodyPreviewHash string
 
@@ -327,6 +331,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 				PatternScope:    alert.PatternScope,
 				PatternBucket:   alert.PatternBucket,
 				PatternValue:    alert.PatternValue,
+				OriginEventID:   alert.OriginEventID,
 				Downgraded:      true,
 				DowngradeReason: reason,
 				EventCount:      1,
@@ -723,6 +728,7 @@ func buildFinalAlert(pending *PendingAlert, shape finalShape) *FinalAlert {
 		PatternScope:    pending.PatternScope,
 		PatternBucket:   pending.PatternBucket,
 		PatternValue:    pending.PatternValue,
+		OriginEventID:   pending.OriginEventID,
 		EvidenceJournal: pending.EvidenceJournal,
 		Evidence:        pending.EvidenceResult,
 		Downgraded:      shape.downgraded,

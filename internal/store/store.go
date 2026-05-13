@@ -447,6 +447,17 @@ func (s *Store) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_expected_endpoints_lookup
 				ON expected_endpoints(host, http_method, http_path, http_status);`,
 		},
+		{
+			// Cache lineage: stores the event that originally taught the pattern
+			// a cache-hit finding matched. Denormalized from the pattern store so
+			// the link survives pattern deletion/revocation.
+			//
+			// Existing findings get empty string (DEFAULT ''). The UI treats empty
+			// as "lineage unavailable" (pre-lineage event or LLM-origin).
+			version: 13,
+			desc:    "cache lineage: origin_event_id on findings",
+			sql:     `ALTER TABLE findings ADD COLUMN origin_event_id TEXT DEFAULT '';`,
+		},
 	}
 
 	for _, m := range migrations {

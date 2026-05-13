@@ -954,12 +954,13 @@ func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Contex
 
 	// Step 2: Create the correct human hash pattern with "human" source
 	if err := s.patterns.Learn(sourceScope, patternstore.Verdict(targetVerdict), patternstore.LearnedPattern{
-		Type:         patternstore.PatternHash,
-		Value:        hash,
-		Source:       "human",
-		Reason:       humanReason,
-		OriginalLine: line,
-		CreatedAt:    time.Now(),
+		Type:               patternstore.PatternHash,
+		Value:              hash,
+		Source:             "human",
+		Reason:             humanReason,
+		OriginalLine:       line,
+		CreatedAt:          time.Now(),
+		CreatedFromEventID: finding.EventID,
 	}); err != nil {
 		jsonError(w, "failed to create pattern: "+err.Error(), http.StatusInternalServerError)
 		return

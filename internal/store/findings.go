@@ -24,6 +24,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		source_ip, dest_host, http_method, http_path, http_status, response_bytes, user_agent,
 		verdict, classification, confidence, reason, matched_via,
 		matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
+		origin_event_id,
 		raw_line, normalized_line, normalized_hash,
 		evidence_status, evidence_status_code, evidence_content_type,
 		evidence_body_hash, evidence_capture_mode,
@@ -35,6 +36,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?,
 		?, ?, ?,
+		?,
 		?, ?, ?,
 		?, ?, ?,
 		?, ?,
@@ -46,6 +48,7 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 		f.SourceIP, f.DestHost, f.HTTPMethod, f.HTTPPath, f.HTTPStatus, f.ResponseBytes, f.UserAgent,
 		f.Verdict, f.Classification, f.Confidence, f.Reason, f.MatchedVia,
 		f.MatchedPatternScope, f.MatchedPatternBucket, f.MatchedPatternValue,
+		f.OriginEventID,
 		f.RawLine, f.NormalizedLine, f.NormalizedHash,
 		f.EvidenceStatus, f.EvidenceStatusCode, f.EvidenceContentType,
 		f.EvidenceBodyHash, f.EvidenceCaptureMode,
@@ -168,6 +171,7 @@ func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding,
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
+		       COALESCE(origin_event_id,''),
 		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
@@ -192,6 +196,7 @@ func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) (
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
+		       COALESCE(origin_event_id,''),
 		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
@@ -216,6 +221,7 @@ func (s *Store) QueryRecent(ctx context.Context, limit int) ([]Finding, error) {
 		       source_ip, dest_host, http_method, http_path, http_status,
 		       verdict, classification, confidence, reason, matched_via,
 		       matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
+		       COALESCE(origin_event_id,''),
 		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
@@ -408,6 +414,8 @@ func (w *FindingsWriter) flushBatch(ctx context.Context, batch []*Finding) {
 		event_id, timestamp, source_type, source_name,
 		source_ip, dest_host, http_method, http_path, http_status, response_bytes, user_agent,
 		verdict, classification, confidence, reason, matched_via,
+		matched_pattern_scope, matched_pattern_bucket, matched_pattern_value,
+		origin_event_id,
 		raw_line, normalized_line, normalized_hash,
 		evidence_status, evidence_status_code, evidence_content_type,
 		evidence_body_hash, evidence_capture_mode,
@@ -418,6 +426,8 @@ func (w *FindingsWriter) flushBatch(ctx context.Context, batch []*Finding) {
 		?, ?, ?, ?,
 		?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?,
+		?, ?, ?,
+		?,
 		?, ?, ?,
 		?, ?, ?,
 		?, ?,
@@ -442,6 +452,8 @@ func (w *FindingsWriter) flushBatch(ctx context.Context, batch []*Finding) {
 			f.EventID, f.Timestamp.Format(time.RFC3339), f.SourceType, f.SourceName,
 			f.SourceIP, f.DestHost, f.HTTPMethod, f.HTTPPath, f.HTTPStatus, f.ResponseBytes, f.UserAgent,
 			f.Verdict, f.Classification, f.Confidence, f.Reason, f.MatchedVia,
+			f.MatchedPatternScope, f.MatchedPatternBucket, f.MatchedPatternValue,
+			f.OriginEventID,
 			f.RawLine, f.NormalizedLine, f.NormalizedHash,
 			f.EvidenceStatus, f.EvidenceStatusCode, f.EvidenceContentType,
 			f.EvidenceBodyHash, f.EvidenceCaptureMode,
@@ -502,6 +514,7 @@ func scanFindings(rows interface {
 			&f.SourceIP, &f.DestHost, &f.HTTPMethod, &f.HTTPPath, &f.HTTPStatus,
 			&f.Verdict, &f.Classification, &f.Confidence, &f.Reason, &f.MatchedVia,
 			&f.MatchedPatternScope, &f.MatchedPatternBucket, &f.MatchedPatternValue,
+			&f.OriginEventID,
 			&f.NormalizedLine, &f.NormalizedHash, &downgraded, &f.DowngradeReason, &notified,
 			&f.EvidenceBodyHash, &f.EvidenceStatusCode,
 			&f.EvidenceContentType, &f.ResolutionStatus,
@@ -515,6 +528,7 @@ func scanFindings(rows interface {
 	}
 	return findings, rows.Err()
 }
+
 // UpdateFindingVerdict changes the verdict on a finding as part of a human
 // correction. Records the previous verdict for audit trail, sets resolution
 // method to "human_override". Used when a human corrects a classification
@@ -567,6 +581,7 @@ func (s *Store) GetFindingByEventID(ctx context.Context, eventID string) (*Findi
 		verdict, COALESCE(classification,''), COALESCE(confidence,0), COALESCE(reason,''),
 		COALESCE(matched_via,''),
 		COALESCE(matched_pattern_scope,''), COALESCE(matched_pattern_bucket,''), COALESCE(matched_pattern_value,''),
+		COALESCE(origin_event_id,''),
 		COALESCE(normalized_line,''), COALESCE(normalized_hash,''),
 		COALESCE(downgraded,0), COALESCE(downgrade_reason,''), COALESCE(notified,0),
 		COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
@@ -579,6 +594,7 @@ func (s *Store) GetFindingByEventID(ctx context.Context, eventID string) (*Findi
 		&f.Verdict, &f.Classification, &f.Confidence, &f.Reason,
 		&f.MatchedVia,
 		&f.MatchedPatternScope, &f.MatchedPatternBucket, &f.MatchedPatternValue,
+		&f.OriginEventID,
 		&f.NormalizedLine, &f.NormalizedHash,
 		&downgraded, &f.DowngradeReason, &notified,
 		&f.EvidenceBodyHash, &f.EvidenceStatusCode,

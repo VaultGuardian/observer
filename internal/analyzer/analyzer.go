@@ -29,6 +29,11 @@ type AnalysisResult struct {
 	PatternBucket string `json:"pattern_bucket,omitempty"` // allow, malicious, alert, suppress
 	PatternValue  string `json:"pattern_value,omitempty"`
 
+	// OriginEventID is the event that originally taught this pattern.
+	// Populated on cache hits from LearnedPattern.CreatedFromEventID.
+	// Powers cache lineage: "Originally learned from evt_abc123".
+	OriginEventID string `json:"origin_event_id,omitempty"`
+
 	// LLM-specific fields (only set when the LLM was consulted)
 	LLMClassification string       `json:"llm_classification,omitempty"`
 	LLMConfidence     float64      `json:"llm_confidence,omitempty"`
@@ -225,6 +230,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 				PatternScope:  evt.ScopeKey(),
 				PatternBucket: string(result.Verdict),
 				PatternValue:  result.Pattern.Value,
+				OriginEventID: result.Pattern.CreatedFromEventID,
 			}
 		}
 	}
@@ -282,6 +288,7 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 				PatternScope:  evt.ScopeKey(),
 				PatternBucket: string(result.Verdict),
 				PatternValue:  result.Pattern.Value,
+				OriginEventID: result.Pattern.CreatedFromEventID,
 			}
 		}
 	}
@@ -419,7 +426,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 
 	// Always learn the exact hash for allow/suppress (fast path for exact repeats)
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
-		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine)
+		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
 	}
 
 	// For malicious, learn the hash but NOT patterns (conservative trust model).
@@ -427,7 +434,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	// because malicious classification on identical normalized lines should
 	// continue to fire fast.
 	if v == patternstore.VerdictMalicious {
-		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine)
+		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
 		return false
 	}
 
@@ -436,7 +443,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	// distinct from VerdictMalicious (suspicious vs confirmed-bad). Hash-only, no patterns,
 	// no generalization. The conservative trust model is preserved.
 	if verdict.Action == "alert" {
-		a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine)
+		a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
 		return false
 	}
 
@@ -484,12 +491,13 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	}
 
 	pattern := patternstore.LearnedPattern{
-		Type:         pt,
-		Value:        verdict.Pattern,
-		Source:       "llm",
-		Reason:       verdict.Reason,
-		OriginalLine: evt.NormalizedLine,
-		CreatedAt:    time.Now(),
+		Type:               pt,
+		Value:              verdict.Pattern,
+		Source:             "llm",
+		Reason:             verdict.Reason,
+		OriginalLine:       evt.NormalizedLine,
+		CreatedAt:          time.Now(),
+		CreatedFromEventID: evt.ID,
 	}
 
 	// Strict validation lives in patternstore.validatePattern (v0.47 F3).
