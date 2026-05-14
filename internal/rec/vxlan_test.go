@@ -35,8 +35,8 @@ func buildVXLANPacket(vxlanPort uint16, vni uint32, iFlag bool, innerPayload []b
 
 	// --- Outer UDP ---
 	udpOff := ipOff + 20
-	binary.BigEndian.PutUint16(pkt[udpOff:udpOff+2], 12345)         // src port
-	binary.BigEndian.PutUint16(pkt[udpOff+2:udpOff+4], vxlanPort)   // dst port
+	binary.BigEndian.PutUint16(pkt[udpOff:udpOff+2], 12345)       // src port
+	binary.BigEndian.PutUint16(pkt[udpOff+2:udpOff+4], vxlanPort) // dst port
 	binary.BigEndian.PutUint16(pkt[udpOff+4:udpOff+6], uint16(udpLen))
 
 	// --- VXLAN Header ---
@@ -117,10 +117,10 @@ func TestDecapVXLAN_NoIFlag(t *testing.T) {
 
 func TestDecapVXLAN_TCPPacket(t *testing.T) {
 	// Build a normal TCP packet (not UDP) — should return errNotVXLAN
-	pkt := make([]byte, 14+20+20) // Eth + IPv4 + TCP
+	pkt := make([]byte, 14+20+20)                  // Eth + IPv4 + TCP
 	binary.BigEndian.PutUint16(pkt[12:14], 0x0800) // EtherType = IPv4
-	pkt[14] = 0x45 // IPv4, IHL=5
-	pkt[14+9] = 6  // Protocol = TCP (not UDP)
+	pkt[14] = 0x45                                 // IPv4, IHL=5
+	pkt[14+9] = 6                                  // Protocol = TCP (not UDP)
 
 	_, err := decapVXLAN(pkt, 4789)
 	if err != errNotVXLAN {
@@ -168,7 +168,7 @@ func TestDecapVXLAN_VariableIHL(t *testing.T) {
 
 	// VXLAN header
 	vxlanOff := udpOff + 8
-	pkt[vxlanOff] = 0x08 // I-flag
+	pkt[vxlanOff] = 0x08                                            // I-flag
 	binary.BigEndian.PutUint32(pkt[vxlanOff+4:vxlanOff+8], 4098<<8) // VNI=4098
 
 	// Inner frame
@@ -203,8 +203,8 @@ func TestDecapVXLAN_VLANTag(t *testing.T) {
 
 	// Outer Ethernet with VLAN tag
 	binary.BigEndian.PutUint16(pkt[12:14], 0x8100) // VLAN tag present
-	binary.BigEndian.PutUint16(pkt[14:16], 100)     // VLAN ID 100
-	binary.BigEndian.PutUint16(pkt[16:18], 0x0800)  // Encapsulated EtherType = IPv4
+	binary.BigEndian.PutUint16(pkt[14:16], 100)    // VLAN ID 100
+	binary.BigEndian.PutUint16(pkt[16:18], 0x0800) // Encapsulated EtherType = IPv4
 
 	// Outer IPv4 (starts at offset 18 due to VLAN tag)
 	ipOff := 18

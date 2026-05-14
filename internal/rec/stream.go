@@ -201,13 +201,13 @@ func (s *httpStream) flowKey() streamKey {
 // streamTTL deadline below OR via FlushOlderThan from the assembler — the
 // `next` channel is closed and the next send panics:
 //
-//   panic: send on closed channel
-//   gopacket/tcpassembly/tcpreader.(*ReaderStream).Read
-//     reader.go:178
-//   bufio.(*Reader).fill
-//   net/http.ReadResponse
-//   internal/rec.(*httpStream).runResponse  stream.go:228
-//   internal/rec.(*httpStream).run          stream.go:212
+//	panic: send on closed channel
+//	gopacket/tcpassembly/tcpreader.(*ReaderStream).Read
+//	  reader.go:178
+//	bufio.(*Reader).fill
+//	net/http.ReadResponse
+//	internal/rec.(*httpStream).runResponse  stream.go:228
+//	internal/rec.(*httpStream).run          stream.go:212
 //
 // safeReaderStream.Reassembled already has a `defer recover()` for the
 // assembler-side version of this race (v0.43.1 fix). This is the symmetric

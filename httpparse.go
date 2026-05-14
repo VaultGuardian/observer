@@ -160,8 +160,8 @@ func extractResponseBytes(rawLine string) int64 {
 // but the generic normalizer replaces 4+ digit numbers with <NUM>. This means
 // the same request produces different paths from different containers:
 //
-//   nginx:   /?debug=true&test=1774472800
-//   backend: /?debug=true&test=<NUM>
+//	nginx:   /?debug=true&test=1774472800
+//	backend: /?debug=true&test=<NUM>
 //
 // canonicalPath applies the same number replacement so both containers produce
 // the same coordinator key. This does NOT affect normalizer output, hash stability,

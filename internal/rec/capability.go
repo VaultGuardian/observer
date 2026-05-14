@@ -11,7 +11,8 @@ import (
 // by reading the effective capabilities from /proc/self/status.
 //
 // To grant this capability without running as root, add to observer.service:
-//   AmbientCapabilities=CAP_NET_RAW
+//
+//	AmbientCapabilities=CAP_NET_RAW
 func hasCapNetRaw() bool {
 	f, err := os.Open("/proc/self/status")
 	if err != nil {

@@ -104,12 +104,12 @@ func LoadConfig() Config {
 		RECBufferMaxBytes:   getEnvInt64("REC_BUFFER_MAX_BYTES", 128*1024*1024),
 		RECBufferMaxAge:     getEnvDuration("REC_BUFFER_MAX_AGE", 30*time.Second),
 		RECBufferMaxBody:    getEnvInt("REC_BUFFER_MAX_BODY", 2048),
-		MaxConcurrentLLM:  getEnvInt("LLM_SLOTS", 4),
-		Tier1Effort:       getEnv("LLM_TIER1_EFFORT", "low"),
-		Tier2Effort:       getEnv("LLM_TIER2_EFFORT", "medium"),
-		DashboardPort:     9090,
-		DashboardKeyFile:  getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
-		DashboardBindAddr: getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
+		MaxConcurrentLLM:    getEnvInt("LLM_SLOTS", 4),
+		Tier1Effort:         getEnv("LLM_TIER1_EFFORT", "low"),
+		Tier2Effort:         getEnv("LLM_TIER2_EFFORT", "medium"),
+		DashboardPort:       9090,
+		DashboardKeyFile:    getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+		DashboardBindAddr:   getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
 		// REC reassembly tuning — response-only, bounds are tunable.
 		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),

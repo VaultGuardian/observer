@@ -8,10 +8,11 @@ import (
 // PostgresNormalizer handles PostgreSQL log lines.
 //
 // Typical formats:
-//   2026-03-17 15:10:04.123 UTC [12345] LOG:  database system is ready to accept connections
-//   2026-03-17 15:10:04.123 UTC [12345] user@db LOG:  duration: 1.234 ms  statement: SELECT * FROM users WHERE id = 42
-//   2026-03-17 15:10:04.123 UTC [12345] ERROR:  relation "nonexistent" does not exist
-//   LOG:  checkpoint starting: time
+//
+//	2026-03-17 15:10:04.123 UTC [12345] LOG:  database system is ready to accept connections
+//	2026-03-17 15:10:04.123 UTC [12345] user@db LOG:  duration: 1.234 ms  statement: SELECT * FROM users WHERE id = 42
+//	2026-03-17 15:10:04.123 UTC [12345] ERROR:  relation "nonexistent" does not exist
+//	LOG:  checkpoint starting: time
 //
 // We strip: timestamp, PID, session context (user@db), durations, numeric literals
 // in SQL, and specific parameter values.

@@ -22,10 +22,10 @@ import (
 // FCMNotifier sends push notifications to Android devices via
 // Firebase Cloud Messaging HTTP v1 API with OAuth2 service account auth.
 type FCMNotifier struct {
-	config       FCMConfig
-	httpClient   *http.Client
-	privateKey   *rsa.PrivateKey
-	clientEmail  string
+	config      FCMConfig
+	httpClient  *http.Client
+	privateKey  *rsa.PrivateKey
+	clientEmail string
 
 	// OAuth2 token cache — access tokens are typically valid for 1 hour
 	tokenMu     sync.RWMutex
@@ -35,11 +35,11 @@ type FCMNotifier struct {
 
 // ServiceAccountKey is the parsed Google service account JSON.
 type ServiceAccountKey struct {
-	Type         string `json:"type"`
-	ProjectID    string `json:"project_id"`
-	PrivateKey   string `json:"private_key"`
-	ClientEmail  string `json:"client_email"`
-	TokenURI     string `json:"token_uri"`
+	Type        string `json:"type"`
+	ProjectID   string `json:"project_id"`
+	PrivateKey  string `json:"private_key"`
+	ClientEmail string `json:"client_email"`
+	TokenURI    string `json:"token_uri"`
 }
 
 func NewFCMNotifier(cfg FCMConfig) (*FCMNotifier, error) {

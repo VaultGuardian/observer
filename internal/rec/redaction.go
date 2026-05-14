@@ -440,20 +440,20 @@ func isSensitiveKey(key string) bool {
 // log line, May 8 2026).
 //
 // Two changes:
-//   1. Early-out if `s` contains any whitespace. In the contexts this
-//      function actually runs (HTTP response bodies as JSON string values,
-//      header values, query parameters), base64 payloads are contiguous
-//      tokens — no spaces, tabs, or embedded newlines. Whitespace is the
-//      strongest signal that the string is human text masquerading as a
-//      high-density alphabet. Note: MIME/PEM-style base64 IS line-wrapped
-//      with newlines (76-char chunks), but those forms travel as document
-//      bodies rather than inline string values; we don't see them in the
-//      contexts this check runs against. If that ever changes, we'd want a
-//      context-aware variant rather than relaxing this check.
-//   2. Tighten ratio 0.85 → 0.95. Defense-in-depth for whitespace-free
-//      false positives (URL slugs, long identifiers, hex IDs). Real base64
-//      strings are essentially 100% alphabet-valid; any meaningful gap
-//      below that means it's something else.
+//  1. Early-out if `s` contains any whitespace. In the contexts this
+//     function actually runs (HTTP response bodies as JSON string values,
+//     header values, query parameters), base64 payloads are contiguous
+//     tokens — no spaces, tabs, or embedded newlines. Whitespace is the
+//     strongest signal that the string is human text masquerading as a
+//     high-density alphabet. Note: MIME/PEM-style base64 IS line-wrapped
+//     with newlines (76-char chunks), but those forms travel as document
+//     bodies rather than inline string values; we don't see them in the
+//     contexts this check runs against. If that ever changes, we'd want a
+//     context-aware variant rather than relaxing this check.
+//  2. Tighten ratio 0.85 → 0.95. Defense-in-depth for whitespace-free
+//     false positives (URL slugs, long identifiers, hex IDs). Real base64
+//     strings are essentially 100% alphabet-valid; any meaningful gap
+//     below that means it's something else.
 //
 // Known limitation (not fixed here): pure-alphanumeric English words
 // ("hello123world") still score 100%. The proper fix is entropy-based
@@ -554,10 +554,10 @@ func redactPasswd(body []byte) string {
 		if len(fields) >= 7 {
 			// passwd format: user:pass:uid:gid:gecos:home:shell
 			out.WriteString(fmt.Sprintf("%s:[REDACTED]:%s:%s:[REDACTED]:[REDACTED]:%s",
-				fields[0],  // username — keep
-				fields[2],  // UID — keep
-				fields[3],  // GID — keep
-				fields[6],  // shell — keep
+				fields[0], // username — keep
+				fields[2], // UID — keep
+				fields[3], // GID — keep
+				fields[6], // shell — keep
 			))
 		} else if len(fields) >= 2 && strings.Contains(fields[1], "$") {
 			// shadow format: user:$hash$...:... — keep only username

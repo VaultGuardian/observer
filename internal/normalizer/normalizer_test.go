@@ -308,7 +308,7 @@ func TestRegistryFuzzyLookup(t *testing.T) {
 		{"docker", "prod-nginx-proxy", "nginx"},
 		{"docker", "unknown-app", "docker"},       // falls to source type
 		{"systemd", "sshd", "sshd"},               // exact match
-		{"systemd", "unknown-service", "generic"},  // no match, no "systemd" normalizer in registry... wait, there is no systemd normalizer. Falls to generic.
+		{"systemd", "unknown-service", "generic"}, // no match, no "systemd" normalizer in registry... wait, there is no systemd normalizer. Falls to generic.
 	}
 
 	for _, tt := range tests {

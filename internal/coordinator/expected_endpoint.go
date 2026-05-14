@@ -146,9 +146,9 @@ func NewExpectedEndpointTracker(cap int) *ExpectedEndpointTracker {
 // rules are intentionally tiny so they're easy to audit and stay stable:
 //
 //   - method:  uppercased (lowercase variants from logs vs. uppercased
-//              variants from header parsing collapse to a single form)
+//     variants from header parsing collapse to a single form)
 //   - path:    query string stripped at the first '?' (query params don't
-//              affect endpoint identity for this feature)
+//     affect endpoint identity for this feature)
 //
 // Both the tracker's fingerprint constructor and the API handler's DB save
 // path call this. Without a shared helper the two would drift over time:

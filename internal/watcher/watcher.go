@@ -44,10 +44,10 @@ type LogHandler func(line LogLine)
 
 // Watcher connects to the Docker socket and streams container logs.
 type Watcher struct {
-	socketPath     string
+	socketPath      string
 	selfContainerID string
-	handler        LogHandler
-	httpClient     *http.Client
+	handler         LogHandler
+	httpClient      *http.Client
 }
 
 func New(socketPath string, handler LogHandler) *Watcher {

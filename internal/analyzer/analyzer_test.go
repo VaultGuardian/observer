@@ -842,9 +842,9 @@ func TestHasAttackIndicators_MalformedDecodeBypass(t *testing.T) {
 // refuses to create new suppress/allow cache entries when the line contains
 // a high-risk disclosure string. Completes the three-layer disclosure rule:
 //
-//   1. Disclosure bypasses deterministic gates       (TestIsOperationalNoise / TestIsFailedProbe)
-//   2. Disclosure bypasses cached suppress/allow     (orchestration override in Analyze)
-//   3. Disclosure cannot CREATE new suppress/allow   (this test)
+//  1. Disclosure bypasses deterministic gates       (TestIsOperationalNoise / TestIsFailedProbe)
+//  2. Disclosure bypasses cached suppress/allow     (orchestration override in Analyze)
+//  3. Disclosure cannot CREATE new suppress/allow   (this test)
 //
 // Without this guard, an LLM that hallucinates suppress/allow on a disclosure
 // line would pollute the pattern store, causing repeated DISCLOSURE_OVERRIDE

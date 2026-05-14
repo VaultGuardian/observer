@@ -8,10 +8,11 @@ import (
 // SshdNormalizer handles sshd/auth log lines.
 //
 // Typical sshd log formats:
-//   Mar 17 15:10:04 hostname sshd[12345]: Accepted publickey for drew from 192.168.1.50 port 54321 ssh2
-//   Mar 17 15:10:04 hostname sshd[12345]: Failed password for invalid user admin from 10.0.0.1 port 43210 ssh2
-//   Mar 17 15:10:04 hostname sshd[12345]: Connection closed by 10.0.0.1 port 43210 [preauth]
-//   Mar 17 15:10:04 hostname sshd[12345]: pam_unix(sshd:session): session opened for user drew(uid=1000)
+//
+//	Mar 17 15:10:04 hostname sshd[12345]: Accepted publickey for drew from 192.168.1.50 port 54321 ssh2
+//	Mar 17 15:10:04 hostname sshd[12345]: Failed password for invalid user admin from 10.0.0.1 port 43210 ssh2
+//	Mar 17 15:10:04 hostname sshd[12345]: Connection closed by 10.0.0.1 port 43210 [preauth]
+//	Mar 17 15:10:04 hostname sshd[12345]: pam_unix(sshd:session): session opened for user drew(uid=1000)
 //
 // We strip: syslog timestamp, hostname, PID, source IP, port number, UID.
 // We PRESERVE: action (Accepted/Failed/Connection closed), auth method,

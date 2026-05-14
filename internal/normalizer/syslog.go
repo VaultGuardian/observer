@@ -8,7 +8,8 @@ import (
 // SyslogNormalizer handles generic syslog-formatted lines.
 //
 // Standard syslog format:
-//   Mar 17 15:10:04 hostname service[PID]: message
+//
+//	Mar 17 15:10:04 hostname service[PID]: message
 //
 // This normalizer strips the syslog envelope (timestamp, hostname, service[PID])
 // to expose the raw message, then applies generic variable stripping.

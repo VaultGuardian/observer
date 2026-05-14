@@ -30,9 +30,9 @@ import (
 //   may not preserve 127.0.0.1 as the source IP in nginx logs.
 
 const (
-	tokenLength   = 16 // bytes → 32 hex chars
-	tokenTTL      = 10 * time.Second
-	tokenPrefix   = "OV-" // prefix in User-Agent: "OV-a8f72b4c1d3e..."
+	tokenLength      = 16 // bytes → 32 hex chars
+	tokenTTL         = 10 * time.Second
+	tokenPrefix      = "OV-" // prefix in User-Agent: "OV-a8f72b4c1d3e..."
 	maxPendingTokens = 50
 )
 

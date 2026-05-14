@@ -11,7 +11,7 @@ import (
 type TrustedIP struct {
 	ID          int64     `json:"id"`
 	IPAddress   string    `json:"ip_address,omitempty"` // exact IP (nullable)
-	CIDR        string    `json:"cidr,omitempty"`        // CIDR range (nullable)
+	CIDR        string    `json:"cidr,omitempty"`       // CIDR range (nullable)
 	Description string    `json:"description"`
 	AddedBy     string    `json:"added_by"` // "installer", "api", "cli"
 	CreatedAt   time.Time `json:"created_at"`

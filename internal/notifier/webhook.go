@@ -26,8 +26,8 @@ type WebhookPayload struct {
 	Text string `json:"text"`
 
 	// Full structured data for custom consumers
-	Alert    Alert  `json:"alert"`
-	Source   string `json:"source"`
+	Alert  Alert  `json:"alert"`
+	Source string `json:"source"`
 }
 
 func NewWebhookNotifier(cfg WebhookConfig) *WebhookNotifier {

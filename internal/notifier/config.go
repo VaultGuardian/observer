@@ -19,8 +19,8 @@ type Config struct {
 	APNs    APNsConfig    `yaml:"-"`
 	FCM     FCMConfig     `yaml:"-"`
 
-	Routing    RoutingConfig    `yaml:"routing"`
-	RateLimits RateLimitConfig  `yaml:"rate_limits"`
+	Routing    RoutingConfig     `yaml:"routing"`
+	RateLimits RateLimitConfig   `yaml:"rate_limits"`
 	QuietHours *QuietHoursConfig `yaml:"quiet_hours,omitempty"`
 }
 
@@ -33,9 +33,9 @@ type WebhookConfig struct {
 }
 
 type EmailConfig struct {
-	APIKey  string // RESEND_API_KEY
-	To      string // ALERT_EMAIL_TO
-	From    string // ALERT_EMAIL_FROM (default: "VaultGuardian LogWatch <alerts@vaultguardian.com>")
+	APIKey string // RESEND_API_KEY
+	To     string // ALERT_EMAIL_TO
+	From   string // ALERT_EMAIL_FROM (default: "VaultGuardian LogWatch <alerts@vaultguardian.com>")
 }
 
 type SMSConfig struct {
@@ -81,11 +81,11 @@ func (r RoutingConfig) ChannelsFor(sev Severity) []string {
 }
 
 type RateLimitConfig struct {
-	Webhook  string `yaml:"webhook"`  // duration string: "5s", "1m", etc.
-	Email    string `yaml:"email"`
-	SMS      string `yaml:"sms"`
-	PushIOS  string `yaml:"push_ios"`
-	PushFCM  string `yaml:"push_fcm"`
+	Webhook string `yaml:"webhook"` // duration string: "5s", "1m", etc.
+	Email   string `yaml:"email"`
+	SMS     string `yaml:"sms"`
+	PushIOS string `yaml:"push_ios"`
+	PushFCM string `yaml:"push_fcm"`
 }
 
 func (r RateLimitConfig) IntervalFor(channelName string) time.Duration {

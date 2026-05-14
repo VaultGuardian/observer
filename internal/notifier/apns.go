@@ -29,9 +29,9 @@ type APNsNotifier struct {
 
 	// JWT token cache — APNs tokens are valid for 1 hour,
 	// we refresh at 50 minutes to avoid edge-case rejections.
-	tokenMu    sync.RWMutex
-	cachedJWT  string
-	tokenExp   time.Time
+	tokenMu   sync.RWMutex
+	cachedJWT string
+	tokenExp  time.Time
 }
 
 // APNsPayload is the notification payload sent to Apple's push service.
