@@ -372,6 +372,13 @@ func reconcileClassificationAction(classification, action, reason string) string
 				classification, action)
 			return "malicious"
 		}
+	default:
+		// v0.52: Unknown classification must fail closed. Prior to this fix,
+		// unknown values fell through to `return action`, so a hallucinated
+		// classification:"benign", action:"suppress" would survive as suppress.
+		log.Printf("[llm] UNKNOWN classification=%q action=%q — overriding to alert (fail closed)",
+			classification, action)
+		return "alert"
 	}
 	return action
 }
@@ -599,6 +606,8 @@ Based on this response evidence, did the attack succeed or did the server ignore
 }
 
 // isDowngrade returns true if the new classification is less severe than the original.
+// v0.52: unknown classifications return false (no downgrade) instead of defaulting
+// to severity 0 which could falsely flag a downgrade from any known classification.
 func isDowngrade(original, updated string) bool {
 	severity := map[string]int{
 		"safe":          0,
@@ -608,7 +617,12 @@ func isDowngrade(original, updated string) bool {
 		"suspicious":    4,
 		"malicious":     5,
 	}
-	return severity[updated] < severity[original]
+	updatedSev, okUpdated := severity[updated]
+	originalSev, okOriginal := severity[original]
+	if !okUpdated || !okOriginal {
+		return false
+	}
+	return updatedSev < originalSev
 }
 
 // isEscalation returns true if the new classification is MORE severe than the original.
@@ -623,7 +637,12 @@ func isEscalation(original, updated string) bool {
 		"suspicious":    4,
 		"malicious":     5,
 	}
-	return severity[updated] > severity[original]
+	updatedSev, okUpdated := severity[updated]
+	originalSev, okOriginal := severity[original]
+	if !okUpdated || !okOriginal {
+		return false
+	}
+	return updatedSev > originalSev
 }
 
 func stripCodeBlock(s string) string {

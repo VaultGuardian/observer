@@ -261,9 +261,16 @@ func FormatAlertBody(alert Alert) string {
 		"Severity: %s\nContainer: %s (%s)\nReason: %s\nLog line: %s\nTime: %s",
 		alert.Severity,
 		alert.ContainerName,
-		alert.ContainerID[:12],
+		shortContainerID(alert.ContainerID),
 		alert.Reason,
 		truncateStr(alert.LogLine, 500),
 		alert.Timestamp.Format(time.RFC3339),
 	)
+}
+
+func shortContainerID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }

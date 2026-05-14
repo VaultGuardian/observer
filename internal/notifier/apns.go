@@ -131,12 +131,15 @@ func (a *APNsNotifier) Send(ctx context.Context, alert Alert) error {
 		return fmt.Errorf("APNs request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
+		// v0.52: Read body BEFORE discard. Prior to this fix, io.Copy drained
+		// the body first, so ReadAll returned empty — error diagnostics lost.
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("APNs returned %d: %s", resp.StatusCode, string(respBody))
 	}
+
+	io.Copy(io.Discard, resp.Body)
 
 	return nil
 }

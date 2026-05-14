@@ -228,8 +228,15 @@ func findContainerPID(dockerSocket, namePattern string) (*containerInfo, error) 
 	}
 
 	return &containerInfo{
-		ID:   matchID[:12],
+		ID:   shortID(matchID),
 		Name: matchName,
 		PID:  inspect.State.Pid,
 	}, nil
+}
+
+func shortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }

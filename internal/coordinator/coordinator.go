@@ -472,6 +472,8 @@ func (c *Coordinator) investigationLoop(key string) {
 	// --- Phase 1: Evidence Sprint ---
 	checkInterval := 500 * time.Millisecond
 	evidenceDeadline := time.After(c.evidenceWindow)
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -479,7 +481,7 @@ func (c *Coordinator) investigationLoop(key string) {
 			return
 		case <-evidenceDeadline:
 			goto finalize
-		case <-time.After(checkInterval):
+		case <-ticker.C:
 			if c.tryEvidenceCheck(key) {
 				return
 			}
@@ -495,14 +497,14 @@ finalize:
 	remainingTime := c.finalizeWindow - c.evidenceWindow
 	if remainingTime > 0 {
 		finalDeadline := time.After(remainingTime)
-		checkInterval := time.Second
+		ticker.Reset(time.Second)
 		for {
 			select {
 			case <-c.ctx.Done():
 				return
 			case <-finalDeadline:
 				goto dispatch
-			case <-time.After(checkInterval):
+			case <-ticker.C:
 				if c.tryEvidenceCheck(key) {
 					return
 				}

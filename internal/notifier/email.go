@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"time"
@@ -70,6 +71,17 @@ func (e *EmailNotifier) Send(ctx context.Context, alert Alert) error {
 	return nil
 }
 
+// esc is a shorthand for html.EscapeString. Every dynamic field interpolated
+// into the HTML email body MUST pass through this function to prevent injection.
+//
+// v0.52 P0 fix (code review adversarial review): prior to this fix, all dynamic
+// fields were interpolated via raw fmt.Sprintf %s — an attacker sending
+// GET /<script>alert(1)</script> would render executable HTML in the
+// operator's email client. Ironic for a security product.
+func esc(s string) string {
+	return html.EscapeString(s)
+}
+
 func formatEmailHTML(alert Alert) string {
 	severityColor := "#f59e0b"
 	switch alert.Severity {
@@ -93,7 +105,7 @@ func formatEmailHTML(alert Alert) string {
             <td style="padding:4px 0;color:#6b7280;width:120px;">Correlation</td>
             <td style="padding:4px 0;">%s (%d candidates)</td>
           </tr>`,
-			alert.Evidence.CorrelationConfidence, alert.Evidence.CandidateCount)
+			esc(string(alert.Evidence.CorrelationConfidence)), alert.Evidence.CandidateCount)
 
 		if t != nil {
 			evidenceHTML += fmt.Sprintf(`
@@ -113,7 +125,7 @@ func formatEmailHTML(alert Alert) string {
             <td style="padding:4px 0;color:#6b7280;">Body Hash</td>
             <td style="padding:4px 0;"><code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-size:11px;">sha256:%.16s</code></td>
           </tr>`,
-				t.StatusCode, t.ContentType, t.ContentLength, t.BodyPreviewHash)
+				t.StatusCode, esc(t.ContentType), t.ContentLength, esc(t.BodyPreviewHash))
 		}
 
 		if alert.Evidence.Disclosure != nil {
@@ -122,7 +134,7 @@ func formatEmailHTML(alert Alert) string {
             <td style="padding:4px 0;color:#6b7280;">Disclosure</td>
             <td style="padding:4px 0;font-weight:600;">%s</td>
           </tr>`,
-				alert.Evidence.Disclosure.DisclosureSummary)
+				esc(alert.Evidence.Disclosure.DisclosureSummary))
 		}
 
 		if alert.Evidence.SafeBodyPreview != "" {
@@ -132,7 +144,7 @@ func formatEmailHTML(alert Alert) string {
               <div style="padding:8px;background:#f3f4f6;border-radius:4px;font-family:'SF Mono',Monaco,monospace;font-size:11px;white-space:pre-wrap;color:#374151;">%s</div>
             </td>
           </tr>`,
-				truncateStr(alert.Evidence.SafeBodyPreview, 500))
+				esc(truncateStr(alert.Evidence.SafeBodyPreview, 500)))
 		}
 
 		evidenceHTML += `
@@ -143,7 +155,7 @@ func formatEmailHTML(alert Alert) string {
 		evidenceHTML = fmt.Sprintf(`
       <div style="margin-top:16px;padding:8px 12px;background:#f3f4f6;border-radius:6px;font-size:12px;color:#9ca3af;">
         Response Evidence: %s
-      </div>`, alert.Evidence.Status)
+      </div>`, esc(string(alert.Evidence.Status)))
 	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
@@ -189,15 +201,17 @@ func formatEmailHTML(alert Alert) string {
   </div>
 </body>
 </html>`,
-		severityColor,
-		alert.Severity,
-		alert.ContainerName, alert.ContainerID[:minInt(12, len(alert.ContainerID))],
-		alert.Reason,
-		alert.MatchedVia,
-		alert.Timestamp.Format(time.RFC3339),
-		truncateStr(alert.LogLine, 1000),
-		evidenceHTML,
-		alert.EventID, truncateStr(alert.NormalizedHash, 16),
+		severityColor,               // not attacker-controlled (switch output)
+		esc(string(alert.Severity)), // enum but escape defensively
+		esc(alert.ContainerName),    // ATTACKER-CONTROLLED
+		esc(alert.ContainerID[:minInt(12, len(alert.ContainerID))]), // hex but escape defensively
+		esc(alert.Reason),                          // LLM-GENERATED
+		esc(alert.MatchedVia),                      // internal but escape defensively
+		alert.Timestamp.Format(time.RFC3339),       // time.Format — safe
+		esc(truncateStr(alert.LogLine, 1000)),      // ATTACKER-CONTROLLED — raw log line
+		evidenceHTML,                               // already escaped field-by-field above
+		esc(alert.EventID),                         // UUID — safe but escape defensively
+		esc(truncateStr(alert.NormalizedHash, 16)), // hex — safe but escape defensively
 	)
 }
 

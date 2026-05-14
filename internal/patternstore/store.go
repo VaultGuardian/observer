@@ -348,7 +348,11 @@ func (s *Store) getBucket(scope *ScopeEntry, v Verdict) *PatternBucket {
 	case VerdictSuppress:
 		return &scope.Suppress
 	default:
-		return &scope.Allow
+		// v0.52: Unknown verdicts must NOT silently land in the allow bucket.
+		// Prior to this fix, the default case returned &scope.Allow, so an
+		// invalid LLM output could become a permanent allow pattern.
+		log.Printf("[patternstore] BUG: getBucket called with unknown verdict %q — returning nil", v)
+		return nil
 	}
 }
 
@@ -357,6 +361,9 @@ func (s *Store) getBucket(scope *ScopeEntry, v Verdict) *PatternBucket {
 // but do not participate in matching. Future events matching a revoked
 // pattern will fall through to fresh LLM classification.
 func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *MatchResult {
+	if b == nil {
+		return nil
+	}
 	// Tier 1: Exact hash (O(1), nanoseconds)
 	if p, ok := b.Hashes[hash]; ok && p.RevokedAt == nil {
 		return &MatchResult{Verdict: v, Pattern: p, Tier: PatternHash}
@@ -409,6 +416,9 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 
 	scope := s.getOrCreateScope(scopeKey)
 	bucket := s.getBucket(scope, verdict)
+	if bucket == nil {
+		return fmt.Errorf("unknown verdict %q — refusing to learn", verdict)
+	}
 
 	// Cap check — only applies to non-human, non-seeded sources.
 	// Operator-curated patterns are never capped.

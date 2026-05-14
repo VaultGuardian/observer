@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os/exec"
 	"strings"
@@ -211,6 +212,17 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 				"hostname": entry.Hostname,
 			},
 		})
+	}
+
+	// v0.52: Check scanner error before cmd.Wait(). If the scanner hit
+	// ErrTooLong (entry > 256KB buffer) or another error, it stopped
+	// scanning but journalctl --follow is still running. Without killing
+	// the process, cmd.Wait() blocks forever.
+	if err := scanner.Err(); err != nil {
+		log.Printf("[journald] Scanner error: %v — killing journalctl", err)
+		cmd.Process.Kill()
+		cmd.Wait()
+		return fmt.Errorf("journal scanner: %w", err)
 	}
 
 	// Wait for process to exit

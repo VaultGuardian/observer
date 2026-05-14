@@ -446,6 +446,23 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 		return false
 	}
 
+	// v0.52 (code review adversarial review): Attack-indicator guard.
+	// Mirrors the disclosure guard above. If a log line contains SQL injection,
+	// path traversal, or other attack payloads, we must NOT learn suppress/allow
+	// for it. A bad LLM call (wrong classification at 0.70+ confidence) would
+	// otherwise permanently suppress lines containing e.g. UNION SELECT.
+	//
+	// MALICIOUS and ALERT learning is still allowed — caching an escalation
+	// on an attack-indicator line is correct behavior.
+	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
+		if hasAttackIndicators(evt.Line) || hasAttackIndicators(evt.NormalizedLine) {
+			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s — line contains attack indicators",
+				v, scopeKey)
+			a.stats.DisclosureOverrides.Add(1) // reuse counter — both are "refuse to learn" events
+			return false
+		}
+	}
+
 	// Always learn the exact hash for allow/suppress (fast path for exact repeats)
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
 		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)

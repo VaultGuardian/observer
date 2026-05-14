@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -295,40 +296,63 @@ func (s *Store) RecordPipelineStats(ctx context.Context, stats *PipelineStats) e
 // except recon/noise logging."
 
 // FindingsWriter batches finding INSERTs in a background goroutine.
+//
+// v0.52 P0 fix (code review adversarial review): prior to this fix, Stop() called
+// close(w.ch) while producers could still be in Submit(). Any goroutine in the
+// blocking send path (critical findings, channel full) would panic with
+// "send on closed channel". Fixed by using a dedicated stopCh signal — the data
+// channel is never closed, so sends never race against a close.
 type FindingsWriter struct {
 	store   *Store
 	ch      chan *Finding
 	dropped atomic.Int64
-	done    chan struct{}
+	done    chan struct{} // closed when Run() exits
+	stopCh  chan struct{} // closed when Stop() is called
+
+	stopOnce sync.Once
 }
 
 // NewFindingsWriter creates a writer with the given buffer size.
 func NewFindingsWriter(s *Store, bufSize int) *FindingsWriter {
 	return &FindingsWriter{
-		store: s,
-		ch:    make(chan *Finding, bufSize),
-		done:  make(chan struct{}),
+		store:  s,
+		ch:     make(chan *Finding, bufSize),
+		done:   make(chan struct{}),
+		stopCh: make(chan struct{}),
 	}
 }
 
 // Submit sends a finding to the async writer.
 // Droppable findings (recon, allow, suppress) are silently dropped if
 // the channel is full. Critical findings (malicious, alert, policy,
-// escalated, downgraded) block until space is available.
+// escalated, downgraded) block until space is available or shutdown.
 func (w *FindingsWriter) Submit(f *Finding) {
+	// Fast path: non-blocking try + shutdown check.
 	select {
 	case w.ch <- f:
 		return
-	default:
-		// Channel full — only drop noise/recon
-		if isDroppable(f) {
-			w.dropped.Add(1)
-			return
+	case <-w.stopCh:
+		if !isDroppable(f) {
+			log.Printf("[findings-writer] SHUTDOWN: critical finding %s dropped (verdict=%s)", f.EventID, f.Verdict)
 		}
-		// Critical finding: block until space available.
-		// This is intentional — malicious/alert/policy findings
-		// must never be silently dropped.
-		w.ch <- f
+		return
+	default:
+	}
+
+	// Channel full — only drop noise/recon
+	if isDroppable(f) {
+		w.dropped.Add(1)
+		return
+	}
+
+	// Critical finding: block until space available OR shutdown.
+	// Prior to v0.52 this was a bare `w.ch <- f` which panicked if
+	// Stop() closed w.ch concurrently. The stopCh select arm prevents
+	// both the panic and the infinite block.
+	select {
+	case w.ch <- f:
+	case <-w.stopCh:
+		log.Printf("[findings-writer] SHUTDOWN: critical finding %s dropped (verdict=%s)", f.EventID, f.Verdict)
 	}
 }
 
@@ -338,8 +362,11 @@ func (w *FindingsWriter) Dropped() int64 {
 }
 
 // Stop signals the writer to drain and stop. Blocks until complete.
+// Safe to call multiple times (idempotent via sync.Once).
 func (w *FindingsWriter) Stop() {
-	close(w.ch)
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
+	})
 	<-w.done
 }
 
@@ -361,12 +388,7 @@ func (w *FindingsWriter) Run(ctx context.Context) {
 
 	for {
 		select {
-		case f, ok := <-w.ch:
-			if !ok {
-				// Channel closed — drain remaining
-				flush()
-				return
-			}
+		case f := <-w.ch:
 			batch = append(batch, f)
 			if len(batch) >= 50 {
 				flush()
@@ -375,15 +397,23 @@ func (w *FindingsWriter) Run(ctx context.Context) {
 		case <-flushTimer.C:
 			flush()
 
-		case <-ctx.Done():
-			// Drain remaining findings from channel
+		case <-w.stopCh:
+			// Shutdown: drain remaining findings from channel, then exit.
 			for {
 				select {
-				case f, ok := <-w.ch:
-					if !ok {
-						flush()
-						return
-					}
+				case f := <-w.ch:
+					batch = append(batch, f)
+				default:
+					flush()
+					return
+				}
+			}
+
+		case <-ctx.Done():
+			// Context cancelled: drain remaining findings from channel.
+			for {
+				select {
+				case f := <-w.ch:
 					batch = append(batch, f)
 				default:
 					flush()

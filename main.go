@@ -35,17 +35,28 @@ func main() {
 	var pipelineDrops atomic.Int64
 	log.Println("[observer] VaultGuardian Observer starting...")
 
-	// --- pprof ---
-	go func() {
-		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-			log.Printf("[observer] pprof server failed: %v", err)
-		}
-	}()
+	// --- pprof (debug only) ---
+	// v0.52: gated behind OBSERVER_DEBUG=1. pprof exposes sensitive runtime
+	// data (goroutine stacks, heap profiles, symbol tables) and should not
+	// be unconditionally available, even on localhost.
+	if os.Getenv("OBSERVER_DEBUG") == "1" {
+		go func() {
+			log.Println("[observer] pprof enabled on localhost:6060 (OBSERVER_DEBUG=1)")
+			if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+				log.Printf("[observer] pprof server failed: %v", err)
+			}
+		}()
+	}
 
 	cfg := LoadConfig()
 
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		log.Fatalf("[observer] Failed to create data dir: %v", err)
+	}
+	// v0.52: MkdirAll won't tighten permissions on an existing directory.
+	// Explicit Chmod ensures dirs created by older versions (0755) get fixed.
+	if err := os.Chmod(cfg.DataDir, 0700); err != nil {
+		log.Fatalf("[observer] Failed to chmod data dir: %v", err)
 	}
 
 	// ------- Init components -------
@@ -373,8 +384,11 @@ func main() {
 		w.SetSelfID(cfg.SelfID)
 		go func() {
 			log.Println("[observer] Starting container log watcher...")
-			if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-				log.Printf("[observer] Docker watcher error: %v", err)
+			for ctx.Err() == nil {
+				if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("[observer] Docker watcher error: %v — restarting in 2s", err)
+					time.Sleep(2 * time.Second)
+				}
 			}
 		}()
 	} else {

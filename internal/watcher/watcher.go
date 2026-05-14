@@ -114,7 +114,7 @@ func (w *Watcher) listContainers(ctx context.Context) ([]Container, error) {
 
 func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 	name := cleanName(c.Names)
-	log.Printf("[watcher] Streaming logs for %s (%s)", name, c.ID[:12])
+	log.Printf("[watcher] Streaming logs for %s (%s)", name, shortID(c.ID))
 
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("http://docker/v1.43/containers/%s/logs?follow=true&stdout=true&stderr=true&since=%d&timestamps=true",
@@ -130,6 +130,14 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// v0.52: Verify Docker API returned success before parsing frames.
+	// Error responses are not multiplexed and would be misinterpreted as
+	// frame headers.
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[watcher] Docker API returned %d for %s — skipping", resp.StatusCode, name)
+		return
+	}
 
 	// Docker multiplexed stream format:
 	// [8-byte header][payload]
@@ -158,6 +166,18 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 		}
 
 		size := binary.BigEndian.Uint32(header[4:8])
+
+		// v0.52: Cap frame size to prevent OOM from malicious/noisy containers.
+		// Docker's multiplexed log protocol includes a 32-bit size field — a
+		// crafted frame could request up to 4GB. Normal log lines are well
+		// under 1MB; anything larger is either malicious or a binary dump.
+		// Kill the stream rather than draining attacker-controlled length.
+		const maxFrameSize = 1 << 20 // 1MB
+		if size > maxFrameSize {
+			log.Printf("[watcher] Oversized frame from %s: %d bytes — killing stream", name, size)
+			return
+		}
+
 		payload := make([]byte, size)
 		_, err = io.ReadFull(reader, payload)
 		if err != nil {
@@ -226,13 +246,21 @@ func (w *Watcher) watchEvents(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			log.Printf("[watcher] Event decode error: %v", err)
-			continue
+			// v0.52: EOF or persistent decode error = dead stream. Break out
+			// so the caller can reconnect. Prior to this fix, EOF caused a
+			// hot-loop: Decode returns EOF instantly, ctx.Err() is nil, continue
+			// loops back to Decode which returns EOF instantly again.
+			if err == io.EOF {
+				log.Printf("[watcher] Event stream closed (EOF) — will reconnect")
+				return fmt.Errorf("event stream EOF: %w", err)
+			}
+			log.Printf("[watcher] Event decode error: %v — will reconnect", err)
+			return fmt.Errorf("event decode: %w", err)
 		}
 
 		if event.Action == "start" && event.Actor.ID != w.selfContainerID {
 			name := event.Actor.Attributes["name"]
-			log.Printf("[watcher] New container started: %s (%s)", name, event.Actor.ID[:12])
+			log.Printf("[watcher] New container started: %s (%s)", name, shortID(event.Actor.ID))
 			go w.streamLogs(ctx, Container{
 				ID:    event.Actor.ID,
 				Names: []string{"/" + name},
@@ -246,4 +274,14 @@ func cleanName(names []string) string {
 		return "unknown"
 	}
 	return strings.TrimPrefix(names[0], "/")
+}
+
+// shortID safely truncates a container/actor ID for log display.
+// Docker IDs are normally 64-char hex, but malformed responses,
+// alternate runtimes, or mocked sockets could return shorter strings.
+func shortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }
