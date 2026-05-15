@@ -201,6 +201,7 @@ type Coordinator struct {
 	mu             sync.Mutex
 	pending        map[string]*PendingAlert
 	graveyard      map[string]*FinalizedOutcome
+	checking       map[string]bool // v0.52: singleflight guard for evidence checks
 	catchAll       *CatchAllTracker
 	selfSuppress   *SelfSuppressor
 	evidenceWindow time.Duration
@@ -251,6 +252,7 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 	c := &Coordinator{
 		pending:        make(map[string]*PendingAlert),
 		graveyard:      make(map[string]*FinalizedOutcome),
+		checking:       make(map[string]bool),
 		catchAll:       NewCatchAllTracker(cfg.CatchAllThreshold, verifyFunc),
 		selfSuppress:   selfSuppress,
 		evidenceWindow: cfg.EvidenceWindow,
@@ -580,13 +582,21 @@ func (c *Coordinator) dispatchTimedOut(key string) {
 //
 // Returns true if the investigation was resolved (no further polling needed).
 func (c *Coordinator) tryEvidenceCheck(key string) bool {
-	// --- Step 1: Snapshot under lock ---
+	// --- Step 1: Snapshot under lock + singleflight guard ---
 	c.mu.Lock()
 	pending, ok := c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		c.mu.Unlock()
 		return true
 	}
+	// v0.52: Singleflight guard. Polling loop and VIP push can both snapshot
+	// the same pending alert concurrently. Without this guard, both run
+	// parallel evidence checks (duplicate LLM calls, duplicate audit writes).
+	if c.checking[key] {
+		c.mu.Unlock()
+		return false
+	}
+	c.checking[key] = true
 	snapshot := *pending
 	c.mu.Unlock()
 
@@ -597,6 +607,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	var finalAlert *FinalAlert
 
 	c.mu.Lock()
+	delete(c.checking, key) // release singleflight guard
 	pending, ok = c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		c.mu.Unlock()

@@ -760,11 +760,25 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 	defer lc.vipMu.Unlock()
 
 	var candidates []CapturedResponse
-	for _, resp := range lc.vipEvidence {
+	var consumeID string
+	for id, resp := range lc.vipEvidence {
 		if matchesVIP(resp, req) {
 			candidates = append(candidates, resp)
+			if consumeID == "" {
+				consumeID = id // mark first match for consumption
+			}
 		}
 	}
+
+	// v0.52: Consume the first matched VIP evidence after use. Only one entry
+	// is deleted per lookup — if multiple VIP evidences match (different events
+	// with similar request shapes), the remaining ones stay available for their
+	// own event's lookup. LookupRequest doesn't carry eventID, so we can't do
+	// exact-event matching; consuming one-at-a-time is the safe middle ground.
+	if consumeID != "" {
+		delete(lc.vipEvidence, consumeID)
+	}
+
 	return candidates
 }
 

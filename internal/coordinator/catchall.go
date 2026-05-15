@@ -42,6 +42,8 @@ const (
 	DefaultCatchAllThreshold = 5
 	maxFingerprints          = 500
 	maxPathsPerFingerprint   = 10
+	maxConcurrentVerifiers   = 5             // v0.52: bound goroutine spray from path spray attacks
+	verifiedEntryTTL         = 4 * time.Hour // v0.52: verified entries evictable after TTL
 )
 
 type catchAllState string
@@ -117,6 +119,7 @@ type CatchAllTracker struct {
 	entries   map[CatchAllFingerprint]*catchAllEntry
 	threshold int
 	verify    VerifyFunc
+	verifySem chan struct{} // v0.52: bounds concurrent verification goroutines
 }
 
 // NewCatchAllTracker creates a tracker with the given threshold and verify callback.
@@ -128,6 +131,7 @@ func NewCatchAllTracker(threshold int, verify VerifyFunc) *CatchAllTracker {
 		entries:   make(map[CatchAllFingerprint]*catchAllEntry),
 		threshold: threshold,
 		verify:    verify,
+		verifySem: make(chan struct{}, maxConcurrentVerifiers),
 	}
 }
 
@@ -190,7 +194,23 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 			log.Printf("[catchall] Threshold crossed — requesting verification: host=%s method=%s status=%d hash=%.16s paths=%d sample=%s",
 				host, methodUpper, statusCode, bodyPreviewHash, entry.TotalPaths, samplePath)
 
-			go t.runVerification(fp, samplePath)
+			// v0.52: Bounded verifier goroutines. Without a semaphore, a path
+			// spray attack could launch hundreds of concurrent verification
+			// goroutines blocked on HTTP probes or LLM slots.
+			go func() {
+				select {
+				case t.verifySem <- struct{}{}:
+					defer func() { <-t.verifySem }()
+					t.runVerification(fp, samplePath)
+				default:
+					log.Printf("[catchall] Verifier semaphore full — deferring verification for %s", fp)
+					t.mu.Lock()
+					if e, ok := t.entries[fp]; ok && e.State == StatePendingVerification {
+						e.State = StateCandidate // reset so it retriggers next threshold cross
+					}
+					t.mu.Unlock()
+				}
+			}()
 		}
 		return false, ""
 
@@ -370,6 +390,14 @@ func (t *CatchAllTracker) SeedVerified(fps []CatchAllFingerprint, reasons []stri
 	seeded := 0
 	zeroBytes := 0
 	for i, fp := range fps {
+		// v0.52: Enforce maxFingerprints during seed. Without this check,
+		// a database with thousands of verified catch-alls would load them
+		// all into memory at startup, bypassing the cap that Check() enforces.
+		if len(t.entries) >= maxFingerprints {
+			log.Printf("[catchall] SeedVerified: hit cap (%d) — skipped %d remaining entries", maxFingerprints, len(fps)-i)
+			break
+		}
+
 		reason := ""
 		if i < len(reasons) {
 			reason = reasons[i]
@@ -455,22 +483,52 @@ func (t *CatchAllTracker) Stats() (total, candidates, pending, verified, rejecte
 }
 
 // evictOldest removes the entry with the oldest LastSeen. Must be called with mu held.
+//
+// v0.52: Verified entries are no longer immortal. Eviction prefers non-verified
+// entries first. If only verified entries remain, evicts the oldest one past TTL.
+// If ALL entries are verified and within TTL, evicts the oldest anyway — the hard
+// cap is non-negotiable (prevents unbounded growth from SeedVerified + Check).
 func (t *CatchAllTracker) evictOldest() {
-	var oldestFP CatchAllFingerprint
-	var oldestTime time.Time
-	first := true
+	var bestFP CatchAllFingerprint
+	var bestTime time.Time
+	bestIsVerified := true
+	found := false
+	now := time.Now()
+
 	for fp, entry := range t.entries {
-		if entry.State == StateVerified {
-			continue
+		isVerified := entry.State == StateVerified
+		isPastTTL := isVerified && now.Sub(entry.LastSeen) > verifiedEntryTTL
+
+		// Prefer non-verified over verified, prefer past-TTL verified over fresh verified
+		better := false
+		if !found {
+			better = true
+		} else if !isVerified && bestIsVerified {
+			// Non-verified always beats verified
+			better = true
+		} else if isVerified && bestIsVerified {
+			// Both verified: prefer past-TTL, then oldest
+			if isPastTTL && entry.LastSeen.Before(bestTime) {
+				better = true
+			} else if !found || entry.LastSeen.Before(bestTime) {
+				better = true
+			}
+		} else if !isVerified && !bestIsVerified {
+			// Both non-verified: oldest wins
+			if entry.LastSeen.Before(bestTime) {
+				better = true
+			}
 		}
-		if first || entry.LastSeen.Before(oldestTime) {
-			oldestFP = fp
-			oldestTime = entry.LastSeen
-			first = false
+
+		if better {
+			bestFP = fp
+			bestTime = entry.LastSeen
+			bestIsVerified = isVerified
+			found = true
 		}
 	}
-	if !first {
-		delete(t.entries, oldestFP)
+	if found {
+		delete(t.entries, bestFP)
 	}
 }
 
