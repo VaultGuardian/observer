@@ -1157,38 +1157,55 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx context.Context,
 	finding *store.Finding, decision *store.LLMDecision, reason string) {
 
-	// HARD GUARD #1: this correction is ONLY valid for fresh Tier-2 reclassify
-	// decisions where decision.CacheKey is rec.HashBody(SafeBodyPreview) — i.e.
-	// the redacted response-shape hash. Other LLMDecision rows (Tier-1
-	// classify, classify_retry, catchall_verify) ALSO have CacheKey populated,
-	// but with completely different content: Tier-1 stores the learned pattern
-	// value (regex / string) in CacheKey, and catchall_verify uses it for the
-	// catch-all body fingerprint. Accepting any of those for Card 4 would
-	// store a bogus key in the expected_endpoints table; future evidence
-	// callbacks computing rec.HashBody(SafeBodyPreview) would never match
-	// the stored row, and the API would have lied to the operator about
-	// saving an effective rule. (code review P0 catch, May 11 2026.)
+	// SKIPPY'S FIX (design team review, May 15 2026): The frontend sends the
+	// Tier-1 decision ID because that's all it knows. But Card 4 needs the
+	// Tier-2 reclassify decision (which has the redacted response-shape hash
+	// in CacheKey). Look it up by EventID before hitting the guard.
+	if decision == nil || decision.Tier != "reclassify" {
+		reclassDecisions, err := s.store.ListLLMDecisions(ctx, store.LLMDecisionFilter{
+			EventID: finding.EventID,
+			Tier:    "reclassify",
+			Limit:   1,
+		})
+		if err == nil && len(reclassDecisions) > 0 {
+			decision = &reclassDecisions[0]
+		}
+	}
+
+	// Build the shape hash from the best available source.
 	//
-	// Strict invariant: Tier == "reclassify" AND evidence-backed fields all
-	// populated. Cache-hit findings (no fresh decision) and Tier-1 findings
-	// both get the same operator-readable rejection so the frontend can
-	// surface a single recovery path.
-	if decision == nil ||
-		decision.Tier != "reclassify" ||
-		decision.CacheKey == "" ||
-		decision.EvidenceStatus == 0 ||
-		decision.EvidencePreview == "" {
+	// Priority order (the design review correction, May 15 2026):
+	//   1. decision.CacheKey from a reclassify decision — this is the REDACTED
+	//      response-shape hash (tokens → [REDACTED] before hashing). Stable
+	//      across rotating JWT tokens. This is what makes Card 4 work.
+	//   2. finding.EvidenceBodyHash — the RAW wire hash. Only useful as fallback
+	//      when the response body didn't need redaction (no tokens/secrets).
+	shapeHash := ""
+	if decision != nil && decision.Tier == "reclassify" && isHexHash64(decision.CacheKey) {
+		shapeHash = decision.CacheKey
+	} else if isHexHash64(finding.EvidenceBodyHash) {
+		shapeHash = finding.EvidenceBodyHash
+	}
+
+	// Evidence status: prefer evidence layer, fall back to finding
+	evidenceStatus := 0
+	if decision != nil && decision.EvidenceStatus > 0 {
+		evidenceStatus = decision.EvidenceStatus
+	} else if finding.EvidenceStatusCode > 0 {
+		evidenceStatus = finding.EvidenceStatusCode
+	} else if finding.HTTPStatus > 0 {
+		evidenceStatus = finding.HTTPStatus
+	}
+
+	if shapeHash == "" || evidenceStatus == 0 {
 		jsonError(w,
-			"Expected endpoint corrections require a fresh response-evidence reclassification decision. This finding does not include the redacted response-shape fingerprint needed for this correction. Re-run analysis (delete the cached pattern via the patterns view, then re-trigger the request) before marking the endpoint as expected.",
+			"Expected endpoint corrections require captured response evidence with a redacted response-shape hash. This finding does not have the required evidence available.",
 			http.StatusBadRequest)
 		return
 	}
 
-	// Sanity check the shape of CacheKey: rec.HashBody returns a 64-char
-	// lowercase hex SHA-256 digest. Anything else means we're holding a
-	// non-hash value that slipped past the Tier filter (defensive — should
-	// be impossible given the Tier check above, but cheap to verify).
-	if !isHexHash64(decision.CacheKey) {
+	// Sanity check: rec.HashBody returns a 64-char lowercase hex SHA-256 digest.
+	if !isHexHash64(shapeHash) {
 		jsonError(w,
 			"Expected endpoint correction has an invalid response-shape fingerprint (expected 64-character hex hash).",
 			http.StatusBadRequest)
@@ -1199,30 +1216,12 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 	host := finding.DestHost
 	rawMethod := finding.HTTPMethod
 	rawPath := finding.HTTPPath
-	shapeHash := decision.CacheKey // = rec.HashBody(SafeBodyPreview), the redacted shape hash
-
-	// Status source consistency (code review P1, May 11 2026): prefer the status
-	// captured AT THE EVIDENCE LAYER (same layer that produced the shape
-	// hash). decision.EvidenceStatus is the wire-observed code; finding.HTTPStatus
-	// can be merged from sibling events with a weak default. Falling back to
-	// finding.HTTPStatus only when EvidenceStatus is 0 (zero-value sentinel
-	// for "not captured") keeps us safe if a future code path skips the
-	// evidence step.
-	status := decision.EvidenceStatus
-	if status == 0 {
-		status = finding.HTTPStatus
-	}
+	status := evidenceStatus
 
 	// Normalize method/path to match the tracker's canonical key shape
-	// (code review P2, May 11 2026). Without this, two clicks with different
-	// query strings would create two DB rows but one live tracker entry,
-	// producing audit-trail confusion in the future pattern-review UI.
-	// Shared helper means handler and tracker can't drift over time.
 	method, path := coordinator.NormalizeMethodPath(rawMethod, rawPath)
 
-	// HARD GUARD #2: all five fingerprint components must be present.
-	// Path-scoping is the whole point — without path or status there's
-	// nothing meaningful to match against.
+	// HARD GUARD: all five fingerprint components must be present.
 	if host == "" || method == "" || path == "" || status == 0 {
 		jsonError(w, "Cannot mark as expected endpoint: finding is missing required fingerprint fields (host/method/path/status)", http.StatusBadRequest)
 		return
@@ -1272,14 +1271,16 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		log.Printf("[correction] Warning: finding update failed: %v", err)
 	}
 
-	// Step 5: Mark LLM decision as corrected
-	if err := s.store.UpdateLLMDecisionReview(ctx, decision.ID, store.LLMReview{
-		Status:     "corrected",
-		ReviewedBy: "dashboard",
-		Verdict:    "allow",
-		Reason:     humanReason,
-	}); err != nil {
-		log.Printf("[correction] Warning: decision review update failed: %v", err)
+	// Step 5: Mark LLM decision as corrected (if we have one)
+	if decision != nil {
+		if err := s.store.UpdateLLMDecisionReview(ctx, decision.ID, store.LLMReview{
+			Status:     "corrected",
+			ReviewedBy: "dashboard",
+			Verdict:    "allow",
+			Reason:     humanReason,
+		}); err != nil {
+			log.Printf("[correction] Warning: decision review update failed: %v", err)
+		}
 	}
 
 	log.Printf("[correction:expected_endpoint] host=%s method=%s path=%s status=%d shape_hash=%.16s event=%s",
