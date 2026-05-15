@@ -29,7 +29,18 @@ import (
 	"github.com/vaultguardian/observer/internal/watcher"
 )
 
+// Version is set at build time via ldflags:
+//
+//	go build -ldflags "-X main.Version=v0.52.0" -o observer .
+var Version = "dev"
+
 func main() {
+	// --- Version flag ---
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Printf("observer %s\n", Version)
+		os.Exit(0)
+	}
+
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	var pipelineDrops atomic.Int64
@@ -407,10 +418,31 @@ func main() {
 
 	<-ctx.Done()
 
-	// ------- Shutdown -------
+	// ------- Ordered Shutdown -------
+	// v0.52: Proper shutdown ordering prevents data loss and races.
+	// Sequence: stop API (drain in-flight requests) → persist patterns
+	// → close DB (stops async writer, then closes SQLite).
+	log.Println("[observer] Shutting down...")
+
+	// 1. Stop API server — no new requests accepted, in-flight get 5s to finish.
+	if apiServer != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := apiServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[observer] API server shutdown error: %v", err)
+		}
+		shutdownCancel()
+	}
+
+	// 2. Persist pattern store to disk.
 	if err := a.Persist(); err != nil {
 		log.Printf("[observer] Failed final persist: %v", err)
 	}
+
+	// 3. Close DB — stops async findings writer (drains queue), then closes SQLite.
+	if err := db.Close(); err != nil {
+		log.Printf("[observer] DB close error: %v", err)
+	}
+
 	aStats := a.GetStats()
 	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d learned=%d",
 		aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.PatternsLearned)
@@ -829,7 +861,8 @@ func makeEvidenceCheckCallback(
 
 		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
 
-		db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+		auditCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := db.RecordLLMDecision(auditCtx, &store.LLMDecision{
 			EventID:          snapshot.EventID,
 			Timestamp:        time.Now(),
 			Tier:             "reclassify",
@@ -854,7 +887,10 @@ func makeEvidenceCheckCallback(
 			FinalVerdict:     reclass.Classification,
 			Escalated:        reclass.Escalated,
 			Downgraded:       reclass.Downgraded,
-		})
+		}); err != nil {
+			log.Printf("[reclassify] WARN: audit write failed for %s: %v", snapshot.EventID, err)
+		}
+		auditCancel()
 
 		if reclass.Downgraded {
 			log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
@@ -983,8 +1019,17 @@ func makeVerifyCallback(
 			if maxHash > readLimit {
 				readLimit = maxHash
 			}
-			fullBody, _ := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+			fullBody, readErr := io.ReadAll(io.LimitReader(resp.Body, readLimit))
 			resp.Body.Close()
+
+			// v0.52: Fail closed on read errors. A broken connection or
+			// mid-stream error can produce a partial body whose prefix hash
+			// accidentally matches REC's preview — leading to false verification.
+			if readErr != nil {
+				log.Printf("[verify] Body read error: %v — skipping (fail closed)", readErr)
+				continue
+			}
+
 			fullBodyLen := int64(len(fullBody))
 
 			// Truncate to maxHash for fingerprint match — REC's sniffer hashes
@@ -1063,7 +1108,8 @@ func makeVerifyCallback(
 				return &coordinator.VerifyResult{Confirmed: false, Reason: fmt.Sprintf("LLM error: %v", err)}
 			}
 
-			db.RecordLLMDecision(context.Background(), &store.LLMDecision{
+			auditCtx2, auditCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := db.RecordLLMDecision(auditCtx2, &store.LLMDecision{
 				Timestamp:        time.Now(),
 				Tier:             "catchall_verify",
 				Model:            cfg.LLMModel,
@@ -1085,7 +1131,10 @@ func makeVerifyCallback(
 				CacheKey:         bodyHash,
 				FinalVerdict:     reclass.Classification,
 				Downgraded:       reclass.Downgraded,
-			})
+			}); err != nil {
+				log.Printf("[verify] WARN: audit write failed: %v", err)
+			}
+			auditCancel2()
 
 			if reclass.Downgraded {
 				reason := fmt.Sprintf("LLM confirmed benign: %s", reclass.Reason)

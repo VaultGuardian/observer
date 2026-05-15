@@ -65,6 +65,10 @@ type Server struct {
 	analyzer  *analyzer.Analyzer
 	collector rec.EvidenceCollector
 
+	// v0.52: retained for graceful shutdown. Prior to this, Start() created
+	// a local http.Server with no way to call Shutdown() from outside.
+	httpServer *http.Server
+
 	// Pre-computed CORS origin lookup for O(1) allowlist checks.
 	allowedOrigins map[string]struct{}
 
@@ -207,7 +211,17 @@ func (s *Server) Start() error {
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
+	s.httpServer = srv
 	return srv.ListenAndServe()
+}
+
+// Shutdown gracefully stops the API server, allowing in-flight requests
+// to complete within the given context deadline.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpServer == nil {
+		return nil
+	}
+	return s.httpServer.Shutdown(ctx)
 }
 
 // corsMiddleware sets CORS headers only for explicitly allowed origins.
