@@ -181,8 +181,9 @@ type RECStats struct {
 	RequestsExpired int64 // request expired without matching response (edge-generated)
 
 	// Flow state
-	FlowStates    int64 // current active flow entries
-	FlowEvictions int64 // flows evicted due to MaxFlowStates cap
+	FlowStates        int64 // current active flow entries
+	FlowEvictions     int64 // flows evicted due to MaxFlowStates cap (total)
+	FlowEvictionsLive int64 // subset where the evicted flow had pending request/response state
 
 	// Dashboard backward compat — populated from above in Stats()
 	HTTPRequests  int64 // = InlineRequests

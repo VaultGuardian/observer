@@ -1486,10 +1486,10 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					rStats.BufferEvictionsTotal, rStats.BufferEvictionsCapacity,
 					rStats.BufferEvictionsAge, rStats.BufferEvictionsBytes,
 					rStats.VIPMatches)
-				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d stream_drops=%d parse_errors=%d flows=%d flow_evictions=%d",
+				log.Printf("[observer] REC reassembly: streams_active=%d streams_total=%d streams_timeout=%d stream_drops=%d parse_errors=%d flows=%d flow_evictions=%d flow_evictions_live=%d",
 					rStats.ReassemblyStreamsActive, rStats.ReassemblyStreamsTotal,
 					rStats.ReassemblyStreamsTimedOut, rStats.ReassemblyStreamDrops,
-					rStats.ReassemblyParseErrors, rStats.FlowStates, rStats.FlowEvictions)
+					rStats.ReassemblyParseErrors, rStats.FlowStates, rStats.FlowEvictions, rStats.FlowEvictionsLive)
 				log.Printf("[observer] REC inline: requests=%d seq_dedup=%d body_skip=%d feed_http=%d",
 					rStats.InlineRequests, rStats.InlineDuplicateDrops,
 					rStats.InlineBodySkips, rStats.FeedHTTP)

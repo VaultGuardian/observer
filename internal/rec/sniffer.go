@@ -413,8 +413,9 @@ type sniffer struct {
 	reassemblyResponses       int64
 	reassemblyParseErrors     int64
 
-	feedHTTP      int64
-	flowEvictions int64 // flow cap hit, blunt eviction
+	feedHTTP          int64
+	flowEvictions     int64 // total flows dropped by evictOneFlow under cap pressure
+	flowEvictionsLive int64 // subset of flowEvictions where the dropped flow had pending state
 
 	verbose bool
 }
@@ -748,21 +749,117 @@ func (s *sniffer) handleInlineRequest(flowKey streamKey, tcpSeq uint32, payload 
 		// the request side without parsing chunk framing. Set the guard
 		// flag and let the response side clear it when it pairs.
 		fp.skipUntilPaired = true
+	} else if parsed.headerLen == 0 {
+		// Headers did not terminate within maxInlineScan. We have the
+		// method/path but no \r\n\r\n marker, which means subsequent
+		// client-direction segments on this flow could be either:
+		//   - header continuations (e.g. very long cookie/auth headers),
+		//   - body bytes that happen to start with an HTTP method token
+		//     (attacker-crafted "GET /fake HTTP/1.1\r\n..." inside a body),
+		//   - a pipelined follow-up request.
+		// We cannot distinguish these on the request side alone. Gate the
+		// flow with skipUntilPaired so the response clears it. Same
+		// trade-off as the chunked path: we may over-skip a rare pipelined
+		// keep-alive request, but missing one is safer than registering
+		// a ghost request from attacker-influenced body bytes.
+		fp.skipUntilPaired = true
 	}
 
 	atomic.AddInt64(&s.inlineRequests, 1)
 }
 
-// evictOneFlow removes one flow from the map. O(1) — picks the first key
-// Go's map iterator returns (effectively random). Under overload, we need
-// speed more than precision. An O(N) oldest-flow scan would freeze readLoop
-// when we're already at capacity. (code review catch.)
-// MUST be called with s.flowsMu held.
+// evictionScanLimit caps how many flows evictOneFlow inspects when picking
+// a victim. The scan is bounded so we never freeze readLoop on a 50K-flow
+// table; 64 is large enough that the priority-order preference (empty >
+// response-only > pending-requests) reliably finds an empty victim under
+// realistic workloads, since most flows at any moment are idle.
+const evictionScanLimit = 64
+
+// evictOneFlow removes one flow from the map under flow-state cap pressure.
+//
+// Priority order (best victim first):
+//
+//	priority 2: both queues empty — safest to drop, no in-flight pairing
+//	priority 1: responses queued, no pending requests — losing an orphan
+//	            response is worse than losing an empty entry but does not
+//	            split a live request/response pair
+//	priority 0: pending requests — most expensive to drop because the
+//	            matching response may still be in flight
+//
+// Within a tier, the first scanned candidate wins (no timestamp ordering;
+// flowPair carries no createdAt/lastSeen field and we are not adding one
+// in this pass).
+//
+// Scan is bounded by evictionScanLimit so cost stays O(K) regardless of
+// flow-table size. If no candidate is found in the scan window (only
+// possible when len(s.flows) > evictionScanLimit AND every scanned flow
+// holds a pending request), we still evict the first scanned entry so
+// the caller can make room — better to drop a live flow than to refuse
+// admission and silently drop the incoming packet.
+//
+// flowEvictionsLive increments when the evicted flow had any pending
+// state (priority < 2), giving operators visibility into how often
+// eviction is splitting live pairing data versus reclaiming idle slots.
+//
+// MUST be called with s.flowsMu held. Briefly takes each scanned
+// candidate's fp.mu to read queue lengths. The flowsMu→fp.mu order
+// is consistent with runCleanup Step 3 and the pairResponse fix.
 func (s *sniffer) evictOneFlow() {
-	for key := range s.flows {
-		delete(s.flows, key)
-		atomic.AddInt64(&s.flowEvictions, 1)
-		return
+	var victimKey streamKey
+	var victimPriority int = -1
+	var fallbackKey streamKey
+	var haveFallback bool
+	scanned := 0
+
+	for key, fp := range s.flows {
+		if scanned == 0 {
+			fallbackKey = key
+			haveFallback = true
+		}
+		scanned++
+		if scanned > evictionScanLimit {
+			break
+		}
+
+		fp.mu.Lock()
+		hasReqs := len(fp.requests) > 0
+		hasResps := len(fp.responses) > 0
+		fp.mu.Unlock()
+
+		var priority int
+		switch {
+		case !hasReqs && !hasResps:
+			priority = 2
+		case !hasReqs:
+			priority = 1
+		default:
+			priority = 0
+		}
+
+		if priority > victimPriority {
+			victimKey = key
+			victimPriority = priority
+			if priority == 2 {
+				break // empty flow found — no better candidate possible
+			}
+		}
+	}
+
+	if victimPriority < 0 {
+		// Scan returned nothing usable (map empty or all entries probed
+		// concurrently). Fall back to the first key the iterator
+		// produced — guaranteed valid as long as scanned > 0.
+		if !haveFallback {
+			return
+		}
+		victimKey = fallbackKey
+		victimPriority = 0
+	}
+
+	delete(s.flows, victimKey)
+	atomic.AddInt64(&s.flowEvictions, 1)
+	if victimPriority < 2 {
+		atomic.AddInt64(&s.flowEvictionsLive, 1)
 	}
 }
 
@@ -786,72 +883,57 @@ func (s *sniffer) getOrCreateFlow(key streamKey) *flowPair {
 //
 // Returns the paired pendingRequest (nil if queued as orphan candidate).
 // Does NOT hold the flow lock during buffer.Insert or onCapture — builds
-// the action, unlocks, then the caller executes (the design review: avoid lock chains).
+// the action, unlocks, then the caller executes.
+//
+// Lock discipline (deadlock fix + queue-before-log race avoidance):
+//
+//   - flowsMu is acquired and released first to look up / create the flow.
+//   - fp.mu is then acquired. The state transition (pair or queue) happens
+//     entirely under fp.mu — no intermediate unlock. This is required
+//     because the request side only APPENDS to fp.requests; it never
+//     consumes queued responses. If we unlocked between "no request found"
+//     and "queue this response," a request could land in fp.requests in
+//     the gap, the response would queue after it, and neither side would
+//     ever pair them — they'd both sit until cleanupLoop expired them.
+//   - fp.mu is released before any verbose diagnostic runs.
+//   - logPairMiss (verbose path) snapshots candidate flows under flowsMu,
+//     releases flowsMu, then inspects each candidate's fp.mu independently.
+//     It never holds flowsMu and any fp.mu simultaneously.
+//
+// This breaks the prior ABBA deadlock between pairResponse's verbose path
+// (fp.mu → flowsMu → otherFP.mu) and runCleanup's empty-flow sweep
+// (flowsMu → fp.mu). The canonical lock order is now:
+//
+//	flowsMu → fp.mu  (acquired in this order when both are held;
+//	                  pairResponse avoids holding both simultaneously,
+//	                  handleInlineRequest releases flowsMu before fp.mu,
+//	                  runCleanup Step 3 holds both in canonical order)
 func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pendingRequest {
 	s.flowsMu.Lock()
 	fp := s.getOrCreateFlow(flowKey)
 	s.flowsMu.Unlock()
 
 	fp.mu.Lock()
-	defer fp.mu.Unlock()
 
-	// Response side: check if a request is waiting.
+	// Response side: check if a request is waiting. Fast path.
 	if len(fp.requests) > 0 {
 		req := fp.requests[0]
 		fp.requests = fp.requests[1:]
-		// Clear chunked body guard — the response arrived, so the
-		// request body (chunked or otherwise) has been fully sent.
+		// Clear chunked / split-header body guard — the response arrived,
+		// so the request body (chunked or otherwise) has been fully sent.
 		// Next client payload is a new request.
 		fp.skipUntilPaired = false
 		fp.bodyRemaining = 0
+		fp.mu.Unlock()
+
 		atomic.AddInt64(&s.pairImmediate, 1)
 		return req
 	}
 
-	// No request waiting — log diagnostics before queuing as orphan.
-	if s.verbose {
-		log.Printf("[rec] PAIR MISS: status=%d body_bytes=%d src=%d.%d.%d.%d:%d dst=%d.%d.%d.%d:%d",
-			captured.StatusCode, len(captured.BodyPreview),
-			flowKey.dstIP[0], flowKey.dstIP[1], flowKey.dstIP[2], flowKey.dstIP[3], flowKey.dstPort,
-			flowKey.srcIP[0], flowKey.srcIP[1], flowKey.srcIP[2], flowKey.srcIP[3], flowKey.srcPort)
-		for i, req := range fp.requests {
-			log.Printf("[rec] PAIR MISS:   pending[%d] %s %s (age=%.1fs)",
-				i, req.method, req.path, time.Since(req.timestamp).Seconds())
-		}
-		log.Printf("[rec] PAIR MISS:   stats: inline_req=%d pair_immediate=%d total_misses=%d expired=%d",
-			atomic.LoadInt64(&s.inlineRequests),
-			atomic.LoadInt64(&s.pairImmediate),
-			atomic.LoadInt64(&s.orphanResponses),
-			atomic.LoadInt64(&s.requestsExpired))
-
-		// Scan for requests to the same server on different ephemeral ports.
-		// If we find any, it's a NAT/port rewrite problem — the request
-		// exists but under a different flow key.
-		serverIP := flowKey.dstIP
-		serverPort := flowKey.dstPort
-		s.flowsMu.Lock()
-		for otherKey, otherFP := range s.flows {
-			if otherKey == flowKey {
-				continue
-			}
-			if otherFP == nil {
-				continue
-			}
-			if otherKey.dstIP == serverIP && otherKey.dstPort == serverPort {
-				otherFP.mu.Lock()
-				if len(otherFP.requests) > 0 {
-					log.Printf("[rec] PAIR MISS:   !! FOUND on different ephemeral: %d.%d.%d.%d:%d has %d pending req",
-						otherKey.srcIP[0], otherKey.srcIP[1], otherKey.srcIP[2], otherKey.srcIP[3], otherKey.srcPort,
-						len(otherFP.requests))
-				}
-				otherFP.mu.Unlock()
-			}
-		}
-		s.flowsMu.Unlock()
-	}
-
-	// Queue the response as an orphan candidate.
-	// It will expire after ResponseOrphanTimeout and be inserted as orphan.
+	// No request waiting. Queue the response as an orphan candidate
+	// UNDER THE SAME LOCK that confirmed no request was waiting. Doing
+	// this atomically with the check is what prevents the request/
+	// response blind-date race described above.
 	if len(fp.responses) >= s.flowConfig.MaxResponsesPerFlow {
 		fp.responses = fp.responses[1:] // drop oldest
 		atomic.AddInt64(&s.orphanResponses, 1)
@@ -860,7 +942,75 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 		captured:  captured,
 		timestamp: time.Now(),
 	})
+
+	fp.mu.Unlock()
+
+	// Diagnostics run AFTER fp.mu is released — they may touch flowsMu
+	// and other fp.mus, which would deadlock against runCleanup if we
+	// still held this fp.mu.
+	if s.verbose {
+		s.logPairMiss(flowKey, captured)
+	}
+
 	return nil
+}
+
+// logPairMiss emits verbose diagnostic logging for a response that arrived
+// without a waiting request. Includes a cross-flow scan that looks for the
+// same server-side endpoint reached from a different ephemeral port — a
+// telltale sign of NAT or port rewriting separating request and response
+// into different flow keys.
+//
+// MUST be called with NO flow locks held. Takes flowsMu briefly to snapshot
+// candidate flow pointers into a slice, releases flowsMu, then probes each
+// candidate's fp.mu one at a time. The flow pointers remain valid even if
+// the flow is concurrently evicted from the map — the *flowPair struct
+// itself is GC-rooted by our snapshot slice for the duration of the scan.
+func (s *sniffer) logPairMiss(flowKey streamKey, captured CapturedResponse) {
+	log.Printf("[rec] PAIR MISS: status=%d body_bytes=%d src=%d.%d.%d.%d:%d dst=%d.%d.%d.%d:%d",
+		captured.StatusCode, len(captured.BodyPreview),
+		flowKey.dstIP[0], flowKey.dstIP[1], flowKey.dstIP[2], flowKey.dstIP[3], flowKey.dstPort,
+		flowKey.srcIP[0], flowKey.srcIP[1], flowKey.srcIP[2], flowKey.srcIP[3], flowKey.srcPort)
+	log.Printf("[rec] PAIR MISS:   stats: inline_req=%d pair_immediate=%d total_misses=%d expired=%d",
+		atomic.LoadInt64(&s.inlineRequests),
+		atomic.LoadInt64(&s.pairImmediate),
+		atomic.LoadInt64(&s.orphanResponses),
+		atomic.LoadInt64(&s.requestsExpired))
+
+	// Snapshot candidate flows targeting the same server endpoint.
+	// Hold flowsMu only for the snapshot — do NOT take any fp.mu here.
+	type otherFlow struct {
+		key streamKey
+		fp  *flowPair
+	}
+	var candidates []otherFlow
+	serverIP := flowKey.dstIP
+	serverPort := flowKey.dstPort
+
+	s.flowsMu.Lock()
+	for otherKey, otherFP := range s.flows {
+		if otherKey == flowKey || otherFP == nil {
+			continue
+		}
+		if otherKey.dstIP == serverIP && otherKey.dstPort == serverPort {
+			candidates = append(candidates, otherFlow{key: otherKey, fp: otherFP})
+		}
+	}
+	s.flowsMu.Unlock()
+
+	// Probe each candidate's fp.mu independently, with no other lock held.
+	// Safe under ABBA because we acquire each fp.mu in isolation.
+	for _, c := range candidates {
+		c.fp.mu.Lock()
+		pendingCount := len(c.fp.requests)
+		c.fp.mu.Unlock()
+
+		if pendingCount > 0 {
+			log.Printf("[rec] PAIR MISS:   !! FOUND on different ephemeral: %d.%d.%d.%d:%d has %d pending req",
+				c.key.srcIP[0], c.key.srcIP[1], c.key.srcIP[2], c.key.srcIP[3], c.key.srcPort,
+				pendingCount)
+		}
+	}
 }
 
 // =============================================================================

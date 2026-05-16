@@ -497,6 +497,7 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.FlowStates = int64(len(lc.sniffer.flows))
 		lc.sniffer.flowsMu.Unlock()
 		stats.FlowEvictions = atomic.LoadInt64(&lc.sniffer.flowEvictions)
+		stats.FlowEvictionsLive = atomic.LoadInt64(&lc.sniffer.flowEvictionsLive)
 
 		stats.FeedHTTP = atomic.LoadInt64(&lc.sniffer.feedHTTP)
 
