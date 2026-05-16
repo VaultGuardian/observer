@@ -1232,7 +1232,60 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		humanReason = "human: endpoint expected to return sensitive-looking response by design"
 	}
 
-	// Step 1: Persist (UPSERT on full key tuple — idempotent re-click).
+	// =========================================================================
+	// Step 1: Delete the stale Tier-1 request pattern.
+	//
+	// design fix (May 15 2026): without this step, Card 4 leaves
+	// a landmine. When the LLM originally classified the login event, it
+	// learned an "auto" pattern keyed on the request's normalized hash with
+	// bucket=malicious/alert. That pattern lives in the Tier-1 pattern store
+	// and fires on every subsequent matching request, BEFORE the evidence
+	// callback runs. Result: new logins instantly re-escalate via cache hit,
+	// the ExpectedEndpoint tracker (which lives at the evidence layer) never
+	// gets a turn, and the operator sees the same "MALICIOUS Cache Hit →
+	// ESCALATED" bug that motivated Card 4 in the first place.
+	//
+	// Architectural principle (Drew lock-in): policy is identity, not
+	// inference. Card 4 is the deterministic response-shape policy. The
+	// stale auto-pattern is request-level inference. When operator-explicit
+	// policy is set, the inference-level pattern must yield. Same logic
+	// handleNoiseCorrection already applies — we just forgot it here.
+	//
+	// Distinction from failed_probe: failed probes ARE attacks; we keep
+	// the malicious pattern so the Bouncer flags them, and let T2 downgrade
+	// on the 4xx evidence. Expected endpoints are NOT attacks — keeping a
+	// malicious tag on a legitimate API call is a lie to the DB.
+	// =========================================================================
+	correctionScope := finding.SourceType + ":" + finding.SourceName
+	if decision != nil && decision.PatternLearned && decision.PatternValue != "" {
+		bucket := decision.PatternBucket
+		if bucket == "" {
+			bucket = decision.Action
+		}
+		scope := decision.SourceScope
+		if scope == "" {
+			scope = correctionScope
+		}
+		if deleted := s.patterns.DeletePattern(scope, patternstore.Verdict(bucket), decision.PatternValue); deleted {
+			log.Printf("[correction:expected_endpoint] Deleted LLM-learned stale pattern: scope=%s bucket=%s value=%.32s",
+				scope, bucket, decision.PatternValue)
+		}
+	}
+	if finding.MatchedPatternValue != "" && finding.MatchedPatternBucket != "" {
+		scope := finding.MatchedPatternScope
+		if scope == "" {
+			scope = correctionScope
+		}
+		if deleted := s.patterns.DeletePattern(scope, patternstore.Verdict(finding.MatchedPatternBucket), finding.MatchedPatternValue); deleted {
+			log.Printf("[correction:expected_endpoint] Deleted finding-matched stale pattern: scope=%s bucket=%s value=%.32s",
+				scope, finding.MatchedPatternBucket, finding.MatchedPatternValue)
+		}
+	}
+	if err := s.patterns.Persist(); err != nil {
+		log.Printf("[correction:expected_endpoint] Warning: pattern store persist failed after delete: %v — stale pattern may return on Observer restart", err)
+	}
+
+	// Step 2: Persist expected endpoint (UPSERT on full key tuple — idempotent re-click).
 	// Normalized fields go to DB so rows match runtime tracker keys 1:1.
 	err := s.store.SaveExpectedEndpoint(ctx, &store.ExpectedEndpoint{
 		Host:             host,
@@ -1249,12 +1302,12 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		return
 	}
 
-	// Step 2: Seed into live tracker (active immediately, no restart needed)
+	// Step 3: Seed into live tracker (active immediately, no restart needed)
 	if s.onSeedExpectedEndpoint != nil {
 		s.onSeedExpectedEndpoint(host, method, status, path, shapeHash, humanReason)
 	}
 
-	// Step 3: Invalidate the reclass cache. The reclass cache is keyed on the
+	// Step 4: Invalidate the reclass cache. The reclass cache is keyed on the
 	// REDACTED shape hash (rec.HashBody(SafeBodyPreview), which is exactly
 	// what we have in decision.CacheKey). Without this invalidation, a stale
 	// "malicious" verdict could re-fire on the next matching request before
@@ -1264,14 +1317,14 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		s.onInvalidateReclassCache(shapeHash)
 	}
 
-	// Step 4: Update finding verdict to "allow" — semantically distinct from
+	// Step 5: Update finding verdict to "allow" — semantically distinct from
 	// failed_probe's "recon". The request was LEGITIMATE (not a hostile probe
 	// that happened to fail).
 	if err := s.store.UpdateFindingVerdict(ctx, finding.EventID, "allow", humanReason); err != nil {
 		log.Printf("[correction] Warning: finding update failed: %v", err)
 	}
 
-	// Step 5: Mark LLM decision as corrected (if we have one)
+	// Step 6: Mark LLM decision as corrected (if we have one)
 	if decision != nil {
 		if err := s.store.UpdateLLMDecisionReview(ctx, decision.ID, store.LLMReview{
 			Status:     "corrected",
