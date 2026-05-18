@@ -262,66 +262,177 @@ func redactHTML(body []byte) string {
 }
 
 // redactHTMLAttributes redacts sensitive attribute values in a single HTML tag.
-// Keeps the tag structure, redacts value="..." on input/textarea,
-// content="..." on meta, and any attribute matching secret patterns.
+//
+// Two rule sets, both applied in one pass:
+//
+//  1. Position-based: certain attributes on certain tags always hold secrets
+//     or URL-borne tokens (value on input/textarea, content on meta,
+//     href on anchors, src on media, action on forms).
+//  2. Name-based: any attribute whose name contains a secret-shaped token
+//     (token, key, auth, password, secret, credential, session, bearer,
+//     csrf, apikey) is redacted regardless of tag — catches data-api-key,
+//     x-csrf-token, sessionToken, etc.
+//
+// URL attributes (href/src/action) are redacted wholesale rather than
+// parsing query strings for token-shaped parameters. Loses some URL
+// structure for LLM classification but prevents query-param leakage
+// without a brittle URL parser running over potentially malformed bytes.
 func redactHTMLAttributes(tag string) string {
-	tagLower := strings.ToLower(tag)
-
-	// Only process tags that might have sensitive attributes
-	needsRedaction := false
-	for _, prefix := range []string{"<input", "<textarea", "<meta", "<form"} {
-		if strings.HasPrefix(tagLower, prefix) {
-			needsRedaction = true
-			break
-		}
-	}
-	if !needsRedaction {
+	if len(tag) < 2 || tag[0] != '<' {
 		return tag
 	}
-
-	// Simple attribute value redaction:
-	// Replace value="..." and content="..." with redacted versions
-	result := tag
-	for _, attr := range []string{"value", "content"} {
-		result = redactAttribute(result, attr)
+	if tag[1] == '/' || tag[1] == '!' {
+		return tag // closing tag, comment, or doctype — nothing to redact
 	}
-	return result
+
+	// Walk past tag name.
+	i := 1
+	for i < len(tag) && !isAttrBoundary(tag[i]) {
+		i++
+	}
+	tagName := strings.ToLower(tag[1:i])
+	positional := positionalSecretAttrsFor(tagName)
+
+	var b strings.Builder
+	b.Grow(len(tag) + 16)
+	b.WriteString(tag[:i])
+
+	for i < len(tag) {
+		// Whitespace between attrs (or before '>').
+		wsStart := i
+		for i < len(tag) && isHTMLSpace(tag[i]) {
+			i++
+		}
+		b.WriteString(tag[wsStart:i])
+
+		if i >= len(tag) || tag[i] == '>' || tag[i] == '/' {
+			b.WriteString(tag[i:])
+			return b.String()
+		}
+
+		// Attribute name.
+		nameStart := i
+		for i < len(tag) && tag[i] != '=' && !isAttrBoundary(tag[i]) {
+			i++
+		}
+		name := tag[nameStart:i]
+		nameLower := strings.ToLower(name)
+		b.WriteString(name)
+
+		// Whitespace before '='.
+		for i < len(tag) && isHTMLSpace(tag[i]) {
+			b.WriteByte(tag[i])
+			i++
+		}
+
+		if i >= len(tag) || tag[i] != '=' {
+			// Boolean attribute (e.g. disabled, checked) — no value.
+			continue
+		}
+		b.WriteByte('=')
+		i++
+
+		// Whitespace after '='.
+		for i < len(tag) && isHTMLSpace(tag[i]) {
+			b.WriteByte(tag[i])
+			i++
+		}
+		if i >= len(tag) {
+			return b.String()
+		}
+
+		// Value: quoted or unquoted.
+		isSecret := positional[nameLower] || attrNameLooksSecret(nameLower)
+		valStart := i
+		if tag[i] == '"' || tag[i] == '\'' {
+			quote := tag[i]
+			i++
+			closeIdx := strings.IndexByte(tag[i:], quote)
+			if closeIdx < 0 {
+				// Unterminated quoted value (common at preview truncation
+				// boundaries). Fail closed for secrets: if this attribute
+				// was going to be redacted anyway, drop the raw bytes and
+				// stamp [REDACTED]. For non-secret attrs we still leave
+				// the partial value, since over-redacting structure costs
+				// us LLM signal.
+				if isSecret {
+					b.WriteString(`"[REDACTED]"`)
+				} else {
+					b.WriteString(tag[valStart:])
+				}
+				return b.String()
+			}
+			i = i + closeIdx + 1 // past closing quote
+		} else {
+			for i < len(tag) && tag[i] != '>' && !isHTMLSpace(tag[i]) {
+				i++
+			}
+		}
+		valEnd := i
+
+		if isSecret {
+			b.WriteString(`"[REDACTED]"`)
+		} else {
+			b.WriteString(tag[valStart:valEnd])
+		}
+	}
+
+	return b.String()
 }
 
-// redactAttribute finds attr="..." or attr='...' in a tag string and replaces
-// the value with [REDACTED].
-func redactAttribute(tag, attrName string) string {
-	lower := strings.ToLower(tag)
-	searchLower := attrName + "="
+// isHTMLSpace reports whether b is HTML whitespace as defined by the parser
+// (space, tab, LF, CR, FF). We use this everywhere the spec calls for
+// "ASCII whitespace" — between attributes, around '=', etc.
+func isHTMLSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
+}
 
-	idx := strings.Index(lower, searchLower)
-	if idx < 0 {
-		return tag
+// isAttrBoundary reports whether b terminates an attribute name or tag name.
+func isAttrBoundary(b byte) bool {
+	return isHTMLSpace(b) || b == '>' || b == '/'
+}
+
+// positionalSecretAttrsFor returns the set of attribute names that are
+// considered dangerous-by-position for the given tag. URL-bearing
+// attributes (href, src, action, formaction) are included because
+// query parameters routinely carry tokens (?token=, ?key=, &apikey=)
+// and the safest answer is to redact the value entirely.
+func positionalSecretAttrsFor(tagName string) map[string]bool {
+	switch tagName {
+	case "input", "textarea":
+		return map[string]bool{"value": true}
+	case "meta":
+		return map[string]bool{"content": true}
+	case "form":
+		return map[string]bool{"action": true}
+	case "a", "link", "area", "base":
+		return map[string]bool{"href": true}
+	case "img", "iframe", "source", "embed", "track", "audio", "video":
+		return map[string]bool{"src": true}
+	case "button":
+		return map[string]bool{"formaction": true}
 	}
+	return nil
+}
 
-	// Position after "attr="
-	valStart := idx + len(searchLower)
-	if valStart >= len(tag) {
-		return tag
-	}
-
-	quote := tag[valStart]
-	if quote != '"' && quote != '\'' {
-		// Unquoted attribute — find next space or >
-		valEnd := valStart
-		for valEnd < len(tag) && tag[valEnd] != ' ' && tag[valEnd] != '>' {
-			valEnd++
+// attrNameLooksSecret reports whether the attribute name (already lowercased)
+// contains any token strongly associated with secrets. The match is a plain
+// substring scan: "data-api-key", "x-csrf-token", "sessionToken", and
+// "accessKey" all hit. Some false positives are acceptable — over-redacting
+// a benign attribute value costs the LLM minor structural context, while
+// under-redaction leaks credentials.
+func attrNameLooksSecret(nameLower string) bool {
+	for _, t := range secretAttrNameTokens {
+		if strings.Contains(nameLower, t) {
+			return true
 		}
-		return tag[:valStart] + "\"[REDACTED]\"" + tag[valEnd:]
 	}
+	return false
+}
 
-	// Quoted attribute — find closing quote
-	closeQuote := strings.IndexByte(tag[valStart+1:], quote)
-	if closeQuote < 0 {
-		return tag // malformed, leave as-is
-	}
-	valEnd := valStart + 1 + closeQuote + 1 // past the closing quote
-	return tag[:valStart] + "\"[REDACTED]\"" + tag[valEnd:]
+var secretAttrNameTokens = []string{
+	"token", "secret", "key", "auth", "password", "passwd",
+	"credential", "session", "bearer", "csrf", "apikey",
 }
 
 // =============================================================================

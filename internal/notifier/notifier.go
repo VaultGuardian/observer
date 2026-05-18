@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vaultguardian/observer/internal/rec"
@@ -17,6 +18,17 @@ const (
 	SeverityMalicious  Severity = "malicious"
 	SeveritySuspicious Severity = "suspicious"
 	SeverityAlert      Severity = "alert"
+)
+
+// Tunables for the worker pool and limiter sweeper. Conservative defaults —
+// a 32-deep queue per channel is enough to absorb burst alert storms without
+// unbounded goroutine spawn. Past that, we drop and log: the operator gets
+// a visible counter on stats rather than silent memory growth.
+const (
+	defaultQueueSize    = 32
+	defaultSendTimeout  = 10 * time.Second
+	limiterSweepEvery   = 5 * time.Minute
+	limiterIdleEviction = 1 * time.Hour
 )
 
 // Alert is the unified payload sent to all notification channels.
@@ -49,11 +61,29 @@ type Notifier interface {
 
 // Dispatcher fans out alerts to all enabled channels, applying severity
 // routing and per-channel rate limiting.
+//
+// Send is bounded: each channel has its own buffered queue and a single
+// worker goroutine. Dispatch never spawns a goroutine per alert. When a
+// queue is full (sustained overload), the alert is dropped and the
+// dropped-counter incremented so operators can see shedding.
 type Dispatcher struct {
 	channels []Notifier
 	config   *Config
-	limiters map[string]*rateLimiter // keyed by "channelName:containerName"
-	mu       sync.RWMutex
+
+	// Rate-limiter state. Keyed "channelName:containerName" — high
+	// cardinality, so a sweeper goroutine evicts idle entries.
+	limiters map[string]*rateLimiter
+	mu       sync.Mutex
+
+	// Per-channel work queues. One worker per queue. Started in
+	// NewDispatcher, drained and stopped in Stop().
+	queues map[string]chan Alert
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+
+	dropped atomic.Int64
 }
 
 // NewDispatcher creates a dispatcher from the given config. It auto-detects
@@ -63,6 +93,8 @@ func NewDispatcher(cfg *Config) (*Dispatcher, error) {
 	d := &Dispatcher{
 		config:   cfg,
 		limiters: make(map[string]*rateLimiter),
+		queues:   make(map[string]chan Alert),
+		stopCh:   make(chan struct{}),
 	}
 
 	// --- Auto-detect channels from env config ---
@@ -97,30 +129,156 @@ func NewDispatcher(cfg *Config) (*Dispatcher, error) {
 		}
 	}
 
+	// --- Start one worker per channel ---
+	for _, ch := range d.channels {
+		q := make(chan Alert, defaultQueueSize)
+		d.queues[ch.Name()] = q
+		d.wg.Add(1)
+		go d.runWorker(ch, q)
+	}
+
+	// --- Start limiter sweeper ---
+	d.wg.Add(1)
+	go d.runLimiterSweeper()
+
 	return d, nil
 }
 
-// Dispatch sends an alert to all channels that are configured to receive
-// alerts of the given severity, respecting rate limits.
-func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) {
+// Dispatch enqueues an alert for delivery on every channel configured to
+// receive the given severity. Returns the number of channels that actually
+// accepted the alert into their queue (after rate-limit and queue-full
+// checks). Callers that record a "notified" flag should gate it on a
+// non-zero return so dropped alerts don't get marked delivered.
+//
+// Drops are logged and increment the dropped counter (see DroppedCount).
+// After Stop() has been called, all dispatches return 0 immediately.
+func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) int {
+	// Fast path: already stopped → drop without lock.
+	select {
+	case <-d.stopCh:
+		return 0
+	default:
+	}
+
 	allowedChannels := d.config.Routing.ChannelsFor(alert.Severity)
+	enqueued := 0
 
 	for _, ch := range d.channels {
 		if !contains(allowedChannels, ch.Name()) {
 			continue
 		}
 
-		// Rate limit check
-		if d.isRateLimited(ch.Name(), alert.ContainerName) {
+		// Phase 1: pure check. Doesn't mutate the limiter — that happens
+		// only if the enqueue below succeeds.
+		limited, rlKey := d.rateLimitCheck(ch.Name(), alert.ContainerName)
+		if limited {
 			continue
 		}
 
-		go func(n Notifier) {
-			if err := n.Send(ctx, alert); err != nil {
-				log.Printf("[notifier] %s send failed: %v", n.Name(), err)
-			}
-		}(ch)
+		q := d.queues[ch.Name()]
+		select {
+		case q <- alert:
+			// Phase 2: enqueue succeeded → commit rate-limit timestamp.
+			d.commitRateLimit(rlKey)
+			enqueued++
+		case <-d.stopCh:
+			return enqueued
+		default:
+			// Queue full — drop and log. Limiter NOT committed: a real
+			// alert in the next interval gets its slot, not a dropped one.
+			d.dropped.Add(1)
+			log.Printf("[notifier] %s queue full (depth=%d) — dropped event=%s severity=%s",
+				ch.Name(), len(q), alert.EventID, alert.Severity)
+		}
 	}
+
+	return enqueued
+}
+
+// runWorker drains one channel's queue. Send errors are logged, not retried —
+// individual notifier implementations own their retry policy.
+func (d *Dispatcher) runWorker(n Notifier, q chan Alert) {
+	defer d.wg.Done()
+	for {
+		select {
+		case <-d.stopCh:
+			// Best-effort drain of anything already enqueued.
+			for {
+				select {
+				case alert := <-q:
+					d.send(n, alert)
+				default:
+					return
+				}
+			}
+		case alert := <-q:
+			d.send(n, alert)
+		}
+	}
+}
+
+func (d *Dispatcher) send(n Notifier, alert Alert) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSendTimeout)
+	defer cancel()
+	if err := n.Send(ctx, alert); err != nil {
+		log.Printf("[notifier] %s send failed: %v", n.Name(), err)
+	}
+}
+
+// runLimiterSweeper evicts rate-limiter entries that haven't been touched
+// in `limiterIdleEviction`. Without this, the limiter map grows forever
+// since keys include container name (high cardinality across container
+// restarts).
+func (d *Dispatcher) runLimiterSweeper() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(limiterSweepEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.sweepLimiters()
+		}
+	}
+}
+
+func (d *Dispatcher) sweepLimiters() {
+	cutoff := time.Now().Add(-limiterIdleEviction)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k, rl := range d.limiters {
+		if rl.lastSent.Before(cutoff) {
+			delete(d.limiters, k)
+		}
+	}
+}
+
+// Stop signals workers to drain and exit, then waits up to the context
+// deadline for in-flight sends to complete. Alerts still queued past the
+// deadline are dropped. Safe to call multiple times. Subsequent Dispatch
+// calls drop silently.
+func (d *Dispatcher) Stop(ctx context.Context) {
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+	})
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Drain deadline exceeded — accept the loss.
+	}
+}
+
+// DroppedCount returns the cumulative number of alerts dropped due to
+// full queues since startup.
+func (d *Dispatcher) DroppedCount() int64 {
+	return d.dropped.Load()
 }
 
 // PrintStatus logs which channels are active on startup.
@@ -156,17 +314,27 @@ func (d *Dispatcher) ChannelCount() int {
 }
 
 // --- Rate limiter ---
+//
+// Two-phase to keep timestamps honest with the bounded queue: rateLimitCheck
+// is a pure read of "is this (channel, container) currently rate-limited";
+// commitRateLimit stamps lastSent only after the alert successfully
+// enqueued. Without the split, a rate check that updates lastSent followed
+// by a queue-full drop would silence the next *real* alert with a slot
+// for a dropped one.
 
 type rateLimiter struct {
 	lastSent time.Time
 }
 
-func (d *Dispatcher) isRateLimited(channelName, containerName string) bool {
+// rateLimitCheck returns (limited, key). The caller is responsible for
+// invoking commitRateLimit(key) iff the alert was successfully accepted
+// downstream and limited == false. When interval is 0 (no limit
+// configured for this channel), returns (false, "").
+func (d *Dispatcher) rateLimitCheck(channelName, containerName string) (bool, string) {
 	interval := d.config.RateLimits.IntervalFor(channelName)
 	if interval == 0 {
-		return false
+		return false, ""
 	}
-
 	key := channelName + ":" + containerName
 
 	d.mu.Lock()
@@ -174,16 +342,28 @@ func (d *Dispatcher) isRateLimited(channelName, containerName string) bool {
 
 	rl, exists := d.limiters[key]
 	if !exists {
-		d.limiters[key] = &rateLimiter{lastSent: time.Now()}
-		return false
+		return false, key
 	}
-
 	if time.Since(rl.lastSent) < interval {
-		return true
+		return true, key
 	}
+	return false, key
+}
 
-	rl.lastSent = time.Now()
-	return false
+// commitRateLimit stamps lastSent for the given key. Safe to call with an
+// empty key (no-op) so callers can pass through the value from
+// rateLimitCheck unconditionally.
+func (d *Dispatcher) commitRateLimit(key string) {
+	if key == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if rl, exists := d.limiters[key]; exists {
+		rl.lastSent = time.Now()
+		return
+	}
+	d.limiters[key] = &rateLimiter{lastSent: time.Now()}
 }
 
 // --- Helpers ---

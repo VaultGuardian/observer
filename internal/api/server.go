@@ -92,6 +92,12 @@ type Server struct {
 	onSeedCatchAll           func(host, method string, status int, bodyHash, reason string, responseBytes int64)
 	onSeedExpectedEndpoint   func(host, method string, status int, path, bodyHash, reason string)
 	getExpectedEndpointStats func() (total int, suppressed int64)
+
+	// getNotifierStats exposes notifier dispatcher counters to /api/stats
+	// without coupling the API server type to the notifier package.
+	// Returns the cumulative count of alerts dropped because a channel's
+	// queue was full, and the number of active notification channels.
+	getNotifierStats func() (dropped int64, channels int)
 }
 
 // NewServer creates the API server and loads (or generates) the auth token.
@@ -131,6 +137,14 @@ func NewServer(
 		collector:      collector,
 		allowedOrigins: originSet,
 	}, nil
+}
+
+// SetNotifierStatsCallback wires the notifier dispatcher's counter accessors
+// to /api/stats. Called from main.go after the dispatcher is constructed.
+// Decoupled from the API server type so this package doesn't need to
+// import internal/notifier.
+func (s *Server) SetNotifierStatsCallback(notifierStats func() (dropped int64, channels int)) {
+	s.getNotifierStats = notifierStats
 }
 
 // SetCorrectionCallbacks wires the human correction system to the coordinator
@@ -429,6 +443,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		result["expected_endpoints"] = map[string]interface{}{
 			"total":      eeTotal,
 			"suppressed": eeSuppressed,
+		}
+	}
+
+	// Notifier dispatcher counters. Nil-safe.
+	if s.getNotifierStats != nil {
+		nDropped, nChannels := s.getNotifierStats()
+		result["notifier"] = map[string]interface{}{
+			"channels": nChannels,
+			"dropped":  nDropped,
 		}
 	}
 

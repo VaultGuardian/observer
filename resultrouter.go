@@ -410,6 +410,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// there is no HTTP request/response pair to evaluate. The malicious content
 	// IS the log line itself. Dispatch notification directly, same as policy engine.
 	shouldNotify := result.Verdict == patternstore.VerdictMalicious
+	notified := false
 
 	if shouldNotify {
 		log.Printf("[ESCALATE] EventID=%s Source=%s Reason=%s MatchedVia=%s (non-HTTP malicious, direct dispatch)",
@@ -427,7 +428,9 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			Confidence:     result.LLMConfidence,
 			Timestamp:      evt.Timestamp,
 		}
-		r.dispatch.Dispatch(context.Background(), alert)
+		// Notified reflects actual enqueue success — a queue-full drop or
+		// no-channels-configured both count as "not notified."
+		notified = r.dispatch.Dispatch(context.Background(), alert) > 0
 	}
 
 	// Fix 3: Use async writer for non-HTTP alerts (non-droppable — blocks if full)
@@ -453,6 +456,6 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		RawLine:              evt.Line,
 		NormalizedLine:       evt.NormalizedLine,
 		NormalizedHash:       evt.Hash,
-		Notified:             shouldNotify,
+		Notified:             notified,
 	})
 }

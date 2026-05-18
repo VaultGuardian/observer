@@ -464,15 +464,40 @@ func (s *Store) migrate() error {
 		if m.version <= current {
 			continue
 		}
-		if _, err := s.db.Exec(m.sql); err != nil {
-			return fmt.Errorf("migration v%d (%s): %w", m.version, m.desc, err)
-		}
-		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", m.version); err != nil {
-			return fmt.Errorf("record migration v%d: %w", m.version, err)
+		if err := applyMigration(s.db, m.version, m.desc, m.sql); err != nil {
+			return err
 		}
 		log.Printf("[store] Applied migration v%d: %s", m.version, m.desc)
 	}
 
+	return nil
+}
+
+// applyMigration runs one migration and records its version atomically.
+// Multi-statement migrations (e.g. several ALTERs in one .sql block) used to
+// land partially and leave the schema_version row unwritten — on next boot
+// the runner re-tried the migration and hit "duplicate column" on whichever
+// ALTER landed first. Wrapping the whole step in a transaction means either
+// every statement and the version row commit together, or nothing does.
+//
+// SQLite supports DDL inside transactions for ALTER TABLE, CREATE TABLE,
+// CREATE INDEX, and DROP TABLE/INDEX, which covers every migration we ship.
+func applyMigration(db *sql.DB, version int, desc, migrationSQL string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("migration v%d begin: %w", version, err)
+	}
+	if _, err := tx.Exec(migrationSQL); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("migration v%d (%s): %w", version, desc, err)
+	}
+	if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", version); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record migration v%d: %w", version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration v%d: %w", version, err)
+	}
 	return nil
 }
 

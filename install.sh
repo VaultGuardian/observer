@@ -1,8 +1,7 @@
 #!/bin/bash
 # VaultGuardian Observer — Install Script
 # Usage: sudo bash install.sh
-# Requires: gh CLI authenticated with access to VaultGuardian/observer
-# Future (public repo): curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
+#        curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 set -e
 
 REPO="VaultGuardian/observer"
@@ -44,25 +43,18 @@ echo ""
 # Must have systemd
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
 
-# Must have gh CLI (repo is private — curl can't download without auth)
+# Need curl to download the binary from public releases. gh CLI is an
+# optional fallback for pre-releases or auth-gated repos.
+command -v curl >/dev/null 2>&1 || fail "curl is required (apt-get install curl / yum install curl)"
+
 if command -v gh >/dev/null 2>&1; then
-    ok "GitHub CLI detected"
-else
-    fail "GitHub CLI (gh) is required. Install: https://cli.github.com"
-fi
-
-# Verify gh is authenticated
-# When running as root via sudo, gh auth may live in the calling user's home.
-# Try to inherit it.
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    if [ -d "$REAL_HOME/.config/gh" ]; then
-        export GH_CONFIG_DIR="$REAL_HOME/.config/gh"
+    # When running as root via sudo, gh auth lives in the calling user's home.
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        if [ -d "$REAL_HOME/.config/gh" ]; then
+            export GH_CONFIG_DIR="$REAL_HOME/.config/gh"
+        fi
     fi
-fi
-
-if ! gh auth status >/dev/null 2>&1; then
-    fail "GitHub CLI not authenticated. Run 'gh auth login' first (as your normal user)."
 fi
 
 # -------------------------------------------------------------------
@@ -166,8 +158,21 @@ info "Downloading Observer binary..."
 cd /tmp
 rm -f observer
 
-if ! gh release download --repo "$REPO" --pattern "observer"; then
-    fail "Download failed. Check gh auth status and that the repo has releases."
+# Try public release URL via curl. -L follows redirects (the
+# releases/latest/download URL is a 302 to the actual asset).
+# Fall back to gh CLI when curl can't reach the asset — covers private
+# repos, pre-release tags, and rate-limited unauthenticated requests.
+DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/observer"
+if curl -fsSL --retry 3 -o observer "$DOWNLOAD_URL"; then
+    ok "Downloaded from public release"
+elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    warn "Public download failed — trying gh CLI"
+    if ! gh release download --repo "$REPO" --pattern "observer"; then
+        fail "Download failed via both curl and gh. Check network and that the repo has a release named 'observer'."
+    fi
+    ok "Downloaded via gh CLI"
+else
+    fail "Could not download Observer binary. Check network connectivity, or install + authenticate gh CLI for private/pre-release access."
 fi
 
 mv observer "$BIN"
@@ -276,22 +281,43 @@ REPO="VaultGuardian/observer"
 BIN="/usr/local/bin/observer"
 SERVICE="observer"
 
+# download_binary <version> — fetches observer to ./observer
+# version: "latest" or a tag like "v0.53.0"
+download_binary() {
+    local version="$1"
+    local url
+    if [ "$version" = "latest" ]; then
+        url="https://github.com/${REPO}/releases/latest/download/observer"
+    else
+        url="https://github.com/${REPO}/releases/download/${version}/observer"
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --retry 3 -o observer "$url"; then
+            return 0
+        fi
+    fi
+    # Fall back to gh CLI for private/pre-release/auth-gated cases.
+    if command -v gh >/dev/null 2>&1; then
+        if [ "$version" = "latest" ]; then
+            gh release download --repo "$REPO" --pattern "observer"
+        else
+            gh release download "$version" --repo "$REPO" --pattern "observer"
+        fi
+        return $?
+    fi
+    echo "[vaultguardian] No download method available. Install curl (preferred) or gh CLI."
+    return 1
+}
+
 case "$1" in
   update)
     VERSION="${2:-latest}"
-    echo "[vaultguardian] Updating Observer..."
+    echo "[vaultguardian] Updating Observer to ${VERSION}..."
     cd /tmp
     rm -f observer
-
-    if command -v gh >/dev/null 2>&1; then
-      if [ "$VERSION" = "latest" ]; then
-        gh release download --repo "$REPO" --pattern "observer"
-      else
-        gh release download "$VERSION" --repo "$REPO" --pattern "observer"
-      fi
-    else
-      echo "[vaultguardian] gh CLI not found. Install: https://cli.github.com"
-      exit 1
+    if ! download_binary "$VERSION"; then
+        exit 1
     fi
 
     sudo mv observer "$BIN"
@@ -321,7 +347,7 @@ case "$1" in
     if command -v gh >/dev/null 2>&1; then
       gh release list --repo "$REPO" --limit 5
     else
-      echo "(install gh CLI to see available versions)"
+      echo "(install gh CLI to see available versions, or check https://github.com/${REPO}/releases)"
     fi
     ;;
   uninstall)

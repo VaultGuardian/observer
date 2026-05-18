@@ -40,6 +40,21 @@ type Rule struct {
 	SourceType string // "journal", "docker", "audit", "" for any
 	SourceName string // "sshd", "sudo", "" for any within SourceType
 
+	// MatchKernelUnits, when non-empty, requires the kernel-attached
+	// _SYSTEMD_UNIT of a journald event (carried in evt.Metadata["unit"])
+	// to normalize to one of these values. Use this for high-confidence
+	// rules where the attacker could otherwise spoof SYSLOG_IDENTIFIER —
+	// e.g. a container writing SYSLOG_IDENTIFIER="sshd" to journald.
+	//
+	// Normalization strips ".service"/".scope" and any "@instance" suffix:
+	//   "ssh.service"             -> "ssh"
+	//   "sshd@1.2.3.4-22.service" -> "sshd"
+	//   "docker-abc123.scope"     -> "docker-abc123"
+	//
+	// Matching is case-insensitive. When set, this is the trust anchor;
+	// SourceName above can be left empty to avoid double-filtering.
+	MatchKernelUnits []string
+
 	// Pattern is the compiled regex to match against the event line.
 	Pattern *regexp.Regexp
 
@@ -81,6 +96,16 @@ func (e *Engine) Evaluate(evt *event.Event) Result {
 		}
 		if rule.SourceName != "" && !strings.EqualFold(evt.SourceName, rule.SourceName) {
 			continue
+		}
+		// Kernel-attached unit filter (anti-spoof). When set, the rule only
+		// fires for events whose _SYSTEMD_UNIT normalizes to one of the
+		// listed units. The unit is recorded by the journald watcher in
+		// evt.Metadata["unit"]; for non-journald sources it's empty and
+		// the rule won't match.
+		if len(rule.MatchKernelUnits) > 0 {
+			if !unitMatches(evt.Metadata["unit"], rule.MatchKernelUnits) {
+				continue
+			}
 		}
 
 		// Pattern match
@@ -152,11 +177,17 @@ func defaultRules() []Rule {
 		// ----- SSH Success -----
 		// Matches: "Accepted password for root from 1.2.3.4 port 43822 ssh2"
 		// Matches: "Accepted publickey for deploy from 10.0.0.5 port 22 ssh2"
+		//
+		// Anti-spoof: requires the kernel-attached _SYSTEMD_UNIT, not the
+		// freely-settable SYSLOG_IDENTIFIER. A container writing
+		// `SYSLOG_IDENTIFIER="sshd"` to journald cannot fake "ssh.service"
+		// as its cgroup-derived unit. Debian's unit is "ssh", RHEL's is
+		// "sshd"; both are accepted.
 		{
-			ID:         "ssh_login",
-			SourceType: "journal",
-			SourceName: "sshd",
-			Pattern:    regexp.MustCompile(`Accepted\s+(password|publickey|keyboard-interactive)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)`),
+			ID:               "ssh_login",
+			SourceType:       "journal",
+			MatchKernelUnits: []string{"ssh", "sshd"},
+			Pattern:          regexp.MustCompile(`Accepted\s+(password|publickey|keyboard-interactive)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)`),
 			Extract: func(m []string) Result {
 				return Result{
 					AuthMethod: m[1],
@@ -231,7 +262,17 @@ func defaultRules() []Rule {
 
 		// ----- Failed Sudo (someone inside, trying to escalate) -----
 		// Matches: "user NOT in sudoers" or "3 incorrect password attempts"
-		// Alert only, not escalate — noisy but indicates compromise
+		// Alert only, not escalate — noisy but indicates compromise.
+		//
+		// Residual spoof risk: this rule matches against the spoofable
+		// SYSLOG_IDENTIFIER "sudo" rather than a kernel-attached unit.
+		// Tightening with MatchKernelUnits is impractical because sudo
+		// inherits its cgroup from the parent session (e.g. ssh@N.service,
+		// user@1000.service, session-N.scope) — there is no canonical
+		// "sudo.service" unit to match on. A container writing fake sudo
+		// lines to journald can therefore trip this rule. Mitigation:
+		// it's "alert", not "escalate", and the trusted_ips allowlist
+		// handles the legitimate operator case.
 		{
 			ID:         "sudo_failure",
 			SourceType: "journal",
@@ -266,4 +307,39 @@ func defaultRules() []Rule {
 			DefaultAction:   "allow",
 		},
 	}
+}
+
+// unitMatches reports whether the unit (e.g. "ssh.service" from
+// evt.Metadata["unit"]) normalizes to any of the allowed unit names.
+// Empty unit returns false — rules with MatchKernelUnits set are journald-
+// scoped and an event with no unit can't satisfy them.
+func unitMatches(unit string, allowed []string) bool {
+	if unit == "" {
+		return false
+	}
+	normalized := normalizeUnit(unit)
+	for _, a := range allowed {
+		if strings.EqualFold(normalized, a) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeUnit strips ".service"/".scope"/".socket"/etc. suffixes and any
+// "@instance" portion from a systemd unit name, returning the lowercase base.
+//
+//	"ssh.service"             -> "ssh"
+//	"sshd@1.2.3.4-22.service" -> "sshd"
+//	"user@1000.service"       -> "user"
+//	"docker-abc123.scope"     -> "docker-abc123"
+func normalizeUnit(unit string) string {
+	u := unit
+	if dot := strings.LastIndexByte(u, '.'); dot >= 0 {
+		u = u[:dot]
+	}
+	if at := strings.IndexByte(u, '@'); at >= 0 {
+		u = u[:at]
+	}
+	return strings.ToLower(u)
 }

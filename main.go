@@ -328,6 +328,14 @@ func main() {
 				return expectedEndpointTracker.Stats()
 			},
 		)
+
+		// Notifier dispatcher counters → /api/stats and the periodic log
+		// line. Same nil guard as the correction callbacks above: when
+		// api.NewServer failed we logged "continuing without dashboard"
+		// and apiServer is nil here.
+		apiServer.SetNotifierStatsCallback(func() (dropped int64, channels int) {
+			return dispatch.DroppedCount(), dispatch.ChannelCount()
+		})
 	}
 
 	// ------- Ingestion Pipeline -------
@@ -374,7 +382,7 @@ func main() {
 		pipelineBufferSize, numWorkers, retryQueueSize, numRetryWorkers, cfg.MaxConcurrentLLM)
 
 	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, &pipelineDrops, &retryQueueDrops)
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, &pipelineDrops, &retryQueueDrops, dispatch)
 
 	// ------- Fix 4: Evidence reconciler goroutine -------
 	go runReconciler(ctx, db)
@@ -433,12 +441,19 @@ func main() {
 		shutdownCancel()
 	}
 
-	// 2. Persist pattern store to disk.
+	// 2. Stop notifier dispatcher — drain queued alerts up to 3s, then drop.
+	if dispatch != nil {
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dispatch.Stop(drainCtx)
+		drainCancel()
+	}
+
+	// 3. Persist pattern store to disk.
 	if err := a.Persist(); err != nil {
 		log.Printf("[observer] Failed final persist: %v", err)
 	}
 
-	// 3. Close DB — stops async findings writer (drains queue), then closes SQLite.
+	// 4. Close DB — stops async findings writer (drains queue), then closes SQLite.
 	if err := db.Close(); err != nil {
 		log.Printf("[observer] DB close error: %v", err)
 	}
@@ -537,6 +552,11 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				alert.EventID, alert.ScopeKey, alert.EscalateReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
+			// Compute notified by trying to dispatch. The notified flag in
+			// the finding must reflect whether anything actually entered a
+			// notifier queue — queue-full drops or no-channels-configured
+			// both count as "not notified."
+			notified := false
 			if alert.BuildAlert != nil {
 				// Section 3 / Finding 7: pass the coordinator's already-attached
 				// evidence to the closure instead of doing a second host-less
@@ -544,7 +564,9 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				if builtAlert, ok := alert.BuildAlert(alert.Evidence).(notifier.Alert); ok {
 					builtAlert.Severity = notifier.SeverityMalicious
 					builtAlert.Reason = alert.EscalateReason
-					dispatch.Dispatch(context.Background(), builtAlert)
+					if dispatch.Dispatch(context.Background(), builtAlert) > 0 {
+						notified = true
+					}
 				}
 			}
 
@@ -576,7 +598,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				EvidenceContentType:  evCT,
 				EvidenceBodyHash:     evHash,
 				EvidenceCaptureMode:  evMode,
-				Notified:             true,
+				Notified:             notified,
 				ResolutionStatus:     "resolved",
 				ResolvedAt:           &now,
 				ResolutionMethod:     "rec_evidence",
@@ -1287,21 +1309,6 @@ func routePolicyOutcome(evt *event.Event, pr policy.Result, dispatch *notifier.D
 		log.Printf("[POLICY:ESCALATE] EventID=%s rule=%s ip=%s user=%s reason=%s",
 			evt.ID, pr.RuleID, pr.SourceIP, pr.Username, pr.Reason)
 
-		db.SubmitFinding(&store.Finding{
-			EventID:        evt.ID,
-			Timestamp:      evt.Timestamp,
-			SourceType:     evt.SourceType,
-			SourceName:     evt.SourceName,
-			SourceIP:       pr.SourceIP,
-			Verdict:        "malicious",
-			Classification: "policy_escalated",
-			Confidence:     1.0,
-			Reason:         pr.Reason,
-			MatchedVia:     "policy:" + pr.RuleID,
-			RawLine:        evt.Line,
-			Notified:       true,
-		})
-
 		alert := notifier.Alert{
 			EventID:        evt.ID,
 			Severity:       notifier.SeverityMalicious,
@@ -1314,7 +1321,23 @@ func routePolicyOutcome(evt *event.Event, pr policy.Result, dispatch *notifier.D
 			Confidence:     1.0,
 			Timestamp:      evt.Timestamp,
 		}
-		dispatch.Dispatch(context.Background(), alert)
+		// Dispatch first so the finding's Notified flag reflects reality.
+		notified := dispatch.Dispatch(context.Background(), alert) > 0
+
+		db.SubmitFinding(&store.Finding{
+			EventID:        evt.ID,
+			Timestamp:      evt.Timestamp,
+			SourceType:     evt.SourceType,
+			SourceName:     evt.SourceName,
+			SourceIP:       pr.SourceIP,
+			Verdict:        "malicious",
+			Classification: "policy_escalated",
+			Confidence:     1.0,
+			Reason:         pr.Reason,
+			MatchedVia:     "policy:" + pr.RuleID,
+			RawLine:        evt.Line,
+			Notified:       notified,
+		})
 	}
 }
 
@@ -1448,7 +1471,7 @@ func runReconciler(ctx context.Context, db *store.Store) {
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64, dispatch *notifier.Dispatcher) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -1514,6 +1537,16 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			if policyMatches > 0 {
 				log.Printf("[observer] Policy: matches=%d escalations=%d allows=%d alerts=%d",
 					policyMatches, policyEscalations, policyAllows, policyAlerts)
+			}
+
+			// Notifier — log only when channels are configured. Dropped
+			// counter is the cumulative number of alerts shed because a
+			// channel's queue was full (sustained overload protection).
+			if dispatch != nil && dispatch.ChannelCount() > 0 {
+				if nd := dispatch.DroppedCount(); nd > 0 {
+					log.Printf("[observer] Notifier: channels=%d dropped=%d",
+						dispatch.ChannelCount(), nd)
+				}
 			}
 
 			db.RecordPipelineStats(ctx, &store.PipelineStats{
