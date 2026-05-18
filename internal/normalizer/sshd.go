@@ -45,6 +45,18 @@ var (
 
 	// SHA256 fingerprint: SHA256:xyzabc123...
 	reSshdFingerprint = regexp.MustCompile(`SHA256:\S+`)
+
+	// "Invalid user <name>" — the username is always attacker-fabricated
+	// (the account does not exist on this host). Normalizing it to <USER>
+	// means all "Invalid user" brute-force attempts hash to the same
+	// normalized line regardless of which made-up username the scanner
+	// tried. Without this, every unique username ("uftp", "liugt",
+	// "uploader", ...) produces a cache miss and a separate LLM call.
+	//
+	// We do NOT normalize usernames in "Failed password for <name>" (no
+	// "invalid user" qualifier) because that targets a real local account
+	// and the username has security context worth preserving.
+	reSshdInvalidUser = regexp.MustCompile(`(?i)(invalid user )\S+`)
 )
 
 func (s *SshdNormalizer) Normalize(line string) string {
@@ -70,6 +82,10 @@ func (s *SshdNormalizer) Normalize(line string) string {
 
 	// Strip session IDs
 	line = reSshdSession.ReplaceAllString(line, "session <SID>")
+
+	// Normalize "Invalid user <name>" → "Invalid user <USER>"
+	// See reSshdInvalidUser for the rationale.
+	line = reSshdInvalidUser.ReplaceAllString(line, "${1}<USER>")
 
 	// Strip fingerprints
 	line = reSshdFingerprint.ReplaceAllString(line, "SHA256:<FP>")

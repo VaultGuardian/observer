@@ -471,6 +471,83 @@ func contains(s, substr string) bool {
 		(len(s) > 0 && len(substr) > 0 && stringContains(s, substr)))
 }
 
+func TestSshdNormalizer_InvalidUser(t *testing.T) {
+	n := &SshdNormalizer{}
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "invalid user with random username",
+			in:   "Invalid user uftp from 141.11.45.79 port 57670",
+			want: "Invalid user <USER> from <IP> port <PORT>",
+		},
+		{
+			name: "invalid user with another username — same normalized output",
+			in:   "Invalid user liugt from 64.89.163.173 port 46416",
+			want: "Invalid user <USER> from <IP> port <PORT>",
+		},
+		{
+			name: "invalid user with journald sshd prefix",
+			in:   "sshd[12345]: Invalid user admin from 1.2.3.4 port 22",
+			want: "Invalid user <USER> from <IP> port <PORT>",
+		},
+		{
+			name: "failed password for real account — username preserved",
+			in:   "Failed password for root from 10.0.0.1 port 55123 ssh2",
+			want: "Failed password for root from <IP> port <PORT> ssh2",
+		},
+		{
+			name: "failed password for invalid user — username normalized",
+			in:   "Failed password for invalid user badname from 1.2.3.4 port 1234 ssh2",
+			want: "Failed password for invalid user <USER> from <IP> port <PORT> ssh2",
+		},
+		{
+			name: "accepted password — username preserved",
+			in:   "Accepted password for drew from 192.168.1.50 port 54321 ssh2",
+			want: "Accepted password for drew from <IP> port <PORT> ssh2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := n.Normalize(tt.in)
+			if got != tt.want {
+				t.Errorf("Normalize(%q)\n  got:  %q\n  want: %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSshdNormalizer_InvalidUserCacheCollision confirms the core fix:
+// two different "Invalid user" lines with different usernames and IPs
+// normalize to the same string and therefore produce the same hash.
+// This is what prevents per-username LLM cache misses.
+func TestSshdNormalizer_InvalidUserCacheCollision(t *testing.T) {
+	n := &SshdNormalizer{}
+
+	lines := []string{
+		"Invalid user uftp from 141.11.45.79 port 57670",
+		"Invalid user admin from 192.168.1.1 port 22",
+		"Invalid user liugt from 64.89.163.173 port 46416",
+		"Invalid user uploader from 10.0.0.1 port 12345",
+	}
+
+	normalized := make([]string, len(lines))
+	for i, l := range lines {
+		normalized[i] = n.Normalize(l)
+	}
+
+	for i := 1; i < len(normalized); i++ {
+		if normalized[i] != normalized[0] {
+			t.Errorf("lines[%d] normalized to %q, want %q (same as lines[0])",
+				i, normalized[i], normalized[0])
+		}
+	}
+}
+
 func stringContains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
