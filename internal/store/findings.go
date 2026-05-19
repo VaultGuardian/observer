@@ -563,6 +563,15 @@ func scanFindings(rows interface {
 // correction. Records the previous verdict for audit trail, sets resolution
 // method to "human_override". Used when a human corrects a classification
 // from the dashboard.
+//
+// When the new verdict is a downgrade ('suppress', 'allow', 'recon'), this
+// also clears the notified flag. The dashboard's outcome classifier checks
+// notified before downgraded; leaving notified=1 alongside downgraded=1
+// produces a hybrid render where the badge stays red ("ESCALATED") while
+// the "Why it was downgraded" panel renders green underneath, and the event
+// remains in the Needs Attention list. Clearing notified makes the DB row
+// match the operator's intent so subsequent fetches stay consistent with
+// the dashboard's optimistic update.
 func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVerdict string, reason string) error {
 	now := time.Now().Format(time.RFC3339)
 
@@ -583,11 +592,13 @@ func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVer
 		resolution_method = 'human_override',
 		previous_verdict = ?,
 		downgraded = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN 1 ELSE downgraded END,
-		downgrade_reason = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN ? ELSE downgrade_reason END
+		downgrade_reason = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN ? ELSE downgrade_reason END,
+		notified = CASE WHEN ? IN ('suppress', 'allow', 'recon') THEN 0 ELSE notified END
 	WHERE event_id = ?`,
 		newVerdict, now, currentVerdict,
 		newVerdict,
 		newVerdict, reason,
+		newVerdict,
 		eventID,
 	)
 	if err != nil {
