@@ -298,12 +298,12 @@ func (d *Dispatcher) PrintStatus() {
 		{"push/fcm", d.config.FCM.CredentialsPath != "" && d.config.FCM.DeviceToken != "", "set FCM_CREDENTIALS_PATH + FCM_DEVICE_TOKEN", d.config.FCM.ProjectID},
 	}
 
-	log.Println("[logwatch] Notifications:")
+	log.Println("[observer] Notifications:")
 	for _, ch := range all {
 		if ch.enabled {
-			log.Printf("[logwatch]   ✓ %-10s → %s", ch.name, ch.detail)
+			log.Printf("[observer]   ✓ %-10s → %s", ch.name, ch.detail)
 		} else {
-			log.Printf("[logwatch]   ✗ %-10s → not configured (%s)", ch.name, ch.hint)
+			log.Printf("[observer]   ✗ %-10s → not configured (%s)", ch.name, ch.hint)
 		}
 	}
 }

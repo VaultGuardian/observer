@@ -176,13 +176,13 @@ Observer tries to avoid escalating failed probes and known noise, but it does no
 
 Below is the OpenAI usage chart from one operator running Observer across three production servers for a 30-day window:
 
-![OpenAI usage — 30 days, 3 servers running Observer](docs/screenshots/openai-usage-30d.png)
+![OpenAI usage — 30 days, 3 servers running Observer](docs/images/openai-usage-30d.png)
 
-**Total spend: $30.49** for 30 days across 3 servers, across 33,986 observed events. Only novel events reached the cloud model — most hit the deterministic cache and never cost a thing.
+**Total spend: $34.02** for 30 days across 3 servers — 35,888 LLM requests, ~88M tokens. Those 35,888 requests are the *novel* events that missed the deterministic cache and reached the cloud model; the vast majority of traffic was classified locally and never cost a thing.
 
-That includes two anomalous spike days — Apr 28 ($9.24) and Apr 29 ($11.24) — that look like a runaway-loop bug shipped during development. Backing those out, baseline 30-day spend across 3 servers was approximately **$10**, or roughly **33 cents per day per server**.
+That total includes two anomalous spike days — Apr 28 ($9.24) and Apr 29 ($11.24) — a runaway-loop bug shipped during development. Backing those out, baseline 30-day spend across all 3 servers was about **$13.50**, or roughly **15 cents per server per day**.
 
-Per-event cost works out to around **$0.0009** — under a tenth of a cent per analyzed log event.
+Per-request cost works out to around **$0.0009** — under a tenth of a cent per event that reached the LLM.
 
 The reason it's cheap is **not** that the LLM is cheap. It's that the LLM is rarely consulted. The deterministic-first pipeline (hash cache + pattern store + seeded matches + REC short-circuits) handles 97%+ of events without ever calling the LLM. Cloud-API cost scales with novel events, not with traffic volume.
 

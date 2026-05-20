@@ -199,7 +199,7 @@ func applyDefaults(cfg *Config) {
 }
 
 func generateDefaultConfig(path string) error {
-	content := `# VaultGuardian LogWatch — Notification Config
+	content := `# VaultGuardian Observer — Notification Config
 # Auto-generated on first run. Edit to customize.
 #
 # Secrets (API keys, tokens) are configured via environment variables.

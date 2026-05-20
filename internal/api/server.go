@@ -54,6 +54,9 @@ type ServerConfig struct {
 	// browser never talks to Observer directly). Populated list = echo
 	// matched Origin back, set CORS headers only for allowed origins.
 	AllowedOrigins []string
+
+	// Version reported by /api/health (set from main.Version at construction).
+	Version string
 }
 
 // Server is the dashboard API server.
@@ -334,7 +337,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
 		"status":  "ok",
-		"version": "0.22",
+		"version": s.config.Version,
 	})
 }
 

@@ -214,6 +214,7 @@ func main() {
 			KeyFile:        cfg.DashboardKeyFile,
 			BindAddr:       cfg.DashboardBindAddr,
 			AllowedOrigins: cfg.DashboardAllowedOrigins,
+			Version:        Version,
 		},
 		db, patterns, a, collector,
 	)

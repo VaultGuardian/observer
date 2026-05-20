@@ -48,7 +48,7 @@ func (w *WebhookNotifier) Send(ctx context.Context, alert Alert) error {
 	payload := WebhookPayload{
 		Text:   formatAlertTitle(alert),
 		Alert:  alert,
-		Source: "vaultguardian-logwatch",
+		Source: "vaultguardian-observer",
 	}
 
 	body, err := json.Marshal(payload)
@@ -62,7 +62,7 @@ func (w *WebhookNotifier) Send(ctx context.Context, alert Alert) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "VaultGuardian-LogWatch/1.0")
+	req.Header.Set("User-Agent", "VaultGuardian-Observer/1.0")
 
 	// Apply custom headers (for auth tokens, etc.)
 	for k, v := range w.config.Headers {
