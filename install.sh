@@ -285,16 +285,44 @@ rm -f observer
 # Fall back to gh CLI when curl can't reach the asset — covers private
 # repos, pre-release tags, and rate-limited unauthenticated requests.
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/observer"
+SHA_URL="https://github.com/${REPO}/releases/latest/download/observer.sha256"
+GOT_SHA=false
 if curl -fsSL --retry 3 -o observer "$DOWNLOAD_URL"; then
     ok "Downloaded from public release"
+    # Best-effort: fetch the published checksum alongside the binary.
+    if curl -fsSL --retry 3 -o observer.sha256 "$SHA_URL" 2>/dev/null; then
+        GOT_SHA=true
+    fi
 elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     warn "Public download failed — trying gh CLI"
     if ! gh release download --repo "$REPO" --pattern "observer"; then
         fail "Download failed via both curl and gh. Check network and that the repo has a release named 'observer'."
     fi
+    # Pull the checksum asset too (ignore failure — older releases may lack it).
+    gh release download --repo "$REPO" --pattern "observer.sha256" 2>/dev/null && GOT_SHA=true || true
     ok "Downloaded via gh CLI"
 else
     fail "Could not download Observer binary. Check network connectivity, or install + authenticate gh CLI for private/pre-release access."
+fi
+
+# Verify the binary against the published SHA256 when available. A mismatch
+# means the download was corrupted or tampered with — refuse to install.
+if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
+    EXPECTED=$(awk '{print $1}' observer.sha256)
+    ACTUAL=$(sha256sum observer | awk '{print $1}')
+    if [ "$EXPECTED" = "$ACTUAL" ]; then
+        ok "SHA256 verified: $ACTUAL"
+    else
+        rm -f observer observer.sha256
+        fail "SHA256 MISMATCH — refusing to install.
+       expected: $EXPECTED
+       actual:   $ACTUAL
+       The download may be corrupted or tampered with. Aborting."
+    fi
+    rm -f observer.sha256
+else
+    warn "No published checksum found for this release — skipping verification."
+    warn "(Releases from v0.55.4+ publish observer.sha256 alongside the binary.)"
 fi
 
 mv observer "$BIN"
