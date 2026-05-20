@@ -21,10 +21,10 @@ import (
 // The body hash is already computed per response by the sniffer. The
 // catch-all tracker just needs to key on it instead of byte count.
 //
-// the design review mandate: "Body hash, not body size. Non-negotiable."
+// design rule: "Body hash, not body size. Non-negotiable."
 //
 // =============================================================================
-// Section 3 fix — Landmine A (v1.0 hardening, the design review catch):
+// Section 3 fix — Landmine A (v1.0 hardening, hardening catch):
 // =============================================================================
 // CheckFallbackByBytes is the Phase 3 fallback used when REC misses entirely
 // and we have only a response byte count from the access log. It previously
@@ -239,7 +239,7 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 // Safety: only matches against VERIFIED entries. If any entry for this
 // (host, method, status) was REJECTED, the fallback refuses to suppress.
 //
-// Section 3 fix (Landmine A — the design review catch):
+// Section 3 fix (Landmine A — hardening catch):
 //
 //	Previous behavior allowed ANY (host, method, status) verified entry to
 //	suppress ANY response under 10KB on that tuple, regardless of size.

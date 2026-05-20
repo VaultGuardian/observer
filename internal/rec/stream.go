@@ -30,7 +30,7 @@
 //
 // Lock discipline: pairResponse() returns the paired request metadata.
 // buffer.Insert() and onCapture() are called AFTER the flow lock is released.
-// No lock held during callbacks. (the design review guardrail.)
+// No lock held during callbacks.
 
 package rec
 
@@ -106,7 +106,7 @@ func (discardStream) ReassemblyComplete()                  {}
 //
 // MaxActiveStreams enforcement: CAS loop on reassemblyStreamsActive. If
 // the cap is hit, return a discardStream instead of spawning a goroutine.
-// Under overload, this prevents goroutine explosion. (code review catch.)
+// Under overload, this prevents goroutine explosion.
 func (f *httpStreamFactory) New(netFlow, transFlow gopacket.Flow) tcpassembly.Stream {
 	max := int64(f.sniffer.reassemblyConfig.MaxActiveStreams)
 	if max > 0 {

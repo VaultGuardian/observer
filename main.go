@@ -253,7 +253,7 @@ func main() {
 	// in main.go's lifecycle, not inside the coordinator — the coordinator
 	// itself never invokes Check(); the check runs inside the evidence
 	// callback after redaction so it can short-circuit reclass cache + LLM
-	// using the redacted shape hash. (Committee lock-in, May 11 2026.)
+	// using the redacted shape hash. (Design lock-in, May 11 2026.)
 	expectedEndpointTracker := coordinator.NewExpectedEndpointTracker(coordinator.DefaultExpectedEndpointCap)
 	seedExpectedEndpointsFromDB(db, expectedEndpointTracker)
 
@@ -281,7 +281,7 @@ func main() {
 	// ------- Wire human correction callbacks -------
 	// The API server needs to reach the coordinator's catch-all tracker and
 	// the reclass cache for human corrections. We pass narrow callbacks
-	// instead of the full objects to avoid coupling. (code review suggestion.)
+	// instead of the full objects to avoid coupling.
 	//
 	// Section 3 / Landmine A: seedCatchAll now takes responseBytes from the
 	// finding. Human-confirmed entries with responseBytes=0 will be skipped
@@ -473,7 +473,7 @@ func main() {
 // transport layer is absent. Used to populate finding rows so the dashboard
 // correction workflow has body hash + transport metadata to work with.
 //
-// Section 3 follow-up (code review review item #4): coordinator findings used to
+// Section 3 follow-up: coordinator findings used to
 // drop these fields, leaving the correction endpoint to fall back to the
 // LLMDecision table — which doesn't exist for every finding, especially
 // catch-all auto-downgrades that never invoke the LLM.
@@ -712,7 +712,7 @@ func makeEvidenceCheckCallback(
 			StatusCode:      statusCode,
 			Timestamp:       snapshot.Timestamp,
 			Window:          10 * time.Second, // Matches coordinator finalize window (v0.43.2+)
-			// Section 3 follow-up (code review review item #1): prefer the
+			// Section 3 follow-up: prefer the
 			// merged ResponseBytes off the pending alert. mergePendingMetadata
 			// upgrades this from sibling events with stronger byte data;
 			// extractResponseBytes(snapshot.Line) is a fallback for the
@@ -799,7 +799,7 @@ func makeEvidenceCheckCallback(
 		// Runs AFTER redaction (need the shape hash) but BEFORE reclass
 		// cache so a stale "token-looking = malicious" verdict can't
 		// pre-empt the operator's approval. Without this ordering, Card 4
-		// silently fails for the exact case it was built for. (code review P0
+		// silently fails for the exact case it was built for. (P0
 		// catch + design lock-in, May 11 2026.)
 		//
 		// bodyHash here is the REDACTED response-shape hash — same value
@@ -808,7 +808,7 @@ func makeEvidenceCheckCallback(
 		// hashing. The correction handler stores decision.CacheKey (which
 		// equals this bodyHash) so live traffic and stored rules match.
 		//
-		// Status source consistency (code review P1, May 11 2026): use the
+		// Status source consistency: use the
 		// status captured AT THE EVIDENCE LAYER (same layer that produced
 		// the shape hash) so the key is internally consistent. snapshot.StatusCode
 		// is the fallback if evidence didn't carry a code (defensive — by
@@ -946,7 +946,7 @@ func makeVerifyCallback(
 	ctx context.Context,
 ) coordinator.VerifyFunc {
 
-	// Section 3 follow-up (code review review item #3): DisableCompression: true
+	// Section 3 follow-up: DisableCompression: true
 	// on both transports, and Accept-Encoding: identity on every request.
 	// REC hashes wire-byte response previews; Go's default http.Client requests
 	// gzip and silently decompresses, so the verifier would hash decompressed
@@ -985,7 +985,7 @@ func makeVerifyCallback(
 
 		userAgent, _ := selfSuppress.GenerateToken()
 
-		// Section 3 follow-up (code review review item #5): use the fingerprint's
+		// Section 3 follow-up: use the fingerprint's
 		// method instead of hardcoded GET. catchall.Check accepts both GET and
 		// HEAD; verifying a HEAD-method fingerprint with a GET request would
 		// produce a different body hash (HEAD has no body, GET does) and the

@@ -34,7 +34,7 @@ const (
 )
 
 // =============================================================================
-// Auto-Learning Safety Caps (v0.47, the design review ZD#2)
+// Auto-Learning Safety Caps (v0.47, hardening item #2)
 // =============================================================================
 //
 // Without these caps the hash bucket grows without bound. An attacker spraying
@@ -62,7 +62,7 @@ const (
 // so common across log streams that suppressing/allowing them effectively
 // blinds the analyzer for that scope. Human/seeded sources may use anything.
 //
-// Matching semantics (v0.47, code review review): the candidate prefix is
+// Matching semantics (v0.47, code review): the candidate prefix is
 // "stripped" — whitespace and normalizer placeholders (anything inside <...>
 // like <TS>, <NUM>, <PID>, <UUID>) are removed — and the result is compared
 // case-insensitively for EQUALITY against each blocklist entry.
@@ -220,7 +220,7 @@ type Stats struct {
 	Misses        atomic.Int64
 	PatternCount  atomic.Int64
 
-	// v0.47 — auto-learning safety caps (the design review ZD#2)
+	// v0.47 — auto-learning safety caps
 	AutoLearnRejected atomic.Int64 // bumped when cap hit or validation rejects auto pattern
 	AutoLearnCapped   atomic.Int64 // bumped specifically on bucket-size cap (subset of Rejected)
 }
@@ -400,7 +400,7 @@ func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *Match
 //   - contains patterns require minimum length (anti-overgeneralization)
 //   - LLM-source patterns face stricter validation than human/seeded patterns
 //
-// v0.47 (the design review ZD#2): per-bucket caps prevent unbounded auto-hash growth.
+// v0.47: per-bucket caps prevent unbounded auto-hash growth.
 // Human and seeded patterns bypass caps; only "auto"/"llm" sources are capped.
 func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) error {
 	// Validate (uses pattern.Source to apply LLM-stricter rules)
@@ -486,7 +486,7 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 
 // validatePattern enforces structural and safety rules on patterns.
 //
-// Rules differ by source (v0.47, code review F3):
+// Rules differ by source (v0.47, F3):
 //
 //   - human / human_validated / seeded sources are permissive — operator
 //     intent always wins. Minimum lengths still apply (defends against
@@ -871,7 +871,7 @@ func (s *Store) MarkHumanValidated(scopeKey string, hashValue string) bool {
 
 // MarkPatternValidated finds a pattern by its value in a specific bucket
 // and marks it as human-validated. Works for any pattern type (hash, prefix,
-// regex, contains), not just hashes. (code review fix #7.)
+// regex, contains), not just hashes.
 func (s *Store) MarkPatternValidated(scopeKey string, verdict Verdict, patternValue string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -954,7 +954,7 @@ func (s *Store) Persist() error {
 	path := s.dataDir + "/patternstore.json"
 
 	// Atomic write to avoid corruption from crashes mid-write. the design review raised
-	// this and code review confirmed: a previous os.WriteFile could leave a
+	// this and confirmed in review: a previous os.WriteFile could leave a
 	// partially-written JSON file that fails to parse on next boot, taking
 	// the entire pattern store down with it.
 	//

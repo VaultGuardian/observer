@@ -30,7 +30,7 @@ import (
 // The buffer is a circular array. When full, oldest entries are overwritten.
 // Age-based eviction happens lazily on insert.
 // Evicted/overwritten slots are zeroed so old BodyPreview slices don't pin
-// memory for GC (code review's catch).
+// memory for GC.
 
 const (
 	DefaultMaxEntries    = 10000
@@ -52,7 +52,7 @@ type BufferConfig struct {
 	MaxBodyBytes  int
 }
 
-// DefaultBufferConfig returns the design team-agreed defaults.
+// DefaultBufferConfig returns the standard defaults.
 func DefaultBufferConfig() BufferConfig {
 	return BufferConfig{
 		MaxEntries:    DefaultMaxEntries,
@@ -76,13 +76,13 @@ type CapturedResponse struct {
 	// Full request path INCLUDING query string.
 	// SACRED: never stripped, never normalized. This must match what
 	// gopacket sees on the wire, not what the normalizer produces.
-	// ('s raw-path reminder.)
+	//
 	Path string
 
 	// Host header value. Used as a HARD FILTER in correlation.
 	// On CapRover with multiple virtual hosts behind the same nginx,
 	// same path on different hosts is NOT the same transaction.
-	// (code review's catch — captured but previously unused.)
+	//
 	Host string
 
 	// User-Agent header. Used as a TIE-BREAKER when multiple candidates
@@ -93,7 +93,7 @@ type CapturedResponse struct {
 
 	// HTTP status code. Used as a HARD FILTER in correlation.
 	// A 404 and a 200 for the same path are definitively different
-	// transactions. ( + code review agreed: not a soft downgrade.)
+	// transactions. (agreed: not a soft downgrade.)
 	StatusCode      int
 	ContentType     string
 	ContentLength   int64
@@ -192,7 +192,7 @@ func (rb *RingBuffer) Insert(resp CapturedResponse) {
 	}
 
 	// If buffer is at max count, the circular write overwrites the oldest.
-	// Zero the slot first so old BodyPreview slices get GC'd (code review's fix).
+	// Zero the slot first so old BodyPreview slices get GC'd.
 	if rb.count == rb.config.MaxEntries {
 		rb.total -= rb.entries[rb.head].entryBytes
 		rb.entries[rb.head] = emptyResponse // zero for GC
@@ -215,7 +215,7 @@ type LookupRequest struct {
 	Host            string // Host header — hard filter if present on both sides
 	UserAgent       string // tie-breaker for multiple matches
 	SourceContainer string // container/service that logged the request
-	StatusCode      int    // status code from log line — HARD FILTER (+code review)
+	StatusCode      int    // status code from log line — HARD FILTER (hard filter)
 	Timestamp       time.Time
 	Window          time.Duration // correlation window (default 500ms)
 	ExpectedBytes   int64         // response bytes from access log — ranking signal for orphan disambiguation
@@ -298,14 +298,14 @@ func (rb *RingBuffer) Lookup(req LookupRequest) []CapturedResponse {
 
 		// Status code is a HARD filter, not a soft downgrade.
 		// If the log says 404 and the wire says 200, these are definitively
-		// different transactions. ( + code review independently agreed.)
+		// different transactions. ()
 		if req.StatusCode > 0 && entry.StatusCode != req.StatusCode {
 			continue
 		}
 
 		// Host is a hard filter — same path on different virtual hosts
 		// is NOT the same transaction. Critical on CapRover where multiple
-		// services share one nginx. (code review's catch.)
+		// services share one nginx.
 		if req.Host != "" && entry.Host != "" && entry.Host != req.Host {
 			continue
 		}
@@ -344,7 +344,7 @@ func (rb *RingBuffer) evictExpired() {
 		oldestIdx := (rb.head - rb.count + rb.config.MaxEntries) % rb.config.MaxEntries
 		if rb.entries[oldestIdx].Timestamp.Before(cutoff) {
 			rb.total -= rb.entries[oldestIdx].entryBytes
-			rb.entries[oldestIdx] = emptyResponse // zero for GC (code review's fix)
+			rb.entries[oldestIdx] = emptyResponse // zero for GC
 			rb.count--
 			rb.evictionsAge++
 			rb.evictionsTotal++
@@ -361,7 +361,7 @@ func (rb *RingBuffer) evictOldest() {
 	}
 	oldestIdx := (rb.head - rb.count + rb.config.MaxEntries) % rb.config.MaxEntries
 	rb.total -= rb.entries[oldestIdx].entryBytes
-	rb.entries[oldestIdx] = emptyResponse // zero for GC (code review's fix)
+	rb.entries[oldestIdx] = emptyResponse // zero for GC
 	rb.count--
 }
 

@@ -734,7 +734,7 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 	// Delete-only correction is disabled — use /api/corrections instead.
 	// The old path deleted patterns without creating replacements, leaving
 	// the line to go back to the LLM naked. That's a half-feature that can
-	// reintroduce the same bad classification. (code review final review.)
+	// reintroduce the same bad classification.
 	if req.Review.PatternDeleted && req.Review.Status == "corrected" {
 		jsonError(w, "delete-only correction is disabled; use /api/corrections", http.StatusGone)
 		return
@@ -877,7 +877,7 @@ func (s *Server) handleDeleteTrustedIP(w http.ResponseWriter, r *http.Request) {
 //     actually worked), T2 sees a different body and escalates.
 //
 //   SECURITY INVARIANT: "failed_probe" NEVER creates a request-line pattern.
-//   code review caught this: suppressing "UNION SELECT" because it returned a
+//   Caught in review: suppressing "UNION SELECT" because it returned a
 //   harmless page today would globally whitelist SQL injection forever.
 //   (design consensus, April 28 2026.)
 
@@ -907,7 +907,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Look up the finding server-side — never trust frontend-supplied data
-	// for a security control plane. (code review catch.)
+	// for a security control plane.
 	finding, err := s.store.GetFindingByEventID(ctx, req.EventID)
 	if err != nil {
 		jsonError(w, "finding not found: "+err.Error(), http.StatusNotFound)
@@ -979,7 +979,7 @@ func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Contex
 	// patterns) and finding (cache-hit patterns). If a malicious/alert hash
 	// was learned by the LLM, it lives on the decision, not the finding.
 	// If we only check the finding, the old bad pattern survives and wins
-	// on priority (malicious > suppress). (code review catch #2.)
+	// on priority (malicious > suppress).
 	if decision != nil && decision.PatternLearned && decision.PatternValue != "" {
 		bucket := decision.PatternBucket
 		if bucket == "" {
@@ -1081,7 +1081,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 	}
 
 	// HARD GUARD: Cannot mark as failed probe without response evidence.
-	// (the design review + code review guardrail.)
+	//
 	if host == "" || method == "" || status == 0 || bodyHash == "" {
 		jsonError(w, "Cannot mark as failed probe: no response evidence available for this event", http.StatusBadRequest)
 		return
@@ -1121,7 +1121,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 
 	// Step 3: Invalidate reclass cache.
 	// The reclass cache is keyed on the REDACTED body hash (decision.CacheKey),
-	// NOT the raw BodyPreviewHash. Invalidate BOTH to be safe. (code review catch #3.)
+	// NOT the raw BodyPreviewHash. Invalidate BOTH to be safe.
 	if s.onInvalidateReclassCache != nil {
 		s.onInvalidateReclassCache(bodyHash) // raw body hash
 		if decision != nil && decision.CacheKey != "" {
@@ -1159,7 +1159,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 // on the REDACTED response-shape hash (decision.CacheKey), NOT the raw
 // transport body hash. This is critical: auth endpoints return rotating
 // tokens, so raw hashes change every login while redacted shape hashes stay
-// stable. (code review P0 catch + Drew lock-in, May 11 2026.)
+// stable.
 //
 // SECURITY INVARIANT: This NEVER creates a request-line pattern. The match
 // is strictly (host, method, path, status, shape_hash). The endpoint stays
@@ -1181,7 +1181,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx context.Context,
 	finding *store.Finding, decision *store.LLMDecision, reason string) {
 
-	// SKIPPY'S FIX (design team review, May 15 2026): The frontend sends the
+	// FIX (code review, May 15 2026): The frontend sends the
 	// Tier-1 decision ID because that's all it knows. But Card 4 needs the
 	// Tier-2 reclassify decision (which has the redacted response-shape hash
 	// in CacheKey). Look it up by EventID before hitting the guard.
@@ -1198,7 +1198,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 
 	// Build the shape hash from the best available source.
 	//
-	// Priority order (the design review correction, May 15 2026):
+	// Priority order:
 	//   1. decision.CacheKey from a reclassify decision — this is the REDACTED
 	//      response-shape hash (tokens → [REDACTED] before hashing). Stable
 	//      across rotating JWT tokens. This is what makes Card 4 work.
@@ -1335,7 +1335,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 	// REDACTED shape hash (rec.HashBody(SafeBodyPreview), which is exactly
 	// what we have in decision.CacheKey). Without this invalidation, a stale
 	// "malicious" verdict could re-fire on the next matching request before
-	// the new ExpectedEndpoint rule gets a turn. (code review review answer:
+	// the new ExpectedEndpoint rule gets a turn. (code review answer:
 	// the only cache key that matters is the redacted shape hash.)
 	if s.onInvalidateReclassCache != nil {
 		s.onInvalidateReclassCache(shapeHash)
@@ -1457,7 +1457,7 @@ func jsonError(w http.ResponseWriter, message string, code int) {
 // isHexHash64 returns true iff s is exactly 64 characters of lowercase or
 // uppercase hex — the shape of a SHA-256 hex digest. Used as a sanity check
 // in handleExpectedEndpointCorrection to catch non-hash values that slipped
-// past the Tier filter. (code review defensive guard, May 11 2026.)
+// past the Tier filter.
 //
 // Intentionally tolerant of both cases because rec.HashBody currently emits
 // lowercase via "%x", but if that ever changes to "%X" we don't want this

@@ -275,7 +275,7 @@ func TestHasSensitivePath(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Structural HTTP Parser (the design review ZD#1)
+// v0.47 — Structural HTTP Parser
 // =============================================================================
 
 func TestParseHTTPIdentity_StandardFormats(t *testing.T) {
@@ -427,7 +427,7 @@ func TestParseHTTPIdentity_SpoofingDefense(t *testing.T) {
 }
 
 // TestIsFailedProbe_RegexSpoofingDefense — end-to-end regression that
-// the design review's spoofing attack class cannot trick the deterministic suppression
+// the spoofing attack class cannot trick the deterministic suppression
 // gate into suppressing a successful exploit (HTTP 200 with attack payload).
 //
 // Critical safety property: a real 200 response with attack content in the
@@ -473,7 +473,7 @@ func TestIsFailedProbe_RegexSpoofingDefense(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — URL-Decoded Attack Indicators (code review F6)
+// v0.47 — URL-Decoded Attack Indicators
 // =============================================================================
 
 func TestHasAttackIndicators_URLEncoded(t *testing.T) {
@@ -545,7 +545,7 @@ func TestHasAttackIndicators_URLEncoded(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — High-Risk Disclosure Detection (code review F5)
+// v0.47 — High-Risk Disclosure Detection
 // =============================================================================
 
 // TestContainsHighRiskDisclosure validates the helper directly.
@@ -676,7 +676,7 @@ func TestIsOperationalNoise_HighRiskDisclosureOverride(t *testing.T) {
 //
 // This guards the same semantic rule as the noise-filter override —
 // "high-risk disclosure bypasses all deterministic suppression" — at the
-// SECOND deterministic gate. code review's catch: without this guard, a line
+// SECOND deterministic gate. Note: without this guard, a line
 // like:
 //
 //	`ERROR dumped root:x:0:0:root "GET /random HTTP/1.1" 404`
@@ -744,7 +744,7 @@ func TestIsFailedProbe_HighRiskDisclosureOverride(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Forgiving URL Decode (the design review adversarial review of F6)
+// v0.47 — Forgiving URL Decode
 // =============================================================================
 
 // TestForgivingURLDecode validates that the byte-level decoder tolerates
@@ -787,7 +787,7 @@ func TestForgivingURLDecode(t *testing.T) {
 	}
 }
 
-// TestHasAttackIndicators_MalformedDecodeBypass — the design review's bonus zero-day.
+// TestHasAttackIndicators_MalformedDecodeBypass — the bonus zero-day.
 // An encoded payload paired with a malformed percent-triplet elsewhere in
 // the string would cause stdlib url.QueryUnescape to error out and leave
 // the encoded payload undetected. The forgiving decoder must catch it.
@@ -835,7 +835,7 @@ func TestHasAttackIndicators_MalformedDecodeBypass(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Disclosure Learning Guard (code review third-iteration review)
+// v0.47 — Disclosure Learning Guard
 // =============================================================================
 
 // TestLearnFromVerdict_DisclosureRefusal validates that learnFromVerdict

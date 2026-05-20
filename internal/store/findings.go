@@ -292,12 +292,12 @@ func (s *Store) RecordPipelineStats(ctx context.Context, stats *PipelineStats) e
 // channel is full under DDoS, only recon/noise logging is dropped — real
 // threat findings block until space is available.
 //
-// the team mandate: "Never let async writer dropping apply to anything
+// Design rule: "Never let async writer dropping apply to anything
 // except recon/noise logging."
 
 // FindingsWriter batches finding INSERTs in a background goroutine.
 //
-// v0.52 P0 fix (code review adversarial review): prior to this fix, Stop() called
+// v0.52 P0 fix: prior to this fix, Stop() called
 // close(w.ch) while producers could still be in Submit(). Any goroutine in the
 // blocking send path (critical findings, channel full) would panic with
 // "send on closed channel". Fixed by using a dedicated stopCh signal — the data

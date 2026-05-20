@@ -16,7 +16,7 @@ import (
 // attacker varies query params to change response size and trick the
 // catch-all into auto-downgrading real data exfiltration.
 //
-// Section 3 / Landmine A (v1.0 hardening, the design review catch): ResponseBytes added
+// Section 3 / Landmine A (v1.0 hardening, hardening catch): ResponseBytes added
 // back as a non-key descriptive field so the Phase 3 fallback can compare
 // access-log byte counts against the actual verified body size. The
 // fingerprint is still keyed on body_preview_hash; response_bytes is purely

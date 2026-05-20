@@ -130,7 +130,7 @@ type CollectorConfig struct {
 	Flow FlowConfig
 }
 
-// DefaultCollectorConfig returns the design team-agreed defaults.
+// DefaultCollectorConfig returns the standard defaults.
 func DefaultCollectorConfig() CollectorConfig {
 	return CollectorConfig{
 		Enabled:        false, // opt-in, not surprise packet capture
@@ -228,7 +228,7 @@ type vipPin struct {
 //
 // Phase 1: gopacket on plaintext HTTP behind reverse proxy.
 //
-// KNOWN BLIND SPOT (code review's catch):
+// KNOWN BLIND SPOT:
 //   Phase 1 captures traffic between the reverse proxy and backend containers.
 //   It CANNOT see responses generated directly by nginx/caddy/traefik:
 //     - 403 Forbidden (block pages)
@@ -245,7 +245,7 @@ type liveCollector struct {
 	config  CollectorConfig
 	buffer  *RingBuffer
 	sniffer *sniffer    // stored for stats access
-	running atomic.Bool // atomic — Start() and Lookup() can race (code review's fix)
+	running atomic.Bool // atomic — Start() and Lookup() can race
 
 	// Fix 1: VIP lane for malicious evidence
 	vipMu       sync.Mutex

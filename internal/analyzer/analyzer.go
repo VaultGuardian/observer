@@ -90,7 +90,7 @@ type Stats struct {
 	Retried           atomic.Int64 `json:"retried"`             // events classified via retry queue
 	RetriedPatternHit atomic.Int64 `json:"retried_pattern_hit"` // retries resolved by pattern store (no LLM needed)
 
-	// v0.47 (the design review + code review review of F5): disclosure-protection events.
+	// v0.47 (review of F5): disclosure-protection events.
 	// Increments when:
 	//   - cached suppress/allow verdict rejected because line contains disclosure (Analyze, AnalyzeRetry)
 	//   - LLM-proposed suppress/allow learning refused because line contains disclosure (learnFromVerdict)
@@ -142,7 +142,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// --- Step 1: Normalize ---
 	a.normalizers.NormalizeEvent(evt)
 
-	// --- Step 1.4: High-risk disclosure guard (v0.47, code review review of F5) ---
+	// --- Step 1.4: High-risk disclosure guard (v0.47, review of F5) ---
 	//
 	// If the line contains a confirmed-exfiltration string (etc/passwd
 	// content, private key headers, AWS secret env var, uid=0 output), it
@@ -169,7 +169,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// NEVER hit the LLM or pattern store. Zero cost, zero ambiguity.
 	//
 	// DESIGN DECISION (v0.15, 2026-03-24): Deterministic suppression
-	// for stack traces agreed by the team, code review, , .
+	// for stack traces.
 	// The LLM already proved it can cache the WRONG answer for these
 	// (Remix stack trace classified as "alert" → 25 emails overnight).
 	if !hasDisclosure && isOperationalNoise(evt.Line) {
@@ -207,7 +207,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 
 	// --- Step 2: Pattern store check ---
 	//
-	// v0.47 (the design review adversarial review of F5): if hasDisclosure is true, a
+	// v0.47: if hasDisclosure is true, a
 	// historically-cached SUPPRESS or ALLOW verdict is itself a form of
 	// deterministic suppression and must not be honored. Pre-v0.47 caches
 	// could contain low-confidence suppress hashes (no confidence gate
@@ -281,7 +281,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 // Re-checks the pattern store first (may have learned the pattern since deferral),
 // then does a BLOCKING LLM acquire if still unknown.
 //
-// v0.47 (the design review adversarial review of F5): same disclosure-override semantics
+// v0.47: same disclosure-override semantics
 // as Analyze() — a cached SUPPRESS or ALLOW verdict on a disclosure-bearing
 // line must not be honored. Falls through to blocking LLM classification.
 func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisResult {
@@ -395,7 +395,7 @@ func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) Analys
 // learnFromVerdict processes the LLM's response and adds learned patterns
 // to the pattern store. Returns true if a pattern was learned.
 //
-// v0.47 (code review F2 + F4):
+// v0.47:
 //   - Confidence gate at 0.70 for hash learning of allow/suppress (was: no gate).
 //   - Confidence gate at 0.85 for generalized prefix/regex/contains (unchanged).
 //   - Regex-fallback-to-prefix learning REMOVED. Validation saying "no" now
@@ -421,7 +421,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 		return false
 	}
 
-	// === Disclosure learning guard (v0.47, code review third-iteration review) ===
+	// === Disclosure learning guard (v0.47, third-iteration review) ===
 	//
 	// Completes the disclosure-bypass rule:
 	//   1. Disclosure cannot be suppressed by deterministic gates  (Analyze)
@@ -446,7 +446,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 		return false
 	}
 
-	// v0.52 (code review adversarial review): Attack-indicator guard.
+	// v0.52: Attack-indicator guard.
 	// Mirrors the disclosure guard above. If a log line contains SQL injection,
 	// path traversal, or other attack payloads, we must NOT learn suppress/allow
 	// for it. A bad LLM call (wrong classification at 0.70+ confidence) would
@@ -605,7 +605,7 @@ func (a *Analyzer) Persist() error {
 //   Deterministic suppression prevents the LLM from ever making this
 //   mistake in the first place.
 //
-// SAFETY RULE (code review's catch):
+// SAFETY RULE:
 //   These checks run on the RAW line, not the normalized line. They look
 //   for structural patterns (indentation + "at", "Traceback", etc.) that
 //   are unambiguous. If a stack trace also contains an exploit payload,
@@ -613,7 +613,7 @@ func (a *Analyzer) Persist() error {
 //   log line (the request line) comes through separately.
 
 // =============================================================================
-// High-Risk Disclosure Detection (v0.47, code review F5)
+// High-Risk Disclosure Detection (v0.47, F5)
 // =============================================================================
 //
 // The operational-noise filter suppresses stack traces and framework noise
@@ -668,7 +668,7 @@ func containsHighRiskDisclosure(line string) bool {
 }
 
 func isOperationalNoise(line string) bool {
-	// v0.47 (code review F5): if the line contains a high-risk disclosure
+	// v0.47: if the line contains a high-risk disclosure
 	// string, never suppress as noise — let it proceed to malicious-seed
 	// matching and LLM classification. Catches the case where an exception
 	// stack trace happens to wrap dumped credentials in its message.
@@ -764,7 +764,7 @@ func isOperationalNoise(line string) bool {
 //   produced 70 alert patterns and 20+ emails from a single phpunit scan.
 
 // =============================================================================
-// !!! SYNC WITH httpparse.go OR FACE SKIPPY'S WRATH !!!
+// !!! SYNC WITH httpparse.go — keep these in lockstep !!!
 // =============================================================================
 //
 // The structural HTTP regexes below are intentionally duplicated from the
@@ -786,7 +786,7 @@ func isOperationalNoise(line string) bool {
 // radius, no immediate security gain).
 //
 // =============================================================================
-// Structural HTTP identity parser (v0.47, the design review ZD#1, code review scoping)
+// Structural HTTP identity parser (v0.47, hardening item #1, scoping review)
 // =============================================================================
 //
 // The previous implementation used loose regexes that scanned for the FIRST
@@ -867,7 +867,7 @@ var (
 // failedStatusCodes are HTTP status codes that indicate a probe found nothing.
 // NOTE: 401 (Unauthorized) is deliberately excluded. A 401 means "this endpoint
 // exists and requires auth" — that's surface discovery, not pure nothing.
-// code review's catch: /admin returning 401 is a meaningful finding.
+// Note: /admin returning 401 is a meaningful finding.
 var failedStatusCodes = map[string]bool{
 	"400": true, // Bad request
 	"403": true, // Forbidden
@@ -918,7 +918,7 @@ var attackIndicators = []string{
 // debug endpoints worth tagging." Used by hasSensitivePath for future
 // Probes view classification. Not used in routing.
 //
-// Original source: the team + code review deep research consensus (2026-03-24).
+// Original source: deep research (2026-03-24).
 // That decision was overridden in v0.47 — sensitive-path probes no longer
 // escape suppression — but the path list itself remains useful as a
 // classifier label for the Probes view.
@@ -993,7 +993,7 @@ func attackIndicatorCandidates(input string) []string {
 // whole string on the first invalid `%XY`, this function decodes valid
 // triplets and passes invalid ones through unchanged.
 //
-// the design review's attack class (2026-05): an attacker appends `%zz` (or any invalid
+// the attack class (2026-05): an attacker appends `%zz` (or any invalid
 // percent-triplet) to an otherwise-encoded payload, e.g.
 //
 //	q=%3Cscript%3E&garbage=%zz
@@ -1088,7 +1088,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false
 	}
 
-	// v0.47 (code review review of F5): defense-in-depth — high-risk disclosure
+	// v0.47: defense-in-depth — high-risk disclosure
 	// must never be suppressed by ANY deterministic gate. The Analyze()
 	// orchestration layer also enforces this, but a function-level guard
 	// keeps the safety property correct in isolation. Cheap (single-pass
@@ -1125,7 +1125,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 
 	// --- Path 2: HTTP access log with failed status code ---
 	//
-	// v0.47 (the design review ZD#1): Use structural parseHTTPIdentity instead of
+	// v0.47: Use structural parseHTTPIdentity instead of
 	// loose status regexes. Status anchored to format prevents the
 	// regex-spoofing attack class.
 	//

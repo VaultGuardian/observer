@@ -711,7 +711,7 @@ func ClassifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 // confidence are based on partial content. This is acceptable for Phase 1
 // but should be documented in any API that exposes these fields.
 //
-// FAIL-CLOSED RULE ('s law):
+// FAIL-CLOSED RULE:
 //   If format is unknown, no body preview at all. Only transport metadata.
 //   Content-Length: 45032 on a 404 path IS the evidence.
 

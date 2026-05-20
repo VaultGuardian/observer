@@ -17,7 +17,7 @@ import (
 // and pipeline telemetry. Journald stays for operational logs (startup,
 // debug, sniffer traces). SQLite is for structured security data.
 //
-// Architecture decision (2026-03-24 design team):
+// Architecture decision (2026-03-24):
 //   - Journald for ops, SQLite for findings
 //   - WAL mode for concurrent reads + single writer
 //   - Pure Go driver (modernc.org/sqlite) — no CGO, single binary preserved
@@ -390,7 +390,7 @@ func (s *Store) migrate() error {
 				  ALTER TABLE findings ADD COLUMN matched_pattern_value TEXT DEFAULT '';`,
 		},
 		{
-			// Section 3 / Landmine A (v1.0 hardening): the design review catch.
+			// Section 3 / Landmine A (v1.0 hardening): hardening catch.
 			// CheckFallbackByBytes was suppressing ANY response under 10KB on
 			// a (host, method, status) tuple if any verified entry existed,
 			// regardless of the verified entry's actual response size. We now
@@ -413,7 +413,7 @@ func (s *Store) migrate() error {
 			// same body hash before verification fires — a single login
 			// endpoint would never reach the threshold.
 			//
-			// Architectural distinction (the design review mandate, May 11 2026):
+			// Architectural distinction:
 			//   catchall_verified_v2  — emergent, statistical, path-agnostic
 			//   expected_endpoints    — explicit, deterministic, path-scoped
 			//
@@ -422,10 +422,10 @@ func (s *Store) migrate() error {
 			// body_preview_hash is the REDACTED response-shape hash
 			// (rec.HashBody(SafeBodyPreview), surfaced as decision.CacheKey).
 			// NEVER the raw transport hash — that would break the feature for
-			// auth/token endpoints with rotating values. (code review P0 catch +
+			// auth/token endpoints with rotating values. (P0 catch +
 			// design lock-in, May 11 2026.)
 			//
-			// http_status is part of the key (code review P1, locked May 11 2026):
+			// http_status is part of the key:
 			// cheap guard against 200/401/500 responses with similar body
 			// shapes collapsing into the same row.
 			version: 12,
@@ -504,7 +504,7 @@ func applyMigration(db *sql.DB, version int, desc, migrationSQL string) error {
 // Prune removes old findings based on verdict-specific retention policies.
 // Call periodically from a background goroutine.
 //
-// Retention (design team agreed, 2026-03-24):
+// Retention (agreed, 2026-03-24):
 //   - allow/suppress: 7 days (high volume, low value)
 //   - recon/downgrade: 90 days (useful for trend analysis)
 //   - malicious/alert/malicious: never auto-pruned (security record)

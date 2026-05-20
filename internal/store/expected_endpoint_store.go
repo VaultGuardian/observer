@@ -32,7 +32,7 @@ import (
 // stable across rotations because the redactor replaces secret values with
 // markers like [REDACTED:token] before hashing.
 //
-// http_status is part of the key (code review P1, locked in May 11 2026): cheap
+// http_status is part of the key: cheap
 // guard against e.g. a 200 expected-token response and a 401 error with
 // similar body shape collapsing into the same row.
 //
@@ -40,7 +40,7 @@ import (
 // broadens the legitimate-response surface for that endpoint. Admin vs user,
 // paginated, role-flagged responses each get their own row.
 //
-// Architectural distinction (the design review mandate, May 11 2026):
+// Architectural distinction:
 //
 //   catchall_verified_v2  — emergent, statistical, path-agnostic
 //                           Threshold of 5+ distinct paths sharing the same

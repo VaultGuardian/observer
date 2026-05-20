@@ -25,7 +25,7 @@ import (
 // Why this is structured the way it is
 // =============================================================================
 //
-// Three correctness invariants set by the May 11 2026 design team review:
+// Three correctness invariants set by the May 11 2026 code review:
 //
 //   1. The match key is the REDACTED response-shape hash, not the raw
 //      transport hash. Auth/token endpoints return rotating values; only
@@ -41,8 +41,8 @@ import (
 //   3. Multiple body_hashes per (host, method, path, status) accumulate
 //      additively. Auth endpoints legitimately return different shapes
 //      (admin vs user, role-flagged, paginated). Each operator click
-//      broadens the legitimate-response surface for that endpoint. the design review's
-//      literal reading of the key tuple, design team converged.
+//      broadens the legitimate-response surface for that endpoint. the
+//      literal reading of the key tuple.
 //
 // Architectural distinction from CatchAll:
 //
@@ -84,7 +84,7 @@ const (
 
 // ExpectedEndpointFingerprint is the full key — every field is part of the
 // match. Status is included to prevent collisions between e.g. a 200 expected
-// token response and a 401 error with similar body shape. (code review P1, locked
+// token response and a 401 error with similar body shape. (P1, locked
 // in May 11 2026.)
 //
 // BodyPreviewHash here is specifically the REDACTED response-shape hash
@@ -154,7 +154,7 @@ func NewExpectedEndpointTracker(cap int) *ExpectedEndpointTracker {
 // path call this. Without a shared helper the two would drift over time:
 // the tracker would normalize, the DB row would not, and pattern-review UI
 // would later see DB rows that look like duplicates but match a single live
-// rule. (code review P2, May 11 2026.)
+// rule.
 func NormalizeMethodPath(method, path string) (canonicalMethod, canonicalPath string) {
 	if idx := strings.IndexByte(path, '?'); idx >= 0 {
 		path = path[:idx]
@@ -187,7 +187,7 @@ func newExpectedEndpointFingerprint(host, method string, status int, path, bodyP
 // caller (evidence callback) computes the redacted hash; the correction
 // handler reads it from decision.CacheKey.
 //
-// Race discipline (code review P0 fix, May 11 2026):
+// Race discipline:
 //   - entry pointer + Reason are read under RLock
 //   - Reason is COPIED before the lock is released; never read outside
 //   - Suppressed counters are atomic; no lock needed for increment
@@ -233,7 +233,7 @@ func (t *ExpectedEndpointTracker) Check(host, method string, status int, path, b
 //
 // v1.x note (deferred): if cap is reached during a live operator click, the
 // API handler will return success because this function has no return value.
-// code review flagged this as a future "UX lie" — when cap is reached the seed
+// flagged in review as a future "UX lie" — when cap is reached the seed
 // silently fails. Acceptable at v1.0 because cap=500 is plenty of headroom
 // for normal deployments; v1.1 should make SeedVerified return inserted/dropped
 // counts so the API can surface a warning to the operator.

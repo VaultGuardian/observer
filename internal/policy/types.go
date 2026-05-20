@@ -26,7 +26,7 @@ type Result struct {
 	Reason string
 
 	// Extracted fields — populated by the matching rule even if not all
-	// are used for the current action. Future-proofing per code review's advice:
+	// are used for the current action. Future-proofing per the advice:
 	// "extract username, auth method, source IP now, even if you only use IP today."
 	SourceIP   string
 	Username   string

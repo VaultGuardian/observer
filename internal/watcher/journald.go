@@ -42,7 +42,7 @@ type journalEntry struct {
 //
 // SECURITY: Self-suppression (observer) uses _SYSTEMD_UNIT exclusively.
 // An attacker can spoof SYSLOG_IDENTIFIER but cannot spoof _SYSTEMD_UNIT,
-// which the kernel attaches. (the design review security mandate, 2026-04-09)
+// which the kernel attaches.
 var defaultNoiseUnits = map[string]bool{
 	"systemd-resolved":    true, // DNS resolver — constant chatter
 	"systemd-timesyncd":   true, // NTP sync — periodic, harmless
@@ -61,8 +61,8 @@ var defaultNoiseUnits = map[string]bool{
 	"irqbalance":          true, // IRQ balancing
 	"fwupd":               true, // Firmware update daemon
 	"thermald":            true, // Thermal management
-	"dockerd":             true, // Docker daemon chatter (the design review recommendation)
-	"containerd":          true, // Container runtime chatter (the design review recommendation)
+	"dockerd":             true, // Docker daemon chatter
+	"containerd":          true, // Container runtime chatter
 }
 
 // JournaldWatcher streams entries from systemd journal via journalctl subprocess.

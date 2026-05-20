@@ -78,7 +78,7 @@ func (e *EmailNotifier) Send(ctx context.Context, alert Alert) error {
 // esc is a shorthand for html.EscapeString. Every dynamic field interpolated
 // into the HTML email body MUST pass through this function to prevent injection.
 //
-// v0.52 P0 fix (code review adversarial review): prior to this fix, all dynamic
+// v0.52 P0 fix: prior to this fix, all dynamic
 // fields were interpolated via raw fmt.Sprintf %s — an attacker sending
 // GET /<script>alert(1)</script> would render executable HTML in the
 // operator's email client. Ironic for a security product.

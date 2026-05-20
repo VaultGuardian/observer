@@ -25,8 +25,8 @@ import (
 //   An attacker cannot predict the token. They'd have to guess a random 16-byte
 //   hex string within a 10-second window. Cryptographically infeasible.
 //
-//   the design review's mandate: "No static strings that an attacker can copy."
-//   code review's alternative (loopback IP) was considered but Docker port publishing
+//   the mandate: "No static strings that an attacker can copy."
+//   the alternative (loopback IP) was considered but Docker port publishing
 //   may not preserve 127.0.0.1 as the source IP in nginx logs.
 
 const (

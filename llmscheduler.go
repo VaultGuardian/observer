@@ -9,7 +9,7 @@ import (
 // LLM Scheduler — Global Concurrency Control for All LLM Call Sites
 // =============================================================================
 //
-// PROBLEM (code review code review, April 2026):
+// PROBLEM:
 //   Tier 1 classification had a semaphore. Tier 2 reclassification and
 //   catch-all verification did not. Under load, T2 and catch-all calls
 //   could run unbounded while T1 was being throttled — defeating the
@@ -26,7 +26,7 @@ import (
 //   so blocking won't starve T1. T1 drops are safe because the line stays
 //   VerdictUnknown and will be re-classified on next occurrence.
 //
-// DESIGN DECISION (the team + code review, April 2026):
+// DESIGN DECISION (the team, April 2026):
 //   All LLM calls must flow through a single scheduler.
 
 // LLMScheduler controls concurrent access to the LLM inference server.

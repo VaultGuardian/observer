@@ -26,10 +26,10 @@
 //   capture), the response queues and expires after 2s as an orphan. Request
 //   side ONLY appends — it never consumes queued responses, because doing so
 //   on a keep-alive connection could pair Request B with Response A if
-//   Request A's headers were split (code review's catch).
+//   Request A's headers were split.
 //
 // =============================================================================
-// Inline parser safety (code review + the design review guardrails)
+// Inline parser safety
 // =============================================================================
 //
 // - Payload must START with a known HTTP method token (GET, POST, etc.).
@@ -135,7 +135,7 @@ type flowPair struct {
 	// side alone. Set this flag to skip all subsequent client payloads
 	// until the response side pairs and clears it. Conservative: may
 	// miss a rare pipelined request after a chunked body, but missing
-	// is safer than false evidence. (code review catch.)
+	// is safer than false evidence.
 	skipUntilPaired bool
 
 	mu sync.Mutex
@@ -182,7 +182,7 @@ const maxInlineScan = 8192
 
 // httpMethodPrefixes is the exhaustive set of HTTP/1.x method tokens.
 // The inline parser requires the payload to START with one of these.
-// Parse all methods — let the classifier decide what matters (the design review).
+// Parse all methods — let the classifier decide what matters.
 var httpMethodPrefixes = [][]byte{
 	[]byte("GET "),
 	[]byte("POST "),
@@ -613,7 +613,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 	// Bounded by portRegistry.cap. Safe even on hostile traffic: the
 	// peek is a fixed-size byte-prefix check and the cap stops bloat.
 	//
-	// CRITICAL (code review review): processing must be gated on registry
+	// CRITICAL: processing must be gated on registry
 	// admission (has(port)), NOT on learn()'s return value. learn()
 	// returns false in cases that should still be processed (race —
 	// another goroutine learned the same port a moment earlier) AND in
@@ -674,7 +674,7 @@ func (s *sniffer) handleInlineRequest(flowKey streamKey, tcpSeq uint32, payload 
 	s.flowsMu.Lock()
 	fp := s.flows[flowKey]
 	if fp == nil {
-		// Enforce max flow states (the design review: delete from map, not just clear slices).
+		// Enforce max flow states.
 		if len(s.flows) >= s.flowConfig.MaxFlowStates {
 			s.evictOneFlow()
 		}
@@ -1069,7 +1069,7 @@ func (s *sniffer) flushLoop(ctx context.Context) {
 // matching response for 30s, discard it (edge-generated response, dropped
 // connection, etc.).
 //
-// Empty flows: deleted from the map (the design review: don't leak empty structs).
+// Empty flows: deleted from the map.
 
 func (s *sniffer) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)

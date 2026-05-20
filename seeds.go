@@ -12,7 +12,7 @@ import "github.com/vaultguardian/observer/internal/patternstore"
 //	Seeds trimmed from 25 to 6 patterns. Only "always malicious regardless of
 //	context" patterns remain. Reconnaissance-shaped patterns (.env, /etc/passwd,
 //	UNION SELECT, DROP TABLE) moved to the intelligent pipeline where the LLM
-//	evaluates intent × outcome. the team, code review, ,  all agreed.
+//	evaluates intent × outcome.
 //
 //	Rationale: Seeds bypass LLM classification, evidence check, and coordinator
 //	downgrade. With 97%+ cache hit rates, seeds save one LLM call worth fractions
@@ -25,7 +25,7 @@ import "github.com/vaultguardian/observer/internal/patternstore"
 //	the probe usually fails. That was correct — the PATH is recon. But the FILE
 //	CONTENTS appearing in any log stream is ALWAYS confirmed exploitation.
 //	"root:x:0:0:root" in a web app container's output means the attacker already
-//	won. No LLM needed. the team, the design review agreed.
+//	won. No LLM needed.
 var maliciousSeeds = []struct {
 	Pattern string
 	Reason  string

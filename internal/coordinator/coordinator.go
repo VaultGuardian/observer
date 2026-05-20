@@ -104,7 +104,7 @@ type FinalAlert struct {
 
 	// Key is the coordinator correlation key (host|method|path|status).
 	// Distinct from ScopeKey, which is source identity (e.g. "docker:captain-nginx").
-	// Section 3 follow-up (code review review): logs and DB writes used to put
+	// Section 3 follow-up: logs and DB writes used to put
 	// ScopeKey in the coordinator_key column, which lied about what the
 	// coordinator actually correlated on. This field carries the real key.
 	Key string
@@ -211,7 +211,7 @@ type Coordinator struct {
 	evidenceCheck  EvidenceCheckFunc
 	ctx            context.Context
 
-	// Section 3 follow-up (code review review item #6): telemetry for the
+	// Section 3 follow-up: telemetry for the
 	// host-aware coordinator key. Counts new investigations created with
 	// the "<unknown-host>" placeholder, indicating events that came in
 	// without parseable Host metadata. Low number = healthy. High number
