@@ -60,12 +60,21 @@ fi
 # -------------------------------------------------------------------
 # Check for existing installation
 # -------------------------------------------------------------------
+# Track whether this is an upgrade vs a fresh install. When upgrading
+# AND an env file already exists, we preserve operator customizations
+# (DASHBOARD_BIND_ADDR=0.0.0.0, CORS allowlist, REC tuning, manually-
+# added notifier creds, etc) rather than overwriting them with prompt
+# defaults. The user can use 'vaultguardian update' for binary-only
+# upgrades without re-running this script at all.
+EXISTING_INSTALL=false
+
 if [ -f "$BIN" ]; then
     warn "Observer is already installed at $BIN"
     echo ""
     read -rp "  Reinstall / upgrade? [y/N] " REINSTALL
     case "$REINSTALL" in
         [yY]|[yY][eE][sS])
+            EXISTING_INSTALL=true
             info "Upgrading..."
             if systemctl is-active --quiet observer 2>/dev/null; then
                 info "Stopping running Observer..."
@@ -77,6 +86,16 @@ if [ -f "$BIN" ]; then
             exit 0
             ;;
     esac
+fi
+
+# Decide whether to preserve the existing env file. Both conditions
+# must hold: we must be in an upgrade (not first install) AND a
+# config file must actually exist. A partial state (binary present
+# but no env, or env present but no binary) falls through to fresh
+# config collection.
+PRESERVE_ENV=false
+if [ "$EXISTING_INSTALL" = true ] && [ -f "$CONFIG_DIR/observer.env" ]; then
+    PRESERVE_ENV=true
 fi
 
 # -------------------------------------------------------------------
@@ -106,21 +125,104 @@ fi
 # -------------------------------------------------------------------
 # Collect configuration
 # -------------------------------------------------------------------
+if [ "$PRESERVE_ENV" = true ]; then
+    echo ""
+    info "Existing configuration found at $CONFIG_DIR/observer.env"
+    info "Preserving your settings — skipping configuration prompts."
+    info "To change settings: edit $CONFIG_DIR/observer.env directly, then"
+    info "                    'systemctl restart observer'"
+    info "To reconfigure from scratch: remove the env file and re-run this script"
+    info "For binary-only upgrades next time: 'vaultguardian update'"
+    echo ""
+else
+    echo ""
+    info "Configuration"
+    echo ""
+
+# -------------------------------------------------------------------
+# LLM provider — local first, cloud as opt-in.
+# -------------------------------------------------------------------
+# Observer's binary defaults to local Ollama (LLM_URL=http://llm:11434,
+# LLM_MODEL=qwen2.5:7b). The installer mirrors that: it probes for a
+# running Ollama on the loopback, recommends Local when found, and falls
+# back to Cloud only when the operator explicitly chooses it. Cloud is
+# never the silent default — picking it requires an explicit keystroke
+# and an API key the user must paste.
+# -------------------------------------------------------------------
+echo "  Observer can classify events with a LOCAL LLM (Ollama) or a CLOUD LLM"
+echo "  (any OpenAI-compatible endpoint: OpenAI, Together, Groq, vLLM, etc.)."
 echo ""
-info "Configuration"
+echo "  Local  — logs never leave your network, \$0 API cost, air-gap friendly."
+echo "  Cloud  — no LLM setup, but logs go to a third-party API."
 echo ""
 
-# API key
-echo "  Observer uses an LLM API to classify log events."
-echo "  Currently supported: OpenAI (recommended: gpt-5-nano)"
-echo ""
-read -rp "  OpenAI API key: " API_KEY
-[ -n "$API_KEY" ] || fail "API key is required"
+# Probe for a running Ollama on the loopback. Short timeout — we don't
+# want a hanging port to stall the installer.
+OLLAMA_URL=""
+for url in "http://127.0.0.1:11434" "http://localhost:11434"; do
+    if curl -fsS --max-time 2 "$url/api/tags" >/dev/null 2>&1; then
+        OLLAMA_URL="$url"
+        break
+    fi
+done
 
-# LLM model (default to gpt-5-nano)
+if [ -n "$OLLAMA_URL" ]; then
+    ok "Detected Ollama running at $OLLAMA_URL"
+    DEFAULT_PROVIDER="L"
+else
+    info "No local Ollama detected (https://ollama.com to install)."
+    info "You can still pick Local and point Observer at a remote Ollama on your LAN."
+    DEFAULT_PROVIDER="L"
+fi
+
+read -rp "  Provider — [L]ocal / [C]loud [$DEFAULT_PROVIDER]: " PROVIDER_CHOICE
+PROVIDER_CHOICE="${PROVIDER_CHOICE:-$DEFAULT_PROVIDER}"
+
+case "$PROVIDER_CHOICE" in
+    [cC]*)
+        # Cloud (OpenAI-compatible) branch
+        echo ""
+        info "Cloud LLM selected. Logs will be sent to this endpoint for classification."
+        echo ""
+        read -rp "  LLM base URL [https://api.openai.com]: " LLM_URL
+        LLM_URL="${LLM_URL:-https://api.openai.com}"
+
+        read -rp "  LLM model [gpt-5-nano]: " LLM_MODEL
+        LLM_MODEL="${LLM_MODEL:-gpt-5-nano}"
+
+        read -rp "  API key: " API_KEY
+        [ -n "$API_KEY" ] || fail "API key is required for cloud LLM"
+        ;;
+    *)
+        # Local (Ollama) branch — default
+        DEFAULT_LLM_URL="${OLLAMA_URL:-http://localhost:11434}"
+        echo ""
+        read -rp "  Ollama URL [$DEFAULT_LLM_URL]: " LLM_URL
+        LLM_URL="${LLM_URL:-$DEFAULT_LLM_URL}"
+
+        read -rp "  Model name [qwen2.5:7b]: " LLM_MODEL
+        LLM_MODEL="${LLM_MODEL:-qwen2.5:7b}"
+
+        # Ollama does not require an API key. Leave LLM_API_KEY empty in
+        # the env file so the binary doesn't send an Authorization header.
+        API_KEY=""
+
+        if [ -z "$OLLAMA_URL" ]; then
+            warn "Ollama wasn't reachable during install. Make sure $LLM_URL is up"
+            warn "and that '$LLM_MODEL' is pulled (ollama pull $LLM_MODEL) before traffic arrives."
+        fi
+        ;;
+esac
+
 echo ""
-read -rp "  LLM model [gpt-5-nano]: " LLM_MODEL
-LLM_MODEL="${LLM_MODEL:-gpt-5-nano}"
+
+# Server nickname — used in alert emails so multi-host operators can tell
+# which box fired. Defaults to the system hostname. Stored as HOSTNAME in
+# the env file because that's the env var the binary already reads
+# (config.go: SelfID = getEnv("HOSTNAME", "")).
+DEFAULT_NICK="$(hostname)"
+read -rp "  Server nickname (used in alert emails) [$DEFAULT_NICK]: " SERVER_NICK
+SERVER_NICK="${SERVER_NICK:-$DEFAULT_NICK}"
 
 # Dashboard port
 read -rp "  Dashboard API port [9090]: " DASHBOARD_PORT
@@ -133,9 +235,27 @@ echo "  Requires a Resend API key (https://resend.com)"
 read -rp "  Resend API key (optional, press Enter to skip): " RESEND_KEY
 
 ALERT_EMAIL=""
+ALERT_EMAIL_FROM=""
 if [ -n "$RESEND_KEY" ]; then
-    read -rp "  Alert email address: " ALERT_EMAIL
-    [ -n "$ALERT_EMAIL" ] || warn "No email provided — email alerts disabled"
+    read -rp "  Alert destination email address: " ALERT_EMAIL
+    if [ -z "$ALERT_EMAIL" ]; then
+        warn "No destination email provided — email alerts disabled"
+        RESEND_KEY=""  # don't write a half-configured email block
+    else
+        # The 'From' address must be verified in the USER'S Resend account.
+        # Default to onboarding@resend.dev — Resend's pre-verified sandbox
+        # sender — so first-time installs work immediately without domain
+        # setup. Users can switch to their own verified domain later by
+        # editing ALERT_EMAIL_FROM in the env file.
+        echo ""
+        echo "  The 'From' address must be verified in YOUR Resend account."
+        echo "  Default uses Resend's sandbox sender (onboarding@resend.dev),"
+        echo "  which works out of the box. Switch to your own verified"
+        echo "  domain later via ALERT_EMAIL_FROM in $CONFIG_DIR/observer.env."
+        DEFAULT_FROM="VaultGuardian Observer <onboarding@resend.dev>"
+        read -rp "  Alert 'From' address [$DEFAULT_FROM]: " ALERT_EMAIL_FROM
+        ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM:-$DEFAULT_FROM}"
+    fi
 fi
 
 # Response Evidence Capture
@@ -149,6 +269,8 @@ case "$REC_CHOICE" in
 esac
 
 echo ""
+
+fi  # end of PRESERVE_ENV check (was opened above "Configuration")
 
 # -------------------------------------------------------------------
 # Download binary
@@ -194,7 +316,11 @@ info "Creating systemd service..."
 cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=VaultGuardian Observer
-After=network.target docker.service
+# Wait for the network to be ACTUALLY usable (DNS + routing), not just
+# the interface coming up. Without After=network-online.target, Observer
+# can start before DNS resolves, fail its first LLM call, and burn a
+# RestartSec cycle on every reboot.
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
@@ -221,9 +347,20 @@ ok "Service file created at $SERVICE_FILE"
 # Create environment file (chmod 600, contains secrets)
 # -------------------------------------------------------------------
 ENV_FILE="$CONFIG_DIR/observer.env"
-info "Writing $ENV_FILE (mode 0600)..."
 
-cat > "$ENV_FILE" << EOF
+if [ "$PRESERVE_ENV" = true ]; then
+    ok "Environment file preserved at $ENV_FILE"
+else
+    info "Writing $ENV_FILE (mode 0600)..."
+
+    # Create the file with restrictive perms BEFORE writing any content.
+    # `cat > file` preserves existing perms on an existing file, so by
+    # pre-creating at 0600, the API keys never sit in a world-readable file
+    # even for the microseconds between the heredoc write and a later
+    # chmod. install(1) from coreutils creates atomically at the target mode.
+    install -m 600 /dev/null "$ENV_FILE"
+
+    cat > "$ENV_FILE" << EOF
 # VaultGuardian Observer environment
 # This file contains API keys and runtime configuration.
 # Permissions: 0600 (root only). Do not chmod world-readable.
@@ -231,6 +368,9 @@ cat > "$ENV_FILE" << EOF
 # Core
 DATA_DIR=$DATA_DIR
 DASHBOARD_PORT=$DASHBOARD_PORT
+
+# Server identity (shown in alert emails).
+HOSTNAME=$SERVER_NICK
 
 # Dashboard binding.
 #   127.0.0.1 = localhost only (default, safest — for self-hosted setups)
@@ -242,7 +382,7 @@ DASHBOARD_BIND_ADDR=127.0.0.1
 DASHBOARD_ALLOWED_ORIGINS=
 
 # LLM
-LLM_URL=https://api.openai.com
+LLM_URL=$LLM_URL
 LLM_MODEL=$LLM_MODEL
 LLM_API_KEY=$API_KEY
 
@@ -255,18 +395,20 @@ EXCLUDE_CONTAINERS=
 REC_ENABLED=$REC_ENABLED
 EOF
 
-# Add email config if provided
-if [ -n "$RESEND_KEY" ] && [ -n "$ALERT_EMAIL" ]; then
-    cat >> "$ENV_FILE" << EOF
+    # Add email config if provided
+    if [ -n "$RESEND_KEY" ] && [ -n "$ALERT_EMAIL" ]; then
+        cat >> "$ENV_FILE" << EOF
 
 # Email alerts
 RESEND_API_KEY=$RESEND_KEY
 ALERT_EMAIL_TO=$ALERT_EMAIL
+ALERT_EMAIL_FROM=$ALERT_EMAIL_FROM
 EOF
-fi
+    fi
 
-chmod 600 "$ENV_FILE"
-ok "Environment file written (chmod 0600)"
+    chmod 600 "$ENV_FILE"
+    ok "Environment file written (chmod 0600)"
+fi
 
 # -------------------------------------------------------------------
 # Install CLI tool
@@ -398,14 +540,41 @@ sleep 2
 echo ""
 if systemctl is-active --quiet observer; then
     echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   Observer is running!                   ║${NC}"
+    if [ "$EXISTING_INSTALL" = true ]; then
+        echo -e "${GREEN}║   Observer upgraded — running!           ║${NC}"
+    else
+        echo -e "${GREEN}║   Observer is running!                   ║${NC}"
+    fi
     echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
     echo ""
-    ok "Dashboard API: http://$(hostname -I | awk '{print $1}'):$DASHBOARD_PORT"
-    [ "$DOCKER_FOUND" = true ] && ok "Monitoring: Docker containers"
-    [ "$JOURNALD_FOUND" = true ] && ok "Monitoring: Host OS (journald)"
-    [ -n "$ALERT_EMAIL" ] && ok "Alerts: $ALERT_EMAIL (via Resend)"
-    [ "$REC_ENABLED" = true ] && ok "Evidence capture: enabled"
+
+    if [ "$PRESERVE_ENV" = true ]; then
+        # Upgrade with preserved config — keep the banner minimal. The
+        # user already knows their config; we'd have to source the env
+        # file (which has spaces in some values like ALERT_EMAIL_FROM)
+        # to recap it, and that's more risk than value.
+        ok "Configuration preserved: $ENV_FILE"
+        info "Inspect with: sudo cat $ENV_FILE   (root-only)"
+    else
+        # Dashboard URL — show the actual bind address, not the box's external IP.
+        # By default we bind to 127.0.0.1 (May 4 hardening), so advertising
+        # `http://<hostname -I>:9090` would tell the user to visit an address
+        # that won't accept connections. Show 127.0.0.1 + an SSH tunnel hint;
+        # users who set DASHBOARD_BIND_ADDR=0.0.0.0 (after firewalling the
+        # port) will know their LAN address already.
+        ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
+        info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
+        info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
+        case "$PROVIDER_CHOICE" in
+            [cC]*) ok "LLM: cloud ($LLM_URL, model $LLM_MODEL)" ;;
+            *)     ok "LLM: local ($LLM_URL, model $LLM_MODEL)" ;;
+        esac
+        [ "$DOCKER_FOUND" = true ] && ok "Monitoring: Docker containers"
+        [ "$JOURNALD_FOUND" = true ] && ok "Monitoring: Host OS (journald)"
+        [ -n "$ALERT_EMAIL" ] && ok "Alerts: $ALERT_EMAIL (via Resend)"
+        [ "$REC_ENABLED" = true ] && ok "Evidence capture: enabled"
+    fi
+
     echo ""
     info "Quick commands:"
     echo "  vaultguardian logs      — Watch live logs"

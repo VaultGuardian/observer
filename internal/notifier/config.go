@@ -35,7 +35,7 @@ type WebhookConfig struct {
 type EmailConfig struct {
 	APIKey string // RESEND_API_KEY
 	To     string // ALERT_EMAIL_TO
-	From   string // ALERT_EMAIL_FROM (default: "VaultGuardian LogWatch <alerts@vaultguardian.com>")
+	From   string // ALERT_EMAIL_FROM (default: "VaultGuardian Observer <onboarding@resend.dev>")
 }
 
 type SMSConfig struct {
@@ -133,7 +133,7 @@ func LoadConfig(dataDir string) (*Config, error) {
 	cfg.Email = EmailConfig{
 		APIKey: strings.TrimSpace(os.Getenv("RESEND_API_KEY")),
 		To:     strings.TrimSpace(os.Getenv("ALERT_EMAIL_TO")),
-		From:   getEnvDefault("ALERT_EMAIL_FROM", "VaultGuardian LogWatch <alerts@vaultdec.com>"),
+		From:   getEnvDefault("ALERT_EMAIL_FROM", "VaultGuardian Observer <onboarding@resend.dev>"),
 	}
 
 	cfg.SMS = SMSConfig{

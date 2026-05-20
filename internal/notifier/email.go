@@ -19,7 +19,11 @@ type EmailNotifier struct {
 
 func NewEmailNotifier(cfg EmailConfig) *EmailNotifier {
 	if cfg.From == "" {
-		cfg.From = "VaultGuardian LogWatch <alerts@vaultdec.com>"
+		// Resend's pre-verified sandbox sender — works without domain
+		// verification, so first-time installs send successfully out of
+		// the box. Users override via ALERT_EMAIL_FROM once they verify
+		// their own domain in their Resend account.
+		cfg.From = "VaultGuardian Observer <onboarding@resend.dev>"
 	}
 	return &EmailNotifier{
 		config: cfg,

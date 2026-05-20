@@ -124,7 +124,7 @@ verdict                  recon       → record as probe intelligence, no email
 1. **Deterministic filters** — Stack traces, failed HTTP probes, SSH brute force. Structural detection. Never touches the LLM.
 2. **Policy engine** — SSH logins, user creation, privilege escalation, `authorized_keys` modification. Identity-based decisions with trusted IP allowlist.
 3. **Seed patterns** — Credential file contents (`root:x:0:0:`), private keys (`BEGIN RSA PRIVATE KEY`), reverse shells (`bash -i >& /dev/tcp`), download-and-execute chains (`curl | sh`). Deterministic substring match, instant `malicious` verdict, direct email dispatch.
-4. **Pattern store** — Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). Nanosecond lookups. Cache hit rate runs above 97% in production once the system has seen a few days of traffic.
+4. **Pattern store** — Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). In-memory lookups, no network round-trip. Cache hit rate runs above 97% in production once the system has seen a few days of traffic.
 5. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Local Ollama by default, hosted endpoint optional. Bounded retry queue handles backpressure.
 6. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Full TCP reassembly via gopacket. Captures HTTP responses, redacts secrets structurally, correlates with alerts. VIP lane protects malicious evidence from traffic-flood eviction.
 7. **Coordinator** — Groups alerts, holds for evidence (2–5 s), downgrades false alarms, dispatches findings. Email only on confirmed impact.
@@ -220,12 +220,14 @@ sudo chmod +x /usr/local/bin/observer
 Then write the systemd unit and `/etc/vaultguardian/observer.env` by hand. The `install.sh` script handles both for you in the one-liner path; the unit content it writes is identical to what you'd write manually.
 
 The installer prompts for:
-- LLM provider (Ollama or any OpenAI-compatible endpoint)
+- LLM provider (Ollama or any OpenAI-compatible endpoint). It probes for a local Ollama instance and recommends it by default; the cloud path is an explicit opt-in.
 - LLM model name
 - Server nickname (used in alert emails — defaults to system hostname)
 - Dashboard API port (default `9090`)
-- Resend API key + alert email (optional)
+- Resend API key, alert destination address, and sender ("From") address (optional). The From address defaults to Resend's pre-verified sandbox sender (`onboarding@resend.dev`), so email works out of the box before you've verified your own domain.
 - Whether to enable Response Evidence Capture (REC)
+
+Re-running the installer over an existing install detects your `/etc/vaultguardian/observer.env` and **preserves it** — your settings (bind address, CORS allowlist, REC tuning, notifier config) are kept, the configuration prompts are skipped, and only the binary and systemd unit are refreshed. To change settings, edit the env file directly and `systemctl restart observer`; to reconfigure from scratch, remove the env file first. For binary-only upgrades, prefer `vaultguardian update`.
 
 Docker containers are monitored automatically if Docker is present. If not, Observer watches everything via journald — the policy engine, classification, and email alerts all work on a bare-metal server with nothing but `sshd`.
 
@@ -259,7 +261,7 @@ Configuration is environment variables, loaded from `/etc/vaultguardian/observer
 | `JOURNALD_ENABLED` | (unset) | Set to `true` to watch host journald |
 | `EXCLUDE_CONTAINERS` | | Comma-separated container names to skip |
 | `JOURNALD_EXCLUDE_UNITS` | | Additional systemd units to suppress |
-| `SERVER_NICKNAME` | (system hostname) | Label for this server, included in alert emails alongside the IP |
+| `HOSTNAME` | (system hostname) | Label for this server, included in alert emails alongside the IP. The installer's "server nickname" prompt writes this. |
 
 ### LLM
 
@@ -311,8 +313,9 @@ Additional REC tuning knobs exist (`REC_FLOW_*`, `REC_REASSEMBLY_MAX_BUFFERED_PA
 |---|---|---|
 | `RESEND_API_KEY` | | Resend API key for delivery |
 | `ALERT_EMAIL_TO` | | Destination address for alert emails |
+| `ALERT_EMAIL_FROM` | `VaultGuardian Observer <onboarding@resend.dev>` | Sender address. Must be verified in **your** Resend account. The default is Resend's sandbox sender, which works without domain setup; switch to your own verified domain once you have one. |
 
-When configured, escalation emails include the `SERVER_NICKNAME` (above) and the server's primary IP, so it's obvious which machine fired the alert when you're running Observer on multiple servers.
+When configured, escalation emails include the `HOSTNAME` (above) and the server's primary IP, so it's obvious which machine fired the alert when you're running Observer on multiple servers.
 
 ---
 
