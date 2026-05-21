@@ -26,6 +26,31 @@ warn()  { echo -e "${YELLOW}[vaultguardian]${NC} $1"; }
 fail()  { echo -e "${RED}[vaultguardian]${NC} $1"; exit 1; }
 
 # -------------------------------------------------------------------
+# Interactive prompts under `curl | bash`
+# -------------------------------------------------------------------
+# When run as `curl ... | sudo bash`, stdin (fd 0) IS the script stream, so a
+# plain `read` consumes the script's own following lines instead of the user's
+# answer. Open the controlling terminal on fd 3 and read prompts from there.
+# If there's no tty (CI / automation), prompts are skipped and each caller's
+# "${VAR:-default}" fallback supplies the default.
+if { exec 3</dev/tty; } 2>/dev/null; then
+    HAVE_TTY=1
+else
+    HAVE_TTY=0
+fi
+
+# ask PROMPT VARNAME — interactive read from the tty (fd 3) when available,
+# otherwise leaves VARNAME empty so the caller's default fallback applies.
+ask() {
+    local __prompt="$1" __var="$2" __val=""
+    if [ "$HAVE_TTY" = "1" ]; then
+        printf '%s' "$__prompt" > /dev/tty
+        IFS= read -r __val <&3 || __val=""
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
+# -------------------------------------------------------------------
 # Pre-flight checks
 # -------------------------------------------------------------------
 echo ""
@@ -71,7 +96,7 @@ EXISTING_INSTALL=false
 if [ -f "$BIN" ]; then
     warn "Observer is already installed at $BIN"
     echo ""
-    read -rp "  Reinstall / upgrade? [y/N] " REINSTALL
+    ask "  Reinstall / upgrade? [y/N] " REINSTALL
     case "$REINSTALL" in
         [yY]|[yY][eE][sS])
             EXISTING_INSTALL=true
@@ -175,7 +200,7 @@ else
     DEFAULT_PROVIDER="L"
 fi
 
-read -rp "  Provider — [L]ocal / [C]loud [$DEFAULT_PROVIDER]: " PROVIDER_CHOICE
+ask "  Provider — [L]ocal / [C]loud [$DEFAULT_PROVIDER]: " PROVIDER_CHOICE
 PROVIDER_CHOICE="${PROVIDER_CHOICE:-$DEFAULT_PROVIDER}"
 
 case "$PROVIDER_CHOICE" in
@@ -184,23 +209,23 @@ case "$PROVIDER_CHOICE" in
         echo ""
         info "Cloud LLM selected. Logs will be sent to this endpoint for classification."
         echo ""
-        read -rp "  LLM base URL [https://api.openai.com]: " LLM_URL
+        ask "  LLM base URL [https://api.openai.com]: " LLM_URL
         LLM_URL="${LLM_URL:-https://api.openai.com}"
 
-        read -rp "  LLM model [gpt-5-nano]: " LLM_MODEL
+        ask "  LLM model [gpt-5-nano]: " LLM_MODEL
         LLM_MODEL="${LLM_MODEL:-gpt-5-nano}"
 
-        read -rp "  API key: " API_KEY
+        ask "  API key: " API_KEY
         [ -n "$API_KEY" ] || fail "API key is required for cloud LLM"
         ;;
     *)
         # Local (Ollama) branch — default
         DEFAULT_LLM_URL="${OLLAMA_URL:-http://localhost:11434}"
         echo ""
-        read -rp "  Ollama URL [$DEFAULT_LLM_URL]: " LLM_URL
+        ask "  Ollama URL [$DEFAULT_LLM_URL]: " LLM_URL
         LLM_URL="${LLM_URL:-$DEFAULT_LLM_URL}"
 
-        read -rp "  Model name [qwen2.5:7b]: " LLM_MODEL
+        ask "  Model name [qwen2.5:7b]: " LLM_MODEL
         LLM_MODEL="${LLM_MODEL:-qwen2.5:7b}"
 
         # Ollama does not require an API key. Leave LLM_API_KEY empty in
@@ -221,23 +246,23 @@ echo ""
 # the env file because that's the env var the binary already reads
 # (config.go: SelfID = getEnv("HOSTNAME", "")).
 DEFAULT_NICK="$(hostname)"
-read -rp "  Server nickname (used in alert emails) [$DEFAULT_NICK]: " SERVER_NICK
+ask "  Server nickname (used in alert emails) [$DEFAULT_NICK]: " SERVER_NICK
 SERVER_NICK="${SERVER_NICK:-$DEFAULT_NICK}"
 
 # Dashboard port
-read -rp "  Dashboard API port [9090]: " DASHBOARD_PORT
+ask "  Dashboard API port [9090]: " DASHBOARD_PORT
 DASHBOARD_PORT="${DASHBOARD_PORT:-9090}"
 
 # Email alerts (optional)
 echo ""
 echo "  Observer can email you when it finds confirmed exploitation."
 echo "  Requires a Resend API key (https://resend.com)"
-read -rp "  Resend API key (optional, press Enter to skip): " RESEND_KEY
+ask "  Resend API key (optional, press Enter to skip): " RESEND_KEY
 
 ALERT_EMAIL=""
 ALERT_EMAIL_FROM=""
 if [ -n "$RESEND_KEY" ]; then
-    read -rp "  Alert destination email address: " ALERT_EMAIL
+    ask "  Alert destination email address: " ALERT_EMAIL
     if [ -z "$ALERT_EMAIL" ]; then
         warn "No destination email provided — email alerts disabled"
         RESEND_KEY=""  # don't write a half-configured email block
@@ -253,7 +278,7 @@ if [ -n "$RESEND_KEY" ]; then
         echo "  which works out of the box. Switch to your own verified"
         echo "  domain later via ALERT_EMAIL_FROM in $CONFIG_DIR/observer.env."
         DEFAULT_FROM="VaultGuardian Observer <onboarding@resend.dev>"
-        read -rp "  Alert 'From' address [$DEFAULT_FROM]: " ALERT_EMAIL_FROM
+        ask "  Alert 'From' address [$DEFAULT_FROM]: " ALERT_EMAIL_FROM
         ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM:-$DEFAULT_FROM}"
     fi
 fi
@@ -262,7 +287,7 @@ fi
 echo ""
 echo "  REC captures what your server actually sent back to attackers."
 echo "  Recommended for full evidence on escalated alerts."
-read -rp "  Enable Response Evidence Capture? [Y/n]: " REC_CHOICE
+ask "  Enable Response Evidence Capture? [Y/n]: " REC_CHOICE
 case "$REC_CHOICE" in
     [nN]|[nN][oO]) REC_ENABLED=false ;;
     *) REC_ENABLED=true ;;
