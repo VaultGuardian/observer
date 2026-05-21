@@ -39,7 +39,7 @@ To use a cloud provider instead of local Ollama:
 
 ```bash
 LLM_URL=https://api.openai.com
-LLM_MODEL=gpt-5-nano
+LLM_MODEL=gpt-5-mini
 LLM_API_KEY=sk-xxxxxxxx
 ```
 

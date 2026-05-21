@@ -278,7 +278,7 @@ To use OpenAI directly, override the defaults:
 
 ```bash
 LLM_URL=https://api.openai.com
-LLM_MODEL=gpt-5-nano
+LLM_MODEL=gpt-5-mini
 LLM_API_KEY=sk-xxxxxxxxxxxx
 ```
 

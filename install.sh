@@ -212,8 +212,8 @@ case "$PROVIDER_CHOICE" in
         ask "  LLM base URL [https://api.openai.com]: " LLM_URL
         LLM_URL="${LLM_URL:-https://api.openai.com}"
 
-        ask "  LLM model [gpt-5-nano]: " LLM_MODEL
-        LLM_MODEL="${LLM_MODEL:-gpt-5-nano}"
+        ask "  LLM model [gpt-5-mini]: " LLM_MODEL
+        LLM_MODEL="${LLM_MODEL:-gpt-5-mini}"
 
         ask "  API key: " API_KEY
         [ -n "$API_KEY" ] || fail "API key is required for cloud LLM"
