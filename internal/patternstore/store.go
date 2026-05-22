@@ -420,6 +420,19 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 		return fmt.Errorf("unknown verdict %q — refusing to learn", verdict)
 	}
 
+	// Dedup (slice tiers): if an active pattern with this exact value is
+	// already present in the target tier, the learn is a no-op. Prevents the
+	// prefix/regex/contains slices from accumulating identical entries when
+	// the same line is classified repeatedly before its pattern propagates
+	// (e.g. under retry-queue backlog — this is what produced the duplicate
+	// fwupd / "Reached target" entries observed in patternstore.json). The
+	// hash tier is a map keyed by value and dedups inherently. Revoked entries
+	// are intentionally NOT treated as duplicates, so the existing "re-learn
+	// after operator revoke" behavior is preserved.
+	if bucketHasActivePattern(bucket, pattern.Type, pattern.Value) {
+		return nil
+	}
+
 	// Cap check — only applies to non-human, non-seeded sources.
 	// Operator-curated patterns are never capped.
 	if !isHumanOrSeededSource(pattern.Source) {
@@ -445,6 +458,31 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 
 	s.stats.PatternCount.Add(1)
 	return nil
+}
+
+// bucketHasActivePattern reports whether a non-revoked pattern with the given
+// value already exists in the bucket's slice tier (prefix/regex/contains).
+// Used by Learn to make slice-tier inserts idempotent. The hash tier always
+// reports false: it is a map keyed by value, so re-inserting overwrites rather
+// than duplicating. Caller must hold s.mu.
+func bucketHasActivePattern(bucket *PatternBucket, pt PatternType, value string) bool {
+	var tier []*LearnedPattern
+	switch pt {
+	case PatternPrefix:
+		tier = bucket.Prefixes
+	case PatternRegex:
+		tier = bucket.Regexes
+	case PatternContains:
+		tier = bucket.Contains
+	default:
+		return false // hash tier dedups via its map
+	}
+	for _, p := range tier {
+		if p.RevokedAt == nil && p.Value == value {
+			return true
+		}
+	}
+	return false
 }
 
 // bucketAtCap returns a non-empty reason and true when the relevant tier of
