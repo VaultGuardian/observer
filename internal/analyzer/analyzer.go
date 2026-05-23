@@ -455,8 +455,8 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	// MALICIOUS and ALERT learning is still allowed — caching an escalation
 	// on an attack-indicator line is correct behavior.
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
-		if hasAttackIndicators(evt.Line) || hasAttackIndicators(evt.NormalizedLine) {
-			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s — line contains attack indicators",
+		if hasAttackPayloadForLearning(evt.NormalizedLine) {
+			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s — parsed HTTP request contains attack indicators",
 				v, scopeKey)
 			a.stats.DisclosureOverrides.Add(1) // reuse counter — both are "refuse to learn" events
 			return false
@@ -853,6 +853,30 @@ func parseHTTPIdentity(normalizedLine string) (method, path, status string) {
 		return m[1], m[2], m[3]
 	}
 	return "", "", ""
+}
+
+// hasAttackPayloadForLearning reports whether a line carries an actual attack
+// payload that should block suppress/allow learning. It scans ONLY the HTTP
+// request portion of the line — never arbitrary service text.
+//
+// The raw attackIndicators list contains bare SQL keywords ("UPDATE", "SELECT",
+// "DROP", "DELETE", ...). Run against a whole non-HTTP log line via
+// hasAttackIndicators, those substring-match ordinary English: "Firmware update
+// daemon" -> UPDATE, "sshd dropped a connection" -> DROP. That caused routine
+// service noise (systemd lifecycle, sshd MaxStartups) to hit
+// ATTACK_INDICATOR_REFUSE_LEARN and re-classify on every occurrence instead of
+// caching. Attack payloads only appear in request paths/query strings, so we
+// restrict the scan to a parsed request path or the request embedded in an
+// nginx error log. Malicious/alert learning is unaffected — this guards only
+// the suppress/allow learn path.
+func hasAttackPayloadForLearning(normalizedLine string) bool {
+	if _, path, _ := parseHTTPIdentity(normalizedLine); path != "" {
+		return hasAttackIndicators(path)
+	}
+	if m := reNginxErrorRequest.FindStringSubmatch(normalizedLine); m != nil {
+		return hasAttackIndicators(m[1])
+	}
+	return false
 }
 
 // Nginx error log patterns for structural 404 detection.
