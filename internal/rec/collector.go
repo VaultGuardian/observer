@@ -366,6 +366,10 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
+	// Decode nginx access-log escaping so the log-derived path matches REC's
+	// literal wire capture (both the VIP and ring-buffer compares below).
+	req = normalizeLookupRequest(req)
+
 	// --- Fix 1: Check VIP evidence first ---
 	// VIP evidence is protected from eviction. If there's a match,
 	// use it — the coordinator already knows this is high-priority.
@@ -537,6 +541,10 @@ func (lc *liveCollector) Stats() RECStats {
 // PinVIP registers interest in evidence for a malicious event.
 // Called from resultrouter.go when a malicious HTTP verdict is routed to coordinator.
 func (lc *liveCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {
+	// Decode nginx access-log escaping before the criteria are stored, so the
+	// pinned path matches the sniffer's literal wire capture in matchesVIP.
+	req = normalizeLookupRequest(req)
+
 	lc.vipMu.Lock()
 	defer lc.vipMu.Unlock()
 
@@ -584,6 +592,10 @@ func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
 	if !lc.running.Load() {
 		return
 	}
+
+	// Decode nginx access-log escaping before buffer lookup / pin storage, so
+	// the path matches REC's literal wire capture.
+	req = normalizeLookupRequest(req)
 
 	lc.vipMu.Lock()
 	defer lc.vipMu.Unlock()
@@ -707,6 +719,81 @@ func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
 			}
 			return
 		}
+	}
+}
+
+// normalizeLookupRequest returns req with its Path decoded from nginx
+// access-log escaping. Applied at every REC entry point (Lookup, PinVIP,
+// PrePin) so the ring-buffer compare and the VIP compare both see a path
+// that is byte-identical to the sniffer's literal wire capture. The caller's
+// LookupRequest is unaffected (req is passed by value), so the displayed
+// Finding.HTTPPath keeps its safe escaped form.
+func normalizeLookupRequest(req LookupRequest) LookupRequest {
+	req.Path = decodeNginxLogPath(req.Path)
+	return req
+}
+
+// decodeNginxLogPath reverses nginx's default access-log escaping (\xHH) back
+// to the literal bytes the server observed on the wire, so a log-derived path
+// compares equal to REC's wire capture.
+//
+// nginx (escape=default) rewrites bytes it considers unsafe — control bytes
+// (<0x20), high bytes (>0x7E), '"' (0x22) and '\' (0x5C) — as the 4-char
+// sequence \xHH (a backslash, a literal 'x', then two hex digits). Everything
+// else is written verbatim. This reverses exactly that transform:
+//   - Fast path: returns s unchanged when it contains no `\x` (the common
+//     case, and nginx ERROR-log paths, which are already literal/unescaped).
+//   - Each well-formed \xHH (hex digits are case-insensitive) becomes one byte.
+//   - A malformed sequence (\x not followed by two hex digits, or truncated at
+//     end of string) is passed through verbatim.
+//   - Decoding is a single forward pass, so a byte produced by decoding is
+//     never re-scanned. A literal "\x5C" in a URL is logged as "\x5Cx5C"
+//     (nginx escapes only its leading backslash) and round-trips back to
+//     "\x5C" rather than collapsing to a single backslash.
+func decodeNginxLogPath(s string) string {
+	// Fast path: nothing to decode unless a `\x` marker is present.
+	escapeStart := -1
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == '\\' && s[i+1] == 'x' {
+			escapeStart = i
+			break
+		}
+	}
+	if escapeStart < 0 {
+		return s
+	}
+
+	out := make([]byte, 0, len(s))
+	out = append(out, s[:escapeStart]...)
+	for i := escapeStart; i < len(s); {
+		if i+3 < len(s) && s[i] == '\\' && s[i+1] == 'x' &&
+			isHexDigit(s[i+2]) && isHexDigit(s[i+3]) {
+			out = append(out, unhexNibble(s[i+2])<<4|unhexNibble(s[i+3]))
+			i += 4
+			continue
+		}
+		out = append(out, s[i])
+		i++
+	}
+	return string(out)
+}
+
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// unhexNibble converts a single hex digit to its value. Callers must guard with
+// isHexDigit first; a non-hex byte falls through to 0.
+func unhexNibble(b byte) byte {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0'
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10
+	default:
+		return 0
 	}
 }
 
