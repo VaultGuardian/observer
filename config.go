@@ -43,9 +43,19 @@ type Config struct {
 
 	// REC evidence buffer tuning (v1.0 burst hardening).
 	// Overridable via REC_BUFFER_* env vars so operators can tune
-	// without rebuilds. Defaults handle ~333 req/sec for 30s.
+	// without rebuilds.
+	//
+	// Memory pressure is now the primary eviction trigger: the byte ceiling
+	// is min(RECBufferMaxBytes, RECBufferMaxMB*1MB), and entries live up to
+	// RECBufferMaxAge (10m) as a relaxed safety backstop. The long age window
+	// is deliberate — during scanner bursts the LLM inference pipeline can
+	// queue 30–60s+ of work, so a tight 30s age cap evicted REC responses
+	// before the coordinator's evidence check could read them. RECBufferMaxMB
+	// (default 64) is the preferred operator dial and tightens the effective
+	// ceiling vs. the legacy 128MB to offset the 20× longer retention window.
 	RECBufferMaxEntries int
 	RECBufferMaxBytes   int64
+	RECBufferMaxMB      int
 	RECBufferMaxAge     time.Duration
 	RECBufferMaxBody    int
 
@@ -102,7 +112,8 @@ func LoadConfig() Config {
 		// REC evidence buffer (v1.0 burst hardening).
 		RECBufferMaxEntries: getEnvInt("REC_BUFFER_MAX_ENTRIES", 10000),
 		RECBufferMaxBytes:   getEnvInt64("REC_BUFFER_MAX_BYTES", 128*1024*1024),
-		RECBufferMaxAge:     getEnvDuration("REC_BUFFER_MAX_AGE", 30*time.Second),
+		RECBufferMaxMB:      getEnvInt("REC_BUFFER_MAX_MB", 64),
+		RECBufferMaxAge:     getEnvDuration("REC_BUFFER_MAX_AGE", 10*time.Minute),
 		RECBufferMaxBody:    getEnvInt("REC_BUFFER_MAX_BODY", 2048),
 		MaxConcurrentLLM:    getEnvInt("LLM_SLOTS", 4),
 		Tier1Effort:         getEnv("LLM_TIER1_EFFORT", "low"),

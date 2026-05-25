@@ -120,9 +120,16 @@ func main() {
 	recCfg.Verbose = cfg.RECVerbose
 	recCfg.Ports = cfg.RECPorts
 	recCfg.LearnedPortCap = cfg.RECLearnedPortCap
+	// Effective byte ceiling is the tighter of the two memory knobs:
+	// REC_BUFFER_MAX_BYTES (legacy) and REC_BUFFER_MAX_MB (preferred dial).
+	// BufferConfig stays oblivious to the MB-vs-bytes distinction.
+	maxBytes := cfg.RECBufferMaxBytes
+	if mbCap := int64(cfg.RECBufferMaxMB) * 1024 * 1024; mbCap > 0 && mbCap < maxBytes {
+		maxBytes = mbCap
+	}
 	recCfg.Buffer = rec.BufferConfig{
 		MaxEntries:    cfg.RECBufferMaxEntries,
-		MaxTotalBytes: cfg.RECBufferMaxBytes,
+		MaxTotalBytes: maxBytes,
 		MaxAge:        cfg.RECBufferMaxAge,
 		MaxBodyBytes:  cfg.RECBufferMaxBody,
 	}

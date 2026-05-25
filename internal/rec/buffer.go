@@ -11,14 +11,28 @@ import (
 //
 // Constraints (whichever hits first wins):
 //   - MaxEntries:       10,000 (default, v1.0 — was 1,000)
-//   - MaxTotalBytes:    128MB  (default, v1.0 — was 16MB)
-//   - MaxAge:           30s    (default) — must exceed worst-case LLM latency for first-encounter evidence
+//   - MaxTotalBytes:    128MB  (default) — see memory-pressure note below
+//   - MaxAge:           10m    (default) — relaxed safety backstop, was 30s
 //   - MaxBodyPreview:   2KB    (default) — per-entry body cap
 //
-// v1.0 bump rationale: 10,000 × ~3KB avg = ~30MB working set, 128MB cap = 4x
-// headroom. Handles ~333 req/sec sustained for 30s without evidence loss.
-// Previous 1,000-entry cap was defeated by any standard scanner (Nuclei, ffuf,
-// gobuster) at default rates (~50 req/sec for 30s = 1,500 requests).
+// Eviction model: memory pressure is the PRIMARY eviction trigger. When a new
+// entry would push total bytes past MaxTotalBytes, Insert evicts oldest-first
+// until it fits (counted as EvictionsBytes). MaxAge is a relaxed backstop, not
+// the hot trigger — it only sweeps entries that have sat untouched for the full
+// window.
+//
+// Age rationale (v1.0): the previous 30s cap evicted REC responses mid-pipeline.
+// During scanner bursts the LLM inference pipeline queues 30–60s+ of work, so by
+// the time the coordinator's evidence check called Lookup, the matching response
+// was already gone and the finding resolved as evidence_unavailable. Raising the
+// backstop to 10m (20× longer) keeps first-encounter evidence alive long enough
+// for the delayed evidence check to find it.
+//
+// Memory rationale: the longer retention window is offset at the deploy layer by
+// a tighter effective byte ceiling. main.go composes the cap as
+// min(REC_BUFFER_MAX_BYTES, REC_BUFFER_MAX_MB*1MB); with defaults that is 64MB,
+// down from the legacy 128MB. REC_BUFFER_MAX_MB (default 64) is the preferred
+// operator dial for memory; REC_BUFFER_MAX_BYTES remains honored for back-compat.
 //
 // All four parameters are overridable via REC_BUFFER_* env vars for operator
 // tuning without rebuilds.
@@ -35,8 +49,8 @@ import (
 const (
 	DefaultMaxEntries    = 10000
 	DefaultMaxTotalBytes = 128 * 1024 * 1024 // 128MB
-	DefaultMaxAge        = 30 * time.Second
-	DefaultMaxBodyBytes  = 2 * 1024 // 2KB per entry body preview
+	DefaultMaxAge        = 10 * time.Minute  // relaxed backstop; memory pressure is the primary trigger
+	DefaultMaxBodyBytes  = 2 * 1024          // 2KB per entry body preview
 )
 
 // Approximate bookkeeping overhead per entry (strings, ints, timestamps).
