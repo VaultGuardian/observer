@@ -224,6 +224,7 @@ func (rb *RingBuffer) Insert(resp CapturedResponse) {
 // LookupRequest contains the request attributes for L7 heuristic correlation.
 // Used by the collector to query the buffer.
 type LookupRequest struct {
+	EventID         string // event identity for ownership-safe VIP lookup; empty = legacy method+path scan
 	Method          string
 	Path            string // MUST be raw un-normalized path including query string
 	Host            string // Host header — hard filter if present on both sides

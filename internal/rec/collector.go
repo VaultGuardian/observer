@@ -843,10 +843,43 @@ func matchesVIP(resp CapturedResponse, req LookupRequest) bool {
 }
 
 // lookupVIPEvidence returns VIP-protected candidates matching the request.
+//
+// When req.EventID is set, only that event's promoted evidence is eligible:
+// an exact map lookup, gated by matchesVIP, consumed on success. This prevents
+// a different investigation that happens to share method+path+status from
+// consuming evidence PrePin promoted for THIS event. The method+path scan is
+// NOT used as a fallback in this path — that fallback is the cross-consumption
+// bug. Callers that cannot supply an EventID fall back to the legacy scan.
 func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse {
 	lc.vipMu.Lock()
 	defer lc.vipMu.Unlock()
 
+	// --- Ownership-safe path: exact event match only ---
+	if req.EventID != "" {
+		resp, ok := lc.vipEvidence[req.EventID]
+		if !ok {
+			return nil
+		}
+		if !matchesVIP(resp, req) {
+			// Entry exists but doesn't match the request shape — a correlation
+			// bug worth investigating. Keep the entry (do NOT delete): it's the
+			// best evidence for diagnosing the mismatch.
+			log.Printf("[rec:vip] Exact VIP evidence mismatch for %s: req method=%s path=%s status=%d host=%s; resp method=%s path=%s status=%d host=%s",
+				req.EventID, req.Method, req.Path, req.StatusCode, req.Host,
+				resp.Method, resp.Path, resp.StatusCode, resp.Host)
+			return nil
+		}
+		delete(lc.vipEvidence, req.EventID)
+		log.Printf("[rec:vip] Exact VIP evidence consumed for %s: status=%d method=%s path=%s",
+			req.EventID, resp.StatusCode, resp.Method, resp.Path)
+		return []CapturedResponse{resp}
+	}
+
+	// --- Legacy path (EventID absent): method+path scan, unchanged ---
+	// Consume the first matched VIP evidence after use. Only one entry is
+	// deleted per lookup — if multiple VIP evidences match (different events
+	// with similar request shapes), the remaining ones stay available for
+	// their own event's lookup.
 	var candidates []CapturedResponse
 	var consumeID string
 	for id, resp := range lc.vipEvidence {
@@ -857,12 +890,6 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 			}
 		}
 	}
-
-	// v0.52: Consume the first matched VIP evidence after use. Only one entry
-	// is deleted per lookup — if multiple VIP evidences match (different events
-	// with similar request shapes), the remaining ones stay available for their
-	// own event's lookup. LookupRequest doesn't carry eventID, so we can't do
-	// exact-event matching; consuming one-at-a-time is the safe middle ground.
 	if consumeID != "" {
 		delete(lc.vipEvidence, consumeID)
 	}

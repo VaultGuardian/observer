@@ -124,3 +124,89 @@ func TestPinVIP_EscapedPathMatchesLiteralCapture(t *testing.T) {
 		t.Errorf("evidence transport status = %d, want 200", ev.Transport.StatusCode)
 	}
 }
+
+// vipEvidenceFor builds a CapturedResponse suitable for seeding the VIP map.
+func vipEvidenceFor(path string, ts time.Time) CapturedResponse {
+	return CapturedResponse{
+		Timestamp:  ts,
+		Method:     "GET",
+		Path:       path,
+		StatusCode: 200,
+	}
+}
+
+// TestLookupVIPEvidenceDoesNotCrossConsumeSamePath is the core regression: two
+// events have promoted VIP evidence for the SAME path, and an ownership-safe
+// lookup for one event must not consume the other's evidence.
+func TestLookupVIPEvidenceDoesNotCrossConsumeSamePath(t *testing.T) {
+	const path = "/?phpinfo=1"
+	now := time.Now()
+
+	lc := &liveCollector{
+		vipPins:     make(map[string]*vipPin),
+		vipEvidence: make(map[string]CapturedResponse),
+	}
+	lc.vipEvidence["evt_a"] = vipEvidenceFor(path, now)
+	lc.vipEvidence["evt_b"] = vipEvidenceFor(path, now)
+
+	req := func(eventID string) LookupRequest {
+		return LookupRequest{
+			EventID:    eventID,
+			Method:     "GET",
+			Path:       path,
+			StatusCode: 200,
+			Timestamp:  now,
+			Window:     5 * time.Second,
+		}
+	}
+
+	// Lookup owned by evt_b consumes only evt_b; evt_a survives untouched.
+	got := lc.lookupVIPEvidence(req("evt_b"))
+	if len(got) != 1 {
+		t.Fatalf("lookup(evt_b) returned %d candidates, want 1", len(got))
+	}
+	if _, ok := lc.vipEvidence["evt_b"]; ok {
+		t.Fatal("evt_b evidence should have been consumed")
+	}
+	if _, ok := lc.vipEvidence["evt_a"]; !ok {
+		t.Fatal("evt_a evidence was cross-consumed by evt_b's lookup")
+	}
+
+	// evt_a's own lookup still finds and consumes its evidence.
+	got = lc.lookupVIPEvidence(req("evt_a"))
+	if len(got) != 1 {
+		t.Fatalf("lookup(evt_a) returned %d candidates, want 1", len(got))
+	}
+	if _, ok := lc.vipEvidence["evt_a"]; ok {
+		t.Fatal("evt_a evidence should have been consumed")
+	}
+}
+
+// TestLookupVIPEvidenceLegacyScanWhenNoEventID confirms backward compatibility:
+// with no EventID, the method+path scan still matches and consumes one entry.
+func TestLookupVIPEvidenceLegacyScanWhenNoEventID(t *testing.T) {
+	const path = "/?phpinfo=1"
+	now := time.Now()
+
+	lc := &liveCollector{
+		vipPins:     make(map[string]*vipPin),
+		vipEvidence: make(map[string]CapturedResponse),
+	}
+	lc.vipEvidence["evt_a"] = vipEvidenceFor(path, now)
+	lc.vipEvidence["evt_b"] = vipEvidenceFor(path, now)
+
+	got := lc.lookupVIPEvidence(LookupRequest{
+		// EventID intentionally empty → legacy scan.
+		Method:     "GET",
+		Path:       path,
+		StatusCode: 200,
+		Timestamp:  now,
+		Window:     5 * time.Second,
+	})
+	if len(got) == 0 {
+		t.Fatal("legacy no-EventID scan returned no candidates")
+	}
+	if len(lc.vipEvidence) != 1 {
+		t.Fatalf("legacy scan should consume exactly one entry, %d remain", len(lc.vipEvidence))
+	}
+}

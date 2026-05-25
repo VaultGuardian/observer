@@ -316,6 +316,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		// captures the literal wire path, exact-match comparison.
 		if result.Verdict == patternstore.VerdictMalicious {
 			r.collector.PinVIP(evt.ID, correlationKey, rec.LookupRequest{
+				EventID:         evt.ID,
 				Method:          method,
 				Path:            rawPath,
 				Host:            host,

@@ -183,6 +183,7 @@ func main() {
 		}
 
 		collector.PrePin(evt.ID, rec.LookupRequest{
+			EventID:         evt.ID,
 			Method:          method,
 			Path:            rawPath,
 			Host:            nHost,
@@ -713,6 +714,7 @@ func makeEvidenceCheckCallback(
 		}
 
 		evidence := collector.Lookup(rec.LookupRequest{
+			EventID:         snapshot.EventID,
 			Method:          method,
 			Path:            path,
 			Host:            host,
