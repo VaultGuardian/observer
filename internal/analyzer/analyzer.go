@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/vaultguardian/observer/internal/event"
 	"github.com/vaultguardian/observer/internal/llm"
@@ -66,8 +69,30 @@ type Analyzer struct {
 	// Optional — nil means no pre-pinning (REC disabled or not wired).
 	prePinEvidence func(evt *event.Event)
 
+	// classifyGroup coalesces concurrent Tier-1 classifications for the same
+	// scope + normalized-line + disclosure-bit into a single in-flight LLM
+	// call. A burst of identical events that all miss the pattern cache before
+	// the first verdict is learned would otherwise each acquire a slot, call
+	// the LLM, and re-learn the same pattern. One shared group covers BOTH
+	// Analyze and AnalyzeRetry — see classifyDeduped. Zero value is ready to use.
+	classifyGroup singleflight.Group
+
 	// stats uses atomic counters — safe for concurrent goroutines.
 	stats Stats
+}
+
+// classifyFlightResult is the shared outcome of one coalesced classification.
+// It is deliberately NOT an AnalysisResult: AnalysisResult carries Event: evt,
+// and sharing it would attach the leader's event/evidence to every follower.
+// Each caller builds its own per-event AnalysisResult from this via buildResult.
+type classifyFlightResult struct {
+	Verdict        *llm.Verdict              // shared LLM verdict; nil for non-llm outcomes
+	PatternLearned bool                      // whether the leader learned a pattern
+	LeaderEventID  string                    // the leader's evt.ID — used to tell leader from followers
+	Source         string                    // "llm" | "pattern" | "backpressure" | "retry_cancelled" | "error"
+	Reason         string                    // populated for "error"
+	Match          *patternstore.MatchResult // populated for "pattern" (in-flight re-check hit)
+	Err            error                     // populated for "error" (currently informational)
 }
 
 // SetPrePinFunc registers the REC evidence pre-pin callback.
@@ -259,22 +284,11 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 		a.prePinEvidence(evt)
 	}
 
-	// Try to acquire a slot from the global LLM scheduler.
-	// Non-blocking: if all slots are busy, return deferred.
-	// The pipeline will push this to a retry queue for blocking classification.
-	release, ok := a.llmScheduler.TryAcquire()
-	if !ok {
-		a.stats.LLMDropped.Add(1)
-		return AnalysisResult{
-			Event:   evt,
-			Verdict: patternstore.VerdictUnknown,
-			Reason:  "LLM concurrency limit reached — deferred to retry queue",
-			Source:  "backpressure",
-		}
-	}
-	defer release()
-
-	return a.classifyWithLLM(ctx, evt)
+	// Coalesce concurrent identical classifications. A burst of the same line
+	// attaches to one in-flight LLM call (non-blocking acquire); only the leader
+	// touches the scheduler and the pattern store. Each event still resolves to
+	// its own AnalysisResult.
+	return a.classifyDeduped(ctx, evt, hasDisclosure, false)
 }
 
 // AnalyzeRetry is called by retry workers for events deferred due to LLM backpressure.
@@ -315,24 +329,93 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 		}
 	}
 
-	// Blocking acquire — wait for a slot, this event deserves classification
-	release, ok := a.llmScheduler.AcquireBlocking(ctx)
-	if !ok {
-		return AnalysisResult{
-			Event:   evt,
-			Verdict: patternstore.VerdictUnknown,
-			Reason:  "context cancelled waiting for LLM slot",
-			Source:  "retry_cancelled",
+	// Coalesce concurrent retries of the same line into one blocking
+	// classification. The in-flight re-check inside the flight closes the race
+	// where a peer learned the pattern while we waited for a slot.
+	return a.classifyDeduped(ctx, evt, hasDisclosure, true)
+}
+
+// classifyDeduped coalesces concurrent classifications of the same event shape
+// into a single in-flight LLM call via singleflight. The key is scope +
+// normalized-line hash + disclosure bit:
+//
+//   - evt.Hash is the SHA-256 of the normalized line, so scope + hash is exact
+//     same-line dedup.
+//   - The disclosure bit is mandatory: a normalizer may scrub a raw disclosure
+//     out of NormalizedLine, so a disclosure-bearing event can share a hash with
+//     a non-disclosure one. Without the bit a disclosure event could inherit a
+//     non-disclosure leader's suppress/allow verdict, breaking the
+//     DISCLOSURE_OVERRIDE path. hasDisclosure is deterministic per (raw,
+//     normalized) line, so truly identical lines share the bit and still coalesce.
+//
+// One leader runs runClassifyFlight; every follower attaches to its result. The
+// leader is identified by LeaderEventID == evt.ID (NOT singleflight's shared
+// bool — the leader can also observe shared==true). Each caller then builds its
+// own per-event AnalysisResult.
+func (a *Analyzer) classifyDeduped(ctx context.Context, evt *event.Event, hasDisclosure, retry bool) AnalysisResult {
+	key := evt.ScopeKey() + "\x00" + evt.Hash + "\x00disc=" + strconv.FormatBool(hasDisclosure)
+
+	res, _, _ := a.classifyGroup.Do(key, func() (interface{}, error) {
+		return a.runClassifyFlight(ctx, evt, hasDisclosure, retry), nil
+	})
+
+	fr := res.(*classifyFlightResult)
+	return a.buildResult(evt, fr, retry, fr.LeaderEventID == evt.ID)
+}
+
+// runClassifyFlight is the leader-only body of a coalesced classification: it
+// holds a single scheduler slot, re-checks the pattern store, calls the LLM
+// once, and learns once. It returns a small shared result that every follower
+// reads. It must only be invoked inside classifyGroup.Do.
+func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasDisclosure, retry bool) *classifyFlightResult {
+	fr := &classifyFlightResult{LeaderEventID: evt.ID}
+
+	// Acquire one slot for the whole coalesced group. Because a single shared
+	// singleflight group covers BOTH Analyze (TryAcquire) and AnalyzeRetry
+	// (AcquireBlocking), the leader's acquire mode applies to every coalesced
+	// follower: under scheduler saturation a fresh event may block for one
+	// LLM-call duration instead of deferring, and a retry event may defer again
+	// instead of blocking. This is an accepted, bounded trade-off — it only
+	// applies within the pre-learn window for a given key and self-heals once
+	// the pattern is cached. The single shared group is intentional; do not
+	// split it (splitting would re-open the cross-path stampede).
+	var release func()
+	var ok bool
+	if retry {
+		// Blocking acquire — wait for a slot, this event deserves classification.
+		if release, ok = a.llmScheduler.AcquireBlocking(ctx); !ok {
+			fr.Source = "retry_cancelled"
+			return fr
+		}
+	} else {
+		// Non-blocking: if all slots are busy, defer to the retry queue.
+		if release, ok = a.llmScheduler.TryAcquire(); !ok {
+			a.stats.LLMDropped.Add(1)
+			fr.Source = "backpressure"
+			return fr
 		}
 	}
 	defer release()
 
-	return a.classifyWithLLM(ctx, evt)
-}
-
-// classifyWithLLM runs LLM classification and pattern learning.
-// Caller must hold an LLM scheduler slot.
-func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) AnalysisResult {
+	// In-flight re-check: a pattern for this line may have been learned out of
+	// band (operator action, T2 reclassification) since the per-event Match.
+	// Re-checking after the (possibly blocking) acquire and before the LLM call
+	// avoids a redundant classification. The disclosure-override guard mirrors
+	// Analyze/AnalyzeRetry — a cached suppress/allow on a disclosure line is not
+	// honored. We do not re-increment DisclosureOverrides here: the per-event
+	// Match already counted any poisoned cache entry, and learnFromVerdict never
+	// learns suppress/allow for a disclosure line, so no fresh such entry exists.
+	if result := a.patterns.Match(evt.ScopeKey(), evt.Hash, evt.NormalizedLine); result != nil {
+		if !(hasDisclosure && (result.Verdict == patternstore.VerdictSuppress || result.Verdict == patternstore.VerdictAllow)) {
+			a.stats.PatternHits.Add(1)
+			if retry {
+				a.stats.RetriedPatternHit.Add(1)
+			}
+			fr.Source = "pattern"
+			fr.Match = result
+			return fr
+		}
+	}
 
 	a.stats.LLMCalls.Add(1)
 
@@ -348,12 +431,10 @@ func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) Analys
 		log.Printf("[analyzer] LLM error for %s: %v", evt.ScopeKey(), err)
 
 		// On LLM failure, return unknown — don't auto-allow or auto-malicious
-		return AnalysisResult{
-			Event:   evt,
-			Verdict: patternstore.VerdictUnknown,
-			Reason:  fmt.Sprintf("LLM error: %v", err),
-			Source:  "error",
-		}
+		fr.Source = "error"
+		fr.Reason = fmt.Sprintf("LLM error: %v", err)
+		fr.Err = err
+		return fr
 	}
 
 	log.Printf("[analyzer] LLM verdict for %s: classification=%s confidence=%.2f action=%s pattern_type=%s",
@@ -374,21 +455,80 @@ func (a *Analyzer) classifyWithLLM(ctx context.Context, evt *event.Event) Analys
 		a.hints.Add(evt.ScopeKey(), hints)
 	}
 
-	// --- Step 4: Learn from the LLM's response ---
-	patternLearned := a.learnFromVerdict(evt, verdict)
+	// --- Step 4: Learn from the LLM's response (leader-only) ---
+	fr.PatternLearned = a.learnFromVerdict(evt, verdict)
+	fr.Source = "llm"
+	fr.Verdict = verdict
+	return fr
+}
 
-	// Map LLM action to our verdict type
-	v := mapActionToVerdict(verdict.Action)
+// buildResult turns a shared classifyFlightResult into this caller's own
+// AnalysisResult. Followers (isLeader == false) carry the shared verdict's flat
+// fields so routing and findings work, but NOT the *llm.Verdict — that keeps
+// followers from writing duplicate llm_decisions audit rows (resultRouter gates
+// the audit row on Source=="llm" && LLMVerdict != nil), so the audit count
+// reflects real LLM calls, not coalesced events.
+func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry, isLeader bool) AnalysisResult {
+	switch fr.Source {
+	case "pattern":
+		source := fr.Match.Pattern.Source
+		if retry {
+			source += "_retry"
+		}
+		return AnalysisResult{
+			Event:         evt,
+			Verdict:       fr.Match.Verdict,
+			Tier:          fr.Match.Tier,
+			Reason:        fr.Match.Pattern.Reason,
+			Source:        source,
+			PatternScope:  evt.ScopeKey(),
+			PatternBucket: string(fr.Match.Verdict),
+			PatternValue:  fr.Match.Pattern.Value,
+			OriginEventID: fr.Match.Pattern.CreatedFromEventID,
+		}
 
-	return AnalysisResult{
-		Event:             evt,
-		Verdict:           v,
-		Reason:            verdict.Reason,
-		Source:            "llm",
-		LLMClassification: verdict.Classification,
-		LLMConfidence:     verdict.Confidence,
-		LLMPatternLearned: patternLearned,
-		LLMVerdict:        verdict,
+	case "backpressure":
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictUnknown,
+			Reason:  "LLM concurrency limit reached — deferred to retry queue",
+			Source:  "backpressure",
+		}
+
+	case "retry_cancelled":
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictUnknown,
+			Reason:  "context cancelled waiting for LLM slot",
+			Source:  "retry_cancelled",
+		}
+
+	case "error":
+		return AnalysisResult{
+			Event:   evt,
+			Verdict: patternstore.VerdictUnknown,
+			Reason:  fr.Reason,
+			Source:  "error",
+		}
+
+	default: // "llm"
+		v := mapActionToVerdict(fr.Verdict.Action)
+		result := AnalysisResult{
+			Event:             evt,
+			Verdict:           v,
+			Reason:            fr.Verdict.Reason,
+			Source:            "llm",
+			LLMClassification: fr.Verdict.Classification,
+			LLMConfidence:     fr.Verdict.Confidence,
+		}
+		if isLeader {
+			// Only the leader carries the learn flag and the full verdict
+			// (with call metadata) for the audit trail. Followers leave
+			// LLMVerdict nil so they write no duplicate llm_decisions row.
+			result.LLMPatternLearned = fr.PatternLearned
+			result.LLMVerdict = fr.Verdict
+		}
+		return result
 	}
 }
 
