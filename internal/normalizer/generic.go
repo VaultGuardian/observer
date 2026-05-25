@@ -24,11 +24,11 @@ var (
 	// Nginx bracket timestamps: [17/Mar/2026:15:10:04 +0000]
 	reNginxTS = regexp.MustCompile(`\[\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s[+\-]\d{4}\]`)
 
-	// Common date: 2026-03-17 or 2026/03/17
-	reDate = regexp.MustCompile(`\d{4}[-/]\d{2}[-/]\d{2}`)
-
-	// Time with optional milliseconds: 15:10:04 or 15:10:04.123
-	reTime = regexp.MustCompile(`\d{2}:\d{2}:\d{2}[\.\d]*`)
+	// Bare date+time, no brackets: "2026/05/25 16:45:24" or "2026-05-25 16:45:24"
+	// (optional fractional seconds). nginx ERROR-log timestamp format. Anchored as
+	// a date+time PAIR on purpose: a naked time regex would also flatten incidental
+	// "12:34:56" substrings elsewhere in a generic log line.
+	reBareDateTime = regexp.MustCompile(`\b\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\b`)
 
 	// IP addresses (v4)
 	reIPv4 = regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`)
@@ -64,6 +64,7 @@ func (g *GenericNormalizer) Normalize(line string) string {
 	line = reISO8601.ReplaceAllString(line, "<TS>")
 	line = reNginxTS.ReplaceAllString(line, "<TS>")
 	line = reSyslog.ReplaceAllString(line, "<TS>")
+	line = reBareDateTime.ReplaceAllString(line, "<TS>") // bare nginx error-log TS, before reNumbers eats the year
 
 	// Strip UUIDs before general hex might interfere
 	line = reUUID.ReplaceAllString(line, "<UUID>")

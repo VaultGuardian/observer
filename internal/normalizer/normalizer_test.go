@@ -201,6 +201,60 @@ func TestNginxErrorLogStability(t *testing.T) {
 	}
 }
 
+// TestGenericBareNginxErrorTimestampStability covers the generic-path failure:
+// app containers that run nginx but lack "nginx" in their name (e.g.
+// srv-captain--api) route through DockerNormalizer -> GenericNormalizer, which
+// must strip the bare nginx error-log timestamp "2026/05/25 16:45:24".
+// SourceName is deliberately NOT "demo-nginx" — that would reach NginxNormalizer
+// and pass for the wrong reason.
+func TestGenericBareNginxErrorTimestampStability(t *testing.T) {
+	reg := NewRegistry()
+
+	const srcName = "srv-captain--api.1.qsgm0aq8qbclp93xxluoswmpp"
+
+	e1 := &event.Event{
+		SourceType: "docker",
+		SourceName: srcName,
+		Line:       `2026/05/25 16:45:24 [error] 10#10: *12345 access forbidden by rule, client: 1.2.3.4, server: _, request: "GET /logs/application.log HTTP/1.0"`,
+	}
+	e2 := &event.Event{
+		SourceType: "docker",
+		SourceName: srcName,
+		Line:       `2026/05/25 16:45:25 [error] 10#10: *12346 access forbidden by rule, client: 5.6.7.8, server: _, request: "GET /logs/application.log HTTP/1.0"`,
+	}
+
+	reg.NormalizeEvent(e1)
+	reg.NormalizeEvent(e2)
+
+	// Same path, one second apart → identical normalization (cache reuse).
+	if e1.Hash != e2.Hash {
+		t.Fatalf("bare nginx error timestamps one second apart did not normalize consistently:\ne1=%q\ne2=%q", e1.NormalizedLine, e2.NormalizedLine)
+	}
+
+	// Guard the routing assumption: srv-captain--api goes through the
+	// Docker→Generic path, NOT NginxNormalizer. DockerNormalizer.Family() is
+	// "docker" (it delegates to GenericNormalizer internally).
+	if got := reg.Lookup(e1).Family(); got != "docker" {
+		t.Fatalf("expected srv-captain--api to route to docker (generic delegation), got %q", got)
+	}
+
+	// The raw error-log timestamp must be gone from the normalized line.
+	if stringContains(e1.NormalizedLine, "16:45:24") {
+		t.Errorf("error-log timestamp survived normalization: %q", e1.NormalizedLine)
+	}
+
+	// Negative case: different probe paths must NOT collapse together.
+	e3 := &event.Event{
+		SourceType: "docker",
+		SourceName: srcName,
+		Line:       `2026/05/25 16:45:24 [error] 10#10: *12347 access forbidden by rule, client: 1.2.3.4, server: _, request: "GET /admin/config.php HTTP/1.0"`,
+	}
+	reg.NormalizeEvent(e3)
+	if e1.Hash == e3.Hash {
+		t.Errorf("different probe paths over-collapsed to the same hash:\ne1=%q\ne3=%q", e1.NormalizedLine, e3.NormalizedLine)
+	}
+}
+
 // TestNginxWorkerProcessNormalization verifies that nginx startup logs like
 // "start worker process 31" and "start worker process 32" hash the same.
 // This was a known issue — the generic normalizer only strips 4+ digit numbers.
