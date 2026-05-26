@@ -61,6 +61,25 @@ var reNormalizedHTTPQuoted = regexp.MustCompile(
 var reNormalizedHTTPBare = regexp.MustCompile(
 	`^(` + httpMethods + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
+// reMorganHTTP matches Format 4 — Express/morgan access logs, as emitted by
+// CapRover's captain-captain backend:
+//
+//	GET /api/keys 200 0.563 ms - 83
+//
+// Unlike Formats 1–3 there is NO "HTTP/x.x" token and the status code follows
+// the path directly. The matcher is deliberately STRICT to the observed
+// production shape — status, integer-or-decimal response time, "ms", and a
+// trailing byte count (or "-" when unknown). It does NOT support colorized/dev
+// morgan output. Requiring the full "<status> <time> ms - <bytes|->" tail is
+// what keeps this from firing on arbitrary "METHOD path 200 ..." lines.
+//
+// Tried only AFTER the HTTP/x.x parsers, so nginx-format lines never reach it.
+// Host stays empty — a morgan line carries no host; buffer.Lookup skips the
+// host filter when req.Host=="" so these events still correlate on
+// method+path+status+time-window.
+var reMorganHTTP = regexp.MustCompile(
+	`^(` + httpMethods + `)\s+(\S+)\s+(\d{3})\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+|-)`)
+
 // parseNormalizedLine extracts HTTP components from a NORMALIZED log line.
 // Tries all three formats in order: hostname-prefixed, quoted, bare.
 // Returns method, path (with query string), host, statusCode.
@@ -87,6 +106,12 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 
 	// Format 3: bare (no hostname, no quotes)
 	if m := reNormalizedHTTPBare.FindStringSubmatch(normalized); m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
+	// Format 4: Express/morgan (captain-captain) — fallback, no HTTP/x.x token.
+	if m := reMorganHTTP.FindStringSubmatch(normalized); m != nil {
 		code, _ := strconv.Atoi(m[3])
 		return m[1], m[2], "", code
 	}
@@ -124,6 +149,14 @@ func parseRawHTTPLine(raw string) (method, path, host string, statusCode int) {
 		return m[1], m[2], "", code
 	}
 
+	// Format 4: Express/morgan (captain-captain). Raw and normalized are the
+	// same shape for small numbers; the raw form preserves any 4+ digit byte
+	// count that the generic normalizer would collapse to <NUM>.
+	if m := reMorganHTTP.FindStringSubmatch(raw); m != nil {
+		code, _ := strconv.Atoi(m[3])
+		return m[1], m[2], "", code
+	}
+
 	return "", "", "", 0
 }
 
@@ -144,8 +177,21 @@ func parseRawHTTPLine(raw string) (method, path, host string, statusCode int) {
 // Returns 0 if no bytes found.
 var reResponseBytes = regexp.MustCompile(`HTTP/\S+"\s+\d{3}\s+(\d+)`)
 
+// reMorganResponseBytes extracts the trailing byte count from an Express/morgan
+// line (`... 200 0.563 ms - 83`). Requiring digits after "ms - " means a
+// trailing "-" (unknown bytes) does not match, so extractResponseBytes returns 0.
+var reMorganResponseBytes = regexp.MustCompile(`\d{3}\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+)`)
+
 func extractResponseBytes(rawLine string) int64 {
 	if m := reResponseBytes.FindStringSubmatch(rawLine); m != nil {
+		bytes, err := strconv.ParseInt(m[1], 10, 64)
+		if err == nil {
+			return bytes
+		}
+	}
+	// Morgan fallback (nginx-format has no "ms - <bytes>" tail, so this only
+	// fires for captain-captain lines).
+	if m := reMorganResponseBytes.FindStringSubmatch(rawLine); m != nil {
 		bytes, err := strconv.ParseInt(m[1], 10, 64)
 		if err == nil {
 			return bytes

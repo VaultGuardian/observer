@@ -1040,7 +1040,22 @@ func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, t
 // =============================================================================
 
 func (s *sniffer) flushLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
+	// 200ms tick + the (now 250ms-default) IdleTimeout bounds the worst-case
+	// emit delay to ~450ms after the last packet of an idle stream. This
+	// SHRINKS the race window where a fast pattern-path finalize beats the
+	// captured response into the coordinator — it does NOT eliminate races.
+	//
+	// Safe to tighten: FlushOlderThan only closes streams that have gone idle
+	// for longer than IdleTimeout. Active/large transfers keep receiving
+	// packets, so their cutoff keeps moving forward and they are never flushed
+	// mid-stream — i.e. no truncation of in-progress responses.
+	//
+	// TODO(rec): eager-emit. Emit a flow the moment a complete response is
+	// parseable (Content-Length satisfied / chunked terminator) instead of
+	// waiting for idle, which would remove the dependency on flush timing
+	// entirely. Needs a packet-injection test harness (see config_test.go TODO)
+	// to land safely.
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {

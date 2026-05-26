@@ -307,14 +307,20 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		}
 		correlationKey := fmt.Sprintf("%s|%s|%s|%d", hostKey, method, canonicalPath(normPath), statusCode)
 
-		// Fix 1: Pin VIP evidence for malicious events.
+		// Fix 1: Pin VIP evidence for malicious AND suspicious (Alert) events.
 		// The collector stores match criteria in a protected map that
 		// CANNOT be evicted by traffic floods. When a matching response
 		// arrives, the VIP callback fires immediately.
 		//
+		// VerdictAlert is included so suspicious cache-hits — which skip the
+		// LLM PrePin path entirely — still get protected evidence. Without
+		// this they got no VIP pin and their response could be evicted under
+		// load before the coordinator's evidence check ran. Malicious behavior
+		// is unchanged; the existing VIP cap (enforceVIPCapLocked) bounds growth.
+		//
 		// REC LookupRequest.Path uses the RAW path (not normalized) — REC
 		// captures the literal wire path, exact-match comparison.
-		if result.Verdict == patternstore.VerdictMalicious {
+		if result.Verdict == patternstore.VerdictMalicious || result.Verdict == patternstore.VerdictAlert {
 			r.collector.PinVIP(evt.ID, correlationKey, rec.LookupRequest{
 				EventID:         evt.ID,
 				Method:          method,

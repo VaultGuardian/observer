@@ -123,9 +123,16 @@ func LoadConfig() Config {
 		DashboardBindAddr:   getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
 		// REC reassembly tuning — response-only, bounds are tunable.
-		RECReassemblyMaxBody:                 getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
-		RECReassemblyStreamTTL:               getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
-		RECReassemblyIdleTimeout:             getEnvDuration("REC_REASSEMBLY_IDLE_TIMEOUT", 2*time.Second),
+		RECReassemblyMaxBody:   getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
+		RECReassemblyStreamTTL: getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
+		// 250ms (was 2s): a completed response should not wait on a 2s idle
+		// flush before REC emits it — fast pattern-path finalizes were beating
+		// the evidence into the coordinator, yielding "no response captured".
+		// This SHRINKS the race window (worst case ~450ms with the 200ms
+		// flushLoop tick); it does not make races impossible. Idle-only flush
+		// means active/large transfers are never truncated. Env-overridable via
+		// REC_REASSEMBLY_IDLE_TIMEOUT.
+		RECReassemblyIdleTimeout:             getEnvDuration("REC_REASSEMBLY_IDLE_TIMEOUT", 250*time.Millisecond),
 		RECReassemblyMaxBufferedPagesTotal:   getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_TOTAL", 4096),
 		RECReassemblyMaxBufferedPagesPerConn: getEnvInt("REC_REASSEMBLY_MAX_BUFFERED_PAGES_PER_CONN", 16),
 		RECReassemblyMaxActiveStreams:        getEnvInt("REC_REASSEMBLY_MAX_ACTIVE_STREAMS", 10000),
