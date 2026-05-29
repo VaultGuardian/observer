@@ -111,8 +111,8 @@ func TestConcurrentInstancesShareBufferRaceSafe(t *testing.T) {
 	writer := func(nc *namespaceCapture, tag string) {
 		for i := 0; i < n; i++ {
 			resp := makeResp("/"+tag, []byte(tag))
-			nc.sniffer.buffer.Insert(resp)    // shared buffer
-			lc.handleCapturedResponse(resp)   // shared VIP handler
+			nc.sniffer.buffer.Insert(resp)  // shared buffer
+			lc.handleCapturedResponse(resp) // shared VIP handler
 		}
 		done <- struct{}{}
 	}
