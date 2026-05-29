@@ -26,6 +26,10 @@ type Config struct {
 	RECNSContainer string
 	RECVerbose     bool
 
+	// RECExcludeContainers is the REC_EXCLUDE_CONTAINERS set (comma-separated
+	// container names). Session 2: dry-run inventory annotation only.
+	RECExcludeContainers map[string]bool
+
 	// REC port discovery.
 	//
 	// RECPorts seeds the port set REC treats as HTTP-bearing. The sniffer
@@ -173,6 +177,21 @@ func LoadConfig() Config {
 			}
 		}
 		log.Printf("[observer] Excluding containers: %s", raw)
+	}
+
+	// REC_EXCLUDE_CONTAINERS — containers to exclude from REC namespace
+	// monitoring. Session 2 uses this only to annotate the dry-run discovery
+	// inventory; matching normalizes both sides (base name, lowercased) inside
+	// the rec package, so a Swarm-suffixed or differently-cased name still matches.
+	cfg.RECExcludeContainers = make(map[string]bool)
+	if raw := getEnv("REC_EXCLUDE_CONTAINERS", ""); raw != "" {
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				cfg.RECExcludeContainers[name] = true
+			}
+		}
+		log.Printf("[rec] REC_EXCLUDE_CONTAINERS: %s", raw)
 	}
 
 	// Parse VXLAN port

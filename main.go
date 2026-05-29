@@ -118,6 +118,7 @@ func main() {
 	recCfg.VXLANPort = cfg.RECVXLANPort
 	recCfg.NSContainer = cfg.RECNSContainer
 	recCfg.Verbose = cfg.RECVerbose
+	recCfg.ExcludeContainers = cfg.RECExcludeContainers
 	recCfg.Ports = cfg.RECPorts
 	recCfg.LearnedPortCap = cfg.RECLearnedPortCap
 	// Effective byte ceiling is the tighter of the two memory knobs:

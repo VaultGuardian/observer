@@ -128,6 +128,13 @@ type CollectorConfig struct {
 
 	// Flow configures the bidirectional pairing queue bounds (v0.42.7+).
 	Flow FlowConfig
+
+	// ExcludeContainers is the REC_EXCLUDE_CONTAINERS set, keyed by raw
+	// (un-normalized) container name. Session 2 uses it ONLY to annotate the
+	// dry-run discovery inventory (mark matching containers excluded); it
+	// changes no capture behavior. Session 3 inherits it for real exclusion.
+	// Matching normalizes both sides (base name, lowercased) — see normalizeName.
+	ExcludeContainers map[string]bool
 }
 
 // DefaultCollectorConfig returns the standard defaults.
@@ -286,6 +293,14 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	}
 
 	iface := lc.config.Interface
+
+	// --- Session 2: dry-run public-container discovery (observability only) ---
+	// Opens nothing, starts no sniffers. The only effect is the inventory log.
+	if lc.config.NSContainer != "" {
+		log.Printf("[rec] Auto-discovery disabled — REC_NS_CONTAINER pinned to %q (legacy single-namespace mode)", lc.config.NSContainer)
+	} else {
+		logDiscoveryInventory(lc.config.DockerSocket, lc.config.ExcludeContainers)
+	}
 
 	// --- Build the capture set ---
 	// Today this resolves to exactly one capture source — the configured
