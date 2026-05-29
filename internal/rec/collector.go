@@ -166,6 +166,7 @@ func NewCollector(cfg CollectorConfig) EvidenceCollector {
 	return &liveCollector{
 		config:      cfg,
 		buffer:      NewRingBuffer(cfg.Buffer),
+		captures:    make(map[string]*namespaceCapture),
 		vipPins:     make(map[string]*vipPin),
 		vipEvidence: make(map[string]CapturedResponse),
 	}
@@ -242,10 +243,23 @@ type vipPin struct {
 //   responses by checking nginx upstream_response_time == "-".
 
 type liveCollector struct {
-	config  CollectorConfig
-	buffer  *RingBuffer
-	sniffer *sniffer    // stored for stats access
-	running atomic.Bool // atomic — Start() and Lookup() can race
+	config CollectorConfig
+	buffer *RingBuffer
+
+	// captures holds one namespaceCapture per capture source, keyed by a stable
+	// id (container name, or "host"). Today exactly one entry resolved from
+	// cfg.NSContainer; later sessions add more via auto-discovery. All instances
+	// feed the single shared buffer + VIP store below.
+	captures map[string]*namespaceCapture
+	capMu    sync.Mutex
+
+	// running is RETAINED only as a manual/white-box gate: an existing test sets
+	// it directly, and Enabled() ORs it in. Production never sets it — namespace
+	// liveness is tracked per-instance (namespaceCapture.running), and Enabled()
+	// reports "at least one namespace active". This deliberately replaces the old
+	// global "last read loop alive" semantics that were the root of the
+	// single-namespace bug (one dead loop must not disable the collector).
+	running atomic.Bool
 
 	// Fix 1: VIP lane for malicious evidence
 	vipMu       sync.Mutex
@@ -273,68 +287,75 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	iface := lc.config.Interface
 
-	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.LearnedPortCap, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
-
-	// Fix 1: Wire sniffer capture callback for VIP lane.
-	// Every successfully parsed response fires this callback.
-	// The callback checks VIP pins and resolves matches immediately.
-	s.onCapture = lc.handleCapturedResponse
-
-	lc.sniffer = s
-
-	// --- Decide capture mode: namespace or host ---
-	var fd int
-	var err error
-	captureMode := "host"
-
+	// --- Build the capture set ---
+	// Today this resolves to exactly one capture source — the configured
+	// namespace container (REC_NS_CONTAINER) or the host. Later sessions expand
+	// this to N instances via auto-discovery; the collector machinery below is
+	// already N-safe (shared buffer/VIP, per-instance liveness, partial-failure
+	// isolation). Key by container name, or "host".
+	key := "host"
 	if lc.config.NSContainer != "" {
-		// Namespace capture mode: find container PID, open socket in its namespace.
-		// This is required for single-node Swarm where overlay traffic stays
-		// inside Docker's network namespaces and never touches the host.
-		info, findErr := findContainerPID(lc.config.DockerSocket, lc.config.NSContainer)
-		if findErr != nil {
-			log.Printf("[rec] Namespace capture requested for %q but container not found: %v — falling back to host capture",
-				lc.config.NSContainer, findErr)
-			// Fall back to host capture
-			fd, err = s.openSocket()
-		} else {
-			log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
-				info.Name, info.PID)
-			fd, err = openSocketInNamespace(info.PID)
-			if err != nil {
-				log.Printf("[rec] Namespace socket failed: %v — falling back to host capture", err)
-				fd, err = s.openSocket()
-			} else {
-				captureMode = fmt.Sprintf("namespace:%s(pid=%d)", info.Name, info.PID)
-			}
-		}
-	} else {
-		// Host capture mode (default)
-		fd, err = s.openSocket()
+		key = lc.config.NSContainer
 	}
 
-	if err != nil {
+	s := newSniffer(lc.buffer, iface, lc.config.Ports, lc.config.LearnedPortCap, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
+
+	// Fix 1: Wire this instance's sniffer into the SHARED VIP handler. Every
+	// successfully parsed response fires this callback regardless of which
+	// namespace captured it — the VIP pins/evidence maps are owned by the
+	// collector, not the sniffer, so all instances resolve against one store.
+	s.onCapture = lc.handleCapturedResponse
+
+	nc := &namespaceCapture{name: key, sniffer: s}
+	lc.capMu.Lock()
+	lc.captures[key] = nc
+	lc.capMu.Unlock()
+
+	// --- Decide capture mode: namespace or host ---
+	// The opener replicates today's namespace→host fallback exactly, including
+	// log lines, and records the resolved mode for the startup line below. It
+	// runs synchronously inside startCapture, preserving the pre-refactor log
+	// ordering (sniffer reassembly/flow lines, then namespace logs, then the
+	// aggregate "started" line).
+	captureMode := "host"
+	open := func() (int, error) {
+		if lc.config.NSContainer != "" {
+			// Namespace capture mode: find container PID, open socket in its
+			// namespace. Required for single-node Swarm where overlay traffic
+			// stays inside Docker's network namespaces and never touches the host.
+			info, findErr := findContainerPID(lc.config.DockerSocket, lc.config.NSContainer)
+			if findErr != nil {
+				log.Printf("[rec] Namespace capture requested for %q but container not found: %v — falling back to host capture",
+					lc.config.NSContainer, findErr)
+				return s.openSocket() // fall back to host capture
+			}
+			log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
+				info.Name, info.PID)
+			nc.containerID = info.ID
+			nc.pid = info.PID
+			fd, nsErr := openSocketInNamespace(info.PID)
+			if nsErr != nil {
+				log.Printf("[rec] Namespace socket failed: %v — falling back to host capture", nsErr)
+				return s.openSocket()
+			}
+			captureMode = fmt.Sprintf("namespace:%s(pid=%d)", info.Name, info.PID)
+			return fd, nil
+		}
+		// Host capture mode (default)
+		return s.openSocket()
+	}
+
+	if err := lc.startCapture(ctx, nc, open); err != nil {
+		// At N=1, a failed sole instance means zero captures started — preserve
+		// today's behavior exactly: report the error so the pipeline runs
+		// without REC. (At N>1, later sessions return nil when at least one
+		// instance starts; the failed ones keep their lastError and the healthy
+		// ones keep capturing — see startCapture.)
 		return fmt.Errorf("REC capture failed to start: %w", err)
 	}
 
-	// Socket is open and verified — NOW we can mark as running
-	lc.running.Store(true)
-
-	// Launch read loop goroutine (socket already open)
-	go func() {
-		s.readLoop(ctx, fd)
-		lc.running.Store(false)
-	}()
-
-	// Launch cleanup goroutine for stale pending requests
-	go s.cleanupLoop(ctx)
-
-	// Phase 3: launch reassembly flush goroutine (no-op if reassembly disabled).
-	// Periodically flushes idle streams from the assembler so their httpStream
-	// goroutines can exit cleanly via EOF.
-	go s.flushLoop(ctx)
-
-	// Fix 1: Launch VIP cleanup goroutine (expire stale pins)
+	// Fix 1: Launch VIP cleanup goroutine (expire stale pins). Collector-level,
+	// bound to the parent ctx — NOT stopped by Close() (see Close()).
 	go lc.vipCleanupLoop(ctx)
 
 	ifaceDesc := iface
@@ -359,7 +380,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 // Lookup performs L7 heuristic correlation.
 // Fix 1: Checks VIP-protected evidence first, then falls back to ring buffer.
 func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
-	if !lc.running.Load() {
+	if !lc.Enabled() {
 		return &Evidence{
 			Status:                EvidenceNotAvailableCollectorDisabled,
 			CorrelationConfidence: ConfidenceNone,
@@ -468,59 +489,98 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 	}
 }
 
+// Enabled reports whether REC is actively capturing — defined as "at least one
+// namespace is active", not "the last read loop is alive". This is the crux of
+// the multi-namespace refactor: one dead/failed instance must not disable the
+// collector while siblings keep capturing.
 func (lc *liveCollector) Enabled() bool {
-	return lc.running.Load()
+	// Manual/white-box override: an existing test sets lc.running directly.
+	// Production never sets it; liveness comes from the per-instance flags below.
+	if lc.running.Load() {
+		return true
+	}
+	// NOTE: this takes capMu. Lookup is hot (fires ~14x/event during bursts),
+	// but at realistic N this is one mutex + a tiny map walk — negligible. If
+	// lock contention ever shows up under load, replace with a lockless
+	// activeCount atomic bumped by startCapture / Close.
+	lc.capMu.Lock()
+	defer lc.capMu.Unlock()
+	for _, c := range lc.captures {
+		if c.running.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 func (lc *liveCollector) Stats() RECStats {
 	stats := RECStats{}
-	if lc.sniffer != nil {
-		stats.PacketsSeen = atomic.LoadInt64(&lc.sniffer.packetCount)
-		stats.VXLANUnwrapped = atomic.LoadInt64(&lc.sniffer.vxlanCount)
+
+	// Aggregate across all capture instances. At N=1 (today's config) the sums
+	// equal the single-sniffer values, so this is byte-for-byte identical to the
+	// pre-refactor stats. The sniffer counters and flow state live per-instance;
+	// the buffer and VIP counters below are collector-wide (shared).
+	lc.capMu.Lock()
+	caps := make([]*namespaceCapture, 0, len(lc.captures))
+	for _, c := range lc.captures {
+		caps = append(caps, c)
+	}
+	lc.capMu.Unlock()
+
+	for _, c := range caps {
+		s := c.sniffer
+		if s == nil {
+			continue
+		}
+		stats.PacketsSeen += atomic.LoadInt64(&s.packetCount)
+		stats.VXLANUnwrapped += atomic.LoadInt64(&s.vxlanCount)
 
 		// Inline parser
-		stats.InlineRequests = atomic.LoadInt64(&lc.sniffer.inlineRequests)
-		stats.InlineDuplicateDrops = atomic.LoadInt64(&lc.sniffer.inlineDuplicateDrops)
-		stats.InlineBodySkips = atomic.LoadInt64(&lc.sniffer.inlineBodySkips)
+		stats.InlineRequests += atomic.LoadInt64(&s.inlineRequests)
+		stats.InlineDuplicateDrops += atomic.LoadInt64(&s.inlineDuplicateDrops)
+		stats.InlineBodySkips += atomic.LoadInt64(&s.inlineBodySkips)
 
 		// Response reassembly
-		stats.ReassemblyStreamsActive = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsActive)
-		stats.ReassemblyStreamsTotal = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsTotal)
-		stats.ReassemblyStreamsTimedOut = atomic.LoadInt64(&lc.sniffer.reassemblyStreamsTimedOut)
-		stats.ReassemblyStreamDrops = atomic.LoadInt64(&lc.sniffer.reassemblyStreamDrops)
-		stats.ReassemblyResponses = atomic.LoadInt64(&lc.sniffer.reassemblyResponses)
-		stats.ReassemblyParseErrors = atomic.LoadInt64(&lc.sniffer.reassemblyParseErrors)
+		stats.ReassemblyStreamsActive += atomic.LoadInt64(&s.reassemblyStreamsActive)
+		stats.ReassemblyStreamsTotal += atomic.LoadInt64(&s.reassemblyStreamsTotal)
+		stats.ReassemblyStreamsTimedOut += atomic.LoadInt64(&s.reassemblyStreamsTimedOut)
+		stats.ReassemblyStreamDrops += atomic.LoadInt64(&s.reassemblyStreamDrops)
+		stats.ReassemblyResponses += atomic.LoadInt64(&s.reassemblyResponses)
+		stats.ReassemblyParseErrors += atomic.LoadInt64(&s.reassemblyParseErrors)
 
 		// Pairing
-		stats.PairImmediate = atomic.LoadInt64(&lc.sniffer.pairImmediate)
-		stats.OrphanResponses = atomic.LoadInt64(&lc.sniffer.orphanResponses)
-		stats.RequestsExpired = atomic.LoadInt64(&lc.sniffer.requestsExpired)
+		stats.PairImmediate += atomic.LoadInt64(&s.pairImmediate)
+		stats.OrphanResponses += atomic.LoadInt64(&s.orphanResponses)
+		stats.RequestsExpired += atomic.LoadInt64(&s.requestsExpired)
 
 		// Flow state
-		lc.sniffer.flowsMu.Lock()
-		stats.FlowStates = int64(len(lc.sniffer.flows))
-		lc.sniffer.flowsMu.Unlock()
-		stats.FlowEvictions = atomic.LoadInt64(&lc.sniffer.flowEvictions)
-		stats.FlowEvictionsLive = atomic.LoadInt64(&lc.sniffer.flowEvictionsLive)
+		s.flowsMu.Lock()
+		stats.FlowStates += int64(len(s.flows))
+		s.flowsMu.Unlock()
+		stats.FlowEvictions += atomic.LoadInt64(&s.flowEvictions)
+		stats.FlowEvictionsLive += atomic.LoadInt64(&s.flowEvictionsLive)
 
-		stats.FeedHTTP = atomic.LoadInt64(&lc.sniffer.feedHTTP)
+		stats.FeedHTTP += atomic.LoadInt64(&s.feedHTTP)
 
-		// Port registry telemetry (v0.47.1)
-		if lc.sniffer.ports != nil {
-			ps := lc.sniffer.ports.stats()
-			stats.PortConfiguredCount = ps.ConfiguredCount
-			stats.PortLearnedCount = ps.LearnedCount
-			stats.PortLearnAttempts = ps.LearnedAttempts
-			stats.PortLearnAdded = ps.LearnedAdded
-			stats.PortLearnRefused = ps.LearnedRefused
-			stats.PortLearnCap = ps.LearnCap
+		// Port registry telemetry (v0.47.1). Summed across instances; at N=1
+		// this equals the single registry. (A per-namespace breakdown is a later
+		// session — aggregate-only here.)
+		if s.ports != nil {
+			ps := s.ports.stats()
+			stats.PortConfiguredCount += ps.ConfiguredCount
+			stats.PortLearnedCount += ps.LearnedCount
+			stats.PortLearnAttempts += ps.LearnedAttempts
+			stats.PortLearnAdded += ps.LearnedAdded
+			stats.PortLearnRefused += ps.LearnedRefused
+			stats.PortLearnCap += ps.LearnCap
 		}
-
-		// Dashboard backward compat
-		stats.HTTPRequests = stats.InlineRequests
-		stats.HTTPResponses = stats.ReassemblyResponses
-		stats.PairMisses = stats.OrphanResponses
 	}
+
+	// Dashboard backward compat
+	stats.HTTPRequests = stats.InlineRequests
+	stats.HTTPResponses = stats.ReassemblyResponses
+	stats.PairMisses = stats.OrphanResponses
+
 	if lc.buffer != nil {
 		bs := lc.buffer.Stats()
 		stats.BufferEntries = bs.Entries
@@ -589,7 +649,7 @@ func (lc *liveCollector) PinVIP(eventID string, correlationKey string, req Looku
 // onCapture callback releases buffer.mu before calling handleCapturedResponse
 // which takes vipMu. No deadlock cycle.
 func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
-	if !lc.running.Load() {
+	if !lc.Enabled() {
 		return
 	}
 
