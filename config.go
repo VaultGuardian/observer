@@ -30,6 +30,11 @@ type Config struct {
 	// container names). Session 2: dry-run inventory annotation only.
 	RECExcludeContainers map[string]bool
 
+	// RECMaxNamespaces caps how many discovered public-facing containers
+	// auto-detect mode monitors concurrently. Default 16. Excess containers
+	// are dropped (sorted by name) and logged as security blind spots.
+	RECMaxNamespaces int
+
 	// REC port discovery.
 	//
 	// RECPorts seeds the port set REC treats as HTTP-bearing. The sniffer
@@ -99,16 +104,17 @@ type Config struct {
 // LoadConfig reads configuration from environment variables with sane defaults.
 func LoadConfig() Config {
 	cfg := Config{
-		DockerSocket:   getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
-		DataDir:        getEnv("DATA_DIR", "/data"),
-		LLMURL:         getEnv("LLM_URL", "http://llm:11434"),
-		LLMModel:       getEnv("LLM_MODEL", "qwen2.5:7b"),
-		LLMAPIKey:      getEnv("LLM_API_KEY", ""),
-		SelfID:         getEnv("HOSTNAME", ""),
-		RECEnabled:     getEnv("REC_ENABLED", "") == "true",
-		RECInterface:   getEnv("REC_INTERFACE", ""),
-		RECNSContainer: getEnv("REC_NS_CONTAINER", ""),
-		RECVerbose:     getEnv("REC_VERBOSE", "") == "true",
+		DockerSocket:     getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
+		DataDir:          getEnv("DATA_DIR", "/data"),
+		LLMURL:           getEnv("LLM_URL", "http://llm:11434"),
+		LLMModel:         getEnv("LLM_MODEL", "qwen2.5:7b"),
+		LLMAPIKey:        getEnv("LLM_API_KEY", ""),
+		SelfID:           getEnv("HOSTNAME", ""),
+		RECEnabled:       getEnv("REC_ENABLED", "") == "true",
+		RECInterface:     getEnv("REC_INTERFACE", ""),
+		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
+		RECVerbose:       getEnv("REC_VERBOSE", "") == "true",
+		RECMaxNamespaces: getEnvInt("REC_MAX_NAMESPACES", 16),
 		// REC_LEARNED_PORT_CAP allows zero (= disable learning).
 		// Resolved below since getEnvInt rejects non-positive values.
 		RECLearnedPortCap: 64,

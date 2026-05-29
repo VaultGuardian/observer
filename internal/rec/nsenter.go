@@ -207,10 +207,19 @@ func findContainerPID(dockerSocket, namePattern string) (*containerInfo, error) 
 		return nil, fmt.Errorf("no running container matching %q found", namePattern)
 	}
 
-	// Inspect the container for its PID
-	inspectResp, err := client.Get(fmt.Sprintf("http://localhost/containers/%s/json", matchID))
+	return inspectContainerPID(dockerSocket, matchID, matchName)
+}
+
+// inspectContainerPID resolves a container's host-namespace PID by its exact
+// container ID (GET /containers/<id>/json → State.Pid). Auto-detect mode calls
+// this directly with the discovery inventory's container ID, which is precise —
+// substring name matching could resolve the wrong container.
+func inspectContainerPID(dockerSocket, id, name string) (*containerInfo, error) {
+	client := newDockerClient(dockerSocket)
+
+	inspectResp, err := client.Get(fmt.Sprintf("http://localhost/containers/%s/json", id))
 	if err != nil {
-		return nil, fmt.Errorf("inspecting container %s: %w", matchID, err)
+		return nil, fmt.Errorf("inspecting container %s: %w", id, err)
 	}
 	defer inspectResp.Body.Close()
 
@@ -224,12 +233,12 @@ func findContainerPID(dockerSocket, namePattern string) (*containerInfo, error) 
 	}
 
 	if inspect.State.Pid == 0 {
-		return nil, fmt.Errorf("container %s has PID 0 (not running?)", matchName)
+		return nil, fmt.Errorf("container %s has PID 0 (not running?)", name)
 	}
 
 	return &containerInfo{
-		ID:   shortID(matchID),
-		Name: matchName,
+		ID:   shortID(id),
+		Name: name,
 		PID:  inspect.State.Pid,
 	}, nil
 }

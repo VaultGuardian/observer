@@ -200,17 +200,6 @@ func classifyContainers(containers []dockerContainer, exclude map[string]bool) d
 	return inv
 }
 
-// logDiscoveryInventory fetches, classifies, and logs the dry-run inventory.
-// Non-fatal on fetch error — discovery is preview-only and must never block capture.
-func logDiscoveryInventory(dockerSocket string, exclude map[string]bool) {
-	containers, err := fetchRunningContainers(dockerSocket)
-	if err != nil {
-		log.Printf("[rec] Discovery (dry-run): Docker query failed: %v — inventory unavailable", err)
-		return
-	}
-	logInventory(classifyContainers(containers, exclude))
-}
-
 // logInventory emits the [rec]-prefixed startup inventory.
 func logInventory(inv discoveryInventory) {
 	log.Printf("[rec] Discovery (dry-run): %d running containers — %d public-facing TCP, %d excluded, %d skipped",
@@ -224,7 +213,35 @@ func logInventory(inv discoveryInventory) {
 	for _, sc := range inv.Skipped {
 		log.Printf("[rec]   skipped:       %s (%s)", sc.Name, sc.Reason)
 	}
-	log.Printf("[rec] Discovery is preview-only — no namespaces monitored yet; Session 3 starts per-namespace capture.")
+	log.Printf("[rec] Opening a namespace capture per public-facing container above (excluded/skipped are not monitored).")
+}
+
+// privatePorts returns the container-side TCP ports of a public container — the
+// ports REC sees from inside the namespace (e.g. captain-captain's 80, not host 3000).
+func privatePorts(ports []tcpPublish) []int {
+	out := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p.PrivatePort > 0 {
+			out = append(out, p.PrivatePort)
+		}
+	}
+	return out
+}
+
+// unionPorts merges two port lists, dropping non-positive values and duplicates
+// while preserving first-seen order (base before extra).
+func unionPorts(base, extra []int) []int {
+	seen := make(map[int]bool, len(base)+len(extra))
+	out := make([]int, 0, len(base)+len(extra))
+	for _, list := range [][]int{base, extra} {
+		for _, p := range list {
+			if p > 0 && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // formatPublishes renders TCP publishes as "tcp host:3000→ctr:80, host:443→ctr:443".
