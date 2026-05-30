@@ -92,17 +92,19 @@ func (lc *liveCollector) startCapture(parent context.Context, nc *namespaceCaptu
 // via parent-ctx cancellation (unchanged by this refactor), and this method
 // exists for deterministic teardown in tests.
 //
-// IMPORTANT: Close() stops only the per-capture goroutines (readLoop / cleanup
-// / flush). It does NOT stop collector-level loops such as vipCleanupLoop,
-// which are bound to the parent ctx and stop only when that ctx is cancelled.
-// A goroutine-leak check that goes through Start() must therefore cancel the
-// parent ctx too — Close() alone is not full teardown.
-//
-// Session 3 breadcrumb: when Close() is promoted onto the EvidenceCollector
-// interface and into main.go shutdown, it must also stop vipCleanupLoop (track
-// it with a collector-level cancel / waitgroup) or that goroutine will leak on
-// real shutdown.
+// Session 7: in auto-detect mode Close() FIRST stops the runtime reconciliation
+// manager (events listener, rescan ticker, reconcile loop, and vipCleanupLoop —
+// all owned by mgrCancel/mgrWG) and joins them, THEN tears down the captures.
+// Stopping the manager first guarantees no in-flight reconcile is mutating the
+// captures map while we snapshot and cancel it below. In legacy NSContainer mode
+// mgrCancel is nil (no manager runs); vipCleanupLoop there is still bound to the
+// parent ctx and stops only on parent cancel — unchanged from prior behavior.
 func (lc *liveCollector) Close() {
+	if lc.mgrCancel != nil {
+		lc.mgrCancel()
+		lc.mgrWG.Wait()
+	}
+
 	lc.capMu.Lock()
 	caps := make([]*namespaceCapture, 0, len(lc.captures))
 	for _, c := range lc.captures {

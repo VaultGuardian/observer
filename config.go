@@ -35,6 +35,12 @@ type Config struct {
 	// are dropped (sorted by name) and logged as security blind spots.
 	RECMaxNamespaces int
 
+	// RECRescanInterval is the period of the auto-detect mode rescan ticker
+	// (Session 7). The ticker re-runs discovery and reconciles the monitored
+	// namespace set, as a backstop to the Docker /events listener. Default 60s.
+	// Auto-detect mode only; ignored in legacy REC_NS_CONTAINER mode.
+	RECRescanInterval time.Duration
+
 	// REC port discovery.
 	//
 	// RECPorts seeds the port set REC treats as HTTP-bearing. The sniffer
@@ -104,17 +110,18 @@ type Config struct {
 // LoadConfig reads configuration from environment variables with sane defaults.
 func LoadConfig() Config {
 	cfg := Config{
-		DockerSocket:     getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
-		DataDir:          getEnv("DATA_DIR", "/data"),
-		LLMURL:           getEnv("LLM_URL", "http://llm:11434"),
-		LLMModel:         getEnv("LLM_MODEL", "qwen2.5:7b"),
-		LLMAPIKey:        getEnv("LLM_API_KEY", ""),
-		SelfID:           getEnv("HOSTNAME", ""),
-		RECEnabled:       getEnv("REC_ENABLED", "") == "true",
-		RECInterface:     getEnv("REC_INTERFACE", ""),
-		RECNSContainer:   getEnv("REC_NS_CONTAINER", ""),
-		RECVerbose:       getEnv("REC_VERBOSE", "") == "true",
-		RECMaxNamespaces: getEnvInt("REC_MAX_NAMESPACES", 16),
+		DockerSocket:      getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
+		DataDir:           getEnv("DATA_DIR", "/data"),
+		LLMURL:            getEnv("LLM_URL", "http://llm:11434"),
+		LLMModel:          getEnv("LLM_MODEL", "qwen2.5:7b"),
+		LLMAPIKey:         getEnv("LLM_API_KEY", ""),
+		SelfID:            getEnv("HOSTNAME", ""),
+		RECEnabled:        getEnv("REC_ENABLED", "") == "true",
+		RECInterface:      getEnv("REC_INTERFACE", ""),
+		RECNSContainer:    getEnv("REC_NS_CONTAINER", ""),
+		RECVerbose:        getEnv("REC_VERBOSE", "") == "true",
+		RECMaxNamespaces:  getEnvInt("REC_MAX_NAMESPACES", 16),
+		RECRescanInterval: getEnvDuration("REC_RESCAN_INTERVAL", 60*time.Second),
 		// REC_LEARNED_PORT_CAP allows zero (= disable learning).
 		// Resolved below since getEnvInt rejects non-positive values.
 		RECLearnedPortCap: 64,

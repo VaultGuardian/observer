@@ -141,10 +141,20 @@ type CollectorConfig struct {
 	// mode monitors. 0 → DefaultMaxNamespaces. Excess are dropped (sorted by name)
 	// and logged as security blind spots.
 	MaxNamespaces int
+
+	// RescanInterval is the period of the Session 7 auto-detect rescan ticker —
+	// the backstop that re-runs discovery and reconciles the monitored namespace
+	// set if a Docker /events notification is missed. 0 → DefaultRescanInterval.
+	// Auto-detect mode only; legacy NSContainer mode never starts the ticker.
+	RescanInterval time.Duration
 }
 
 // DefaultMaxNamespaces bounds auto-detect monitoring when REC_MAX_NAMESPACES is unset.
 const DefaultMaxNamespaces = 16
+
+// DefaultRescanInterval is the auto-detect rescan ticker period when
+// REC_RESCAN_INTERVAL is unset (Session 7).
+const DefaultRescanInterval = 60 * time.Second
 
 // DefaultCollectorConfig returns the standard defaults.
 func DefaultCollectorConfig() CollectorConfig {
@@ -157,6 +167,7 @@ func DefaultCollectorConfig() CollectorConfig {
 		DockerSocket:   "/var/run/docker.sock",
 		NSContainer:    "", // empty = host namespace
 		MaxNamespaces:  DefaultMaxNamespaces,
+		RescanInterval: DefaultRescanInterval,
 		LearnedPortCap: 64, // bounded runtime port learning
 		Reassembly:     DefaultReassemblyConfig(),
 		Flow:           DefaultFlowConfig(),
@@ -284,6 +295,21 @@ type liveCollector struct {
 	vipEvidence map[string]CapturedResponse // eventID → matched response (protected)
 	onVIPMatch  func(correlationKey string) // push callback → coordinator
 	vipMatches  int64                       // telemetry counter
+
+	// Session 7: runtime namespace reconciliation lifecycle. Set ONLY in
+	// auto-detect mode by Start() (nil/zero in legacy NSContainer mode, so no
+	// manager goroutines run there). mgrCancel + mgrWG own the events listener,
+	// the rescan ticker, the reconcile loop, AND vipCleanupLoop so Close() stops
+	// them all without leaking. reconcileCh is a cap-1 coalescing trigger fed by
+	// both the events listener and the ticker; a single reconcileLoop goroutine
+	// drains it, so reconciles never run concurrently. deps/vxlanPort are
+	// captured at Start() so the reconcile path reuses the exact startup open
+	// path (and tests inject fakes via deps).
+	mgrCancel   context.CancelFunc
+	mgrWG       sync.WaitGroup
+	reconcileCh chan struct{}
+	deps        autoDetectDeps
+	vxlanPort   uint16
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
@@ -309,11 +335,43 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// fix — REC now sees the backend/overlay traffic that a single host capture
 	// misses (e.g. captain-captain's port-3000-in-host-mode bypass). ---
 	if lc.config.NSContainer == "" {
-		return lc.startAutoDetect(ctx, iface, vxlanPort, autoDetectDeps{
+		deps := autoDetectDeps{
 			fetch:     func() ([]dockerContainer, error) { return fetchRunningContainers(lc.config.DockerSocket) },
 			openerFor: lc.dockerNamespaceOpener,
 			hostOpen:  func(nc *namespaceCapture) (int, error) { return nc.sniffer.openSocket() },
-		})
+			pidFor: func(id, name string) (int, error) {
+				info, err := inspectContainerPID(lc.config.DockerSocket, id, name)
+				if err != nil {
+					return 0, err
+				}
+				return info.PID, nil
+			},
+		}
+		// Capture deps + resolved VXLAN port so the Session 7 reconcile path
+		// rebuilds captures through the exact startup open path.
+		lc.deps = deps
+		lc.vxlanPort = vxlanPort
+
+		if err := lc.startAutoDetect(ctx, iface, vxlanPort, deps); err != nil {
+			// Total failure (zero captures) — REC disabled, no manager. Preserves
+			// today's error path.
+			return err
+		}
+
+		// Auto-detect established ≥1 capture. Launch the runtime reconciliation
+		// manager (Session 7): Docker /events listener + periodic rescan ticker,
+		// both feeding one serialized reconcile loop, plus vipCleanupLoop — all
+		// owned by mgrCtx/mgrWG so Close() stops them without leaking. mgrCtx is a
+		// child of the Start() parent ctx, so parent cancel still propagates.
+		mgrCtx, cancel := context.WithCancel(ctx)
+		lc.mgrCancel = cancel
+		lc.reconcileCh = make(chan struct{}, 1)
+		lc.mgrWG.Add(4)
+		go func() { defer lc.mgrWG.Done(); lc.reconcileLoop(mgrCtx) }()
+		go func() { defer lc.mgrWG.Done(); lc.rescanTicker(mgrCtx) }()
+		go func() { defer lc.mgrWG.Done(); lc.eventsListener(mgrCtx) }()
+		go func() { defer lc.mgrWG.Done(); lc.vipCleanupLoop(mgrCtx) }()
+		return nil
 	}
 
 	// --- Legacy single-namespace mode (REC_NS_CONTAINER set) ---
@@ -367,6 +425,13 @@ type autoDetectDeps struct {
 	fetch     func() ([]dockerContainer, error)
 	openerFor func(pc publicContainer, nc *namespaceCapture) func() (int, error)
 	hostOpen  func(nc *namespaceCapture) (int, error)
+
+	// pidFor resolves a container's current host PID by exact ID, used by the
+	// Session 7 reconcile to DETECT an in-place PID change (the redeploy/restart
+	// repair path). Production wires inspectContainerPID; tests inject a fake.
+	// The opener (openerFor) independently re-resolves the PID when it actually
+	// opens the socket, so pidFor is detection-only.
+	pidFor func(id, name string) (int, error)
 }
 
 // startAutoDetect discovers public-facing containers and opens one namespace
@@ -405,18 +470,18 @@ func (lc *liveCollector) startAutoDetect(ctx context.Context, iface string, vxla
 		return lc.startHost(ctx, iface, vxlanPort, deps.hostOpen)
 	}
 
-	go lc.vipCleanupLoop(ctx)
+	// vipCleanupLoop is launched once by Start() (bound to mgrCtx), not here, so
+	// Close() can stop it — see Start()'s auto-detect manager launch.
 	lc.logStarted(fmt.Sprintf("%d namespaces active", started), iface, vxlanPort)
 	return nil
 }
 
-// startDiscoveredCaptures builds and starts one capture per public container,
-// applying the REC_MAX_NAMESPACES cap (sorted deterministically by name). A
-// per-container open failure records its lastError and is skipped; siblings keep
-// running. Returns the number started and the number attempted (post-cap).
-func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []publicContainer, iface string, vxlanPort uint16,
-	openerFor func(pc publicContainer, nc *namespaceCapture) func() (int, error)) (started, attempted int) {
-
+// applyNamespaceCap sorts public containers deterministically (by name, then ID),
+// applies the REC_MAX_NAMESPACES cap, and logs each container dropped by the cap
+// as a SECURITY BLIND SPOT. It is the single source of truth for cap + sort +
+// dropped-logging shared by the startup path (startDiscoveredCaptures) and the
+// Session 7 runtime reconcile. Mutates and returns the kept prefix of public.
+func (lc *liveCollector) applyNamespaceCap(public []publicContainer) []publicContainer {
 	sort.Slice(public, func(i, j int) bool {
 		if public[i].Name != public[j].Name {
 			return public[i].Name < public[j].Name
@@ -435,6 +500,17 @@ func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []p
 		}
 		public = public[:max]
 	}
+	return public
+}
+
+// startDiscoveredCaptures builds and starts one capture per public container,
+// applying the REC_MAX_NAMESPACES cap (sorted deterministically by name). A
+// per-container open failure records its lastError and is skipped; siblings keep
+// running. Returns the number started and the number attempted (post-cap).
+func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []publicContainer, iface string, vxlanPort uint16,
+	openerFor func(pc publicContainer, nc *namespaceCapture) func() (int, error)) (started, attempted int) {
+
+	public = lc.applyNamespaceCap(public)
 
 	for _, pc := range public {
 		attempted++
@@ -454,15 +530,29 @@ func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []p
 	return started, attempted
 }
 
+// openHostCapture builds and starts the single host-namespace capture (keyed
+// "host", empty container ID). It is the shared open path used by both the
+// startup host fallback (startHost) and the Session 7 runtime host-invariant
+// reopen. Returns the started instance, or an error if the socket fails to open.
+// It emits NO startup log and launches NO collector-level goroutine — callers
+// decide logging (startup tell vs. quiet runtime line).
+func (lc *liveCollector) openHostCapture(ctx context.Context, iface string, vxlanPort uint16, hostOpen func(nc *namespaceCapture) (int, error)) (*namespaceCapture, error) {
+	nc := lc.buildNamespaceCapture("host", "", lc.config.Ports, iface, vxlanPort)
+	if err := lc.startCapture(ctx, nc, func() (int, error) { return hostOpen(nc) }); err != nil {
+		return nil, fmt.Errorf("REC capture failed to start: %w", err)
+	}
+	return nc, nil
+}
+
 // startHost starts a single host capture (the pre-Session-3 auto-detect behavior).
 // Used as the fallback backstop. Returns an error only if the host capture itself
 // fails to start (zero instances → REC disabled, per the partial-failure rule).
 func (lc *liveCollector) startHost(ctx context.Context, iface string, vxlanPort uint16, hostOpen func(nc *namespaceCapture) (int, error)) error {
-	nc := lc.buildNamespaceCapture("host", "", lc.config.Ports, iface, vxlanPort)
-	if err := lc.startCapture(ctx, nc, func() (int, error) { return hostOpen(nc) }); err != nil {
-		return fmt.Errorf("REC capture failed to start: %w", err)
+	if _, err := lc.openHostCapture(ctx, iface, vxlanPort, hostOpen); err != nil {
+		return err
 	}
-	go lc.vipCleanupLoop(ctx)
+	// vipCleanupLoop is launched once by Start() (bound to mgrCtx) in auto-detect
+	// mode, not here, so Close() can stop it.
 	lc.logStarted("host", iface, vxlanPort)
 	return nil
 }

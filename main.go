@@ -120,6 +120,7 @@ func main() {
 	recCfg.Verbose = cfg.RECVerbose
 	recCfg.ExcludeContainers = cfg.RECExcludeContainers
 	recCfg.MaxNamespaces = cfg.RECMaxNamespaces
+	recCfg.RescanInterval = cfg.RECRescanInterval
 	recCfg.Ports = cfg.RECPorts
 	recCfg.LearnedPortCap = cfg.RECLearnedPortCap
 	// Effective byte ceiling is the tighter of the two memory knobs:
