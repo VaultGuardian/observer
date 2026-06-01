@@ -71,6 +71,20 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 // Append-only: keeps original verdict, adds resolution metadata.
 // Used by the reconciler goroutine for timeout finalization and by the
 // VIP push callback for immediate resolution.
+//
+// Resolution transitions are monotonic by trust, not just by pending-ness:
+//
+//   - A trusted positive resolution (status == "resolved", e.g. REC evidence /
+//     LLM / human re-evaluation) may move a finding pending → resolved AND
+//     evidence_unavailable → resolved. This lets a correct verdict that arrives
+//     after the timeout reconciler already stamped evidence_unavailable still
+//     heal the row.
+//   - Any other write (notably the timeout reconciler's evidence_unavailable)
+//     keeps the original narrow eligibility: it only touches rows that are
+//     empty / pending / NULL, so it can never clobber a resolved row.
+//
+// QueryUnresolvedMalicious already keeps the timeout path off resolved and
+// downgraded rows; this guard makes the store enforce the invariant directly.
 func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, status string, method string, newVerdict string) error {
 	now := time.Now().Format(time.RFC3339)
 
@@ -84,6 +98,13 @@ func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, sta
 		return fmt.Errorf("lookup current verdict for %s: %w", eventID, err)
 	}
 
+	// Trusted resolutions may additionally override a terminal
+	// evidence_unavailable row; the timeout path may not.
+	eligibility := "(resolution_status = '' OR resolution_status = 'pending' OR resolution_status IS NULL)"
+	if status == "resolved" {
+		eligibility = "(resolution_status = '' OR resolution_status = 'pending' OR resolution_status IS NULL OR resolution_status = 'evidence_unavailable')"
+	}
+
 	result, err := s.db.ExecContext(ctx, `UPDATE findings SET
 		resolution_status = ?,
 		resolved_at = ?,
@@ -92,7 +113,7 @@ func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, sta
 		verdict = CASE WHEN ? != '' THEN ? ELSE verdict END,
 		downgraded = CASE WHEN ? = 'resolved' AND ? IN ('downgraded', 'recon_failed') THEN 1 ELSE downgraded END,
 		downgrade_reason = CASE WHEN ? = 'resolved' AND ? IN ('downgraded', 'recon_failed') THEN ? ELSE downgrade_reason END
-	WHERE event_id = ? AND (resolution_status = '' OR resolution_status = 'pending' OR resolution_status IS NULL)`,
+	WHERE event_id = ? AND `+eligibility,
 		status, now, method, currentVerdict,
 		newVerdict, newVerdict,
 		status, newVerdict,
