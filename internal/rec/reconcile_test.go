@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -531,6 +535,71 @@ func TestNextBackoff(t *testing.T) {
 	}
 	if got := nextBackoff(max, max); got != max {
 		t.Fatalf("nextBackoff(30s) = %s, want 30s (stays capped)", got)
+	}
+}
+
+// TestDockerClientTimeouts pins the contract that the streaming client carries
+// no whole-request deadline (which would cut the long-lived /events body read),
+// while the one-shot client keeps its 10s deadline.
+func TestDockerClientTimeouts(t *testing.T) {
+	if got := newDockerStreamClient("").Timeout; got != 0 {
+		t.Fatalf("newDockerStreamClient Timeout = %s, want 0 (no overall deadline)", got)
+	}
+	if got := newDockerClient("").Timeout; got != 10*time.Second {
+		t.Fatalf("newDockerClient Timeout = %s, want 10s (one-shot deadline)", got)
+	}
+}
+
+// TestBackoffAfterStream covers the pure reconnect-delay decision: a healthy
+// stream (event seen OR long-lived) resets to 1s; an unhealthy one doubles
+// toward the cap. No sleeps.
+func TestBackoffAfterStream(t *testing.T) {
+	max := 30 * time.Second
+	if got := backoffAfterStream(16*time.Second, max, true); got != time.Second {
+		t.Fatalf("healthy backoff = %s, want 1s reset", got)
+	}
+	if got := backoffAfterStream(time.Second, max, false); got != 2*time.Second {
+		t.Fatalf("unhealthy backoff = %s, want 2s (doubled)", got)
+	}
+	if got := backoffAfterStream(16*time.Second, max, false); got != max {
+		t.Fatalf("unhealthy backoff = %s, want 30s (capped)", got)
+	}
+}
+
+// TestStreamEvents_NonOK verifies a non-200 from /events is turned into an error
+// for the backoff/reconnect loop and is NEVER fed to the event decoder (so no
+// reconcile is triggered). The httptest server listens on a unix socket so
+// streamEvents exercises its real dial + status-check path.
+func TestStreamEvents_NonOK(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	srv.Listener.Close() // drop the default TCP listener
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+
+	lc := bareCollector()
+	lc.config.DockerSocket = sock
+	lc.reconcileCh = make(chan struct{}, 1)
+
+	got, err := lc.streamEvents(context.Background())
+	if err == nil {
+		t.Fatal("want error on non-200, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("err = %v, want mention of HTTP 500", err)
+	}
+	if got {
+		t.Fatal("no event should be reported for a non-200 response")
+	}
+	if len(lc.reconcileCh) != 0 {
+		t.Fatalf("triggers = %d, want 0 (non-200 must not decode events)", len(lc.reconcileCh))
 	}
 }
 

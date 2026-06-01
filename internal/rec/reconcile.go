@@ -2,8 +2,10 @@
 package rec
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -321,26 +323,28 @@ const eventsURL = `http://localhost/events?filters={"type":["container"],"event"
 // during the gap.
 func (lc *liveCollector) eventsListener(ctx context.Context) {
 	const maxBackoff = 30 * time.Second
+	// A healthy /events connection can stay quiet for minutes, so "zero events"
+	// alone must not look unhealthy — a long-lived stream that simply had nothing
+	// to report counts as healthy too.
+	const healthyStreamThreshold = 1 * time.Minute
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		gotEvent, err := lc.streamEvents(ctx)
+		lived := time.Since(start)
 		if ctx.Err() != nil {
 			return
 		}
-		if gotEvent {
-			backoff = time.Second // healthy stream that later dropped → fast reconnect
-		}
+		healthy := gotEvent || lived >= healthyStreamThreshold
+		backoff = backoffAfterStream(backoff, maxBackoff, healthy)
 		log.Printf("[rec] Reconcile: Docker event stream ended (%v) — reconnecting in %s; periodic rescan holds coverage meanwhile", err, backoff)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
-		}
-		if !gotEvent {
-			backoff = nextBackoff(backoff, maxBackoff)
 		}
 	}
 }
@@ -355,11 +359,20 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 	return next
 }
 
+// backoffAfterStream resets to 1s after a healthy stream, else grows toward max.
+// Pure so the decision is unit-testable without sleeping.
+func backoffAfterStream(cur, max time.Duration, healthy bool) time.Duration {
+	if healthy {
+		return time.Second
+	}
+	return nextBackoff(cur, max)
+}
+
 // streamEvents opens one Docker /events connection and consumes it until the
 // stream ends or ctx is cancelled. Returns whether at least one event was
 // decoded (so the caller can reset backoff on a previously-healthy stream).
 func (lc *liveCollector) streamEvents(ctx context.Context) (gotEvent bool, err error) {
-	client := newDockerClient(lc.config.DockerSocket)
+	client := newDockerStreamClient(lc.config.DockerSocket)
 	req, reqErr := http.NewRequestWithContext(ctx, "GET", eventsURL, nil)
 	if reqErr != nil {
 		return false, reqErr
@@ -369,6 +382,10 @@ func (lc *liveCollector) streamEvents(ctx context.Context) (gotEvent bool, err e
 		return false, doErr
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, fmt.Errorf("docker /events returned HTTP %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+	}
 	return lc.consumeEvents(ctx, resp.Body)
 }
 

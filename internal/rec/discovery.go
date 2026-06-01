@@ -115,6 +115,25 @@ func newDockerClient(dockerSocket string) *http.Client {
 	}
 }
 
+// newDockerStreamClient builds a unix-socket HTTP client for long-lived streams
+// (the /events subscription). Unlike newDockerClient it sets no overall Timeout,
+// since http.Client.Timeout is a whole-request deadline that would also cut the
+// streaming body read. ResponseHeaderTimeout still bounds a hung server's headers.
+func newDockerStreamClient(dockerSocket string) *http.Client {
+	if dockerSocket == "" {
+		dockerSocket = "/var/run/docker.sock"
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.DialTimeout("unix", dockerSocket, 5*time.Second)
+			},
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+		Timeout: 0,
+	}
+}
+
 // fetchRunningContainers lists running containers via the Docker API, using the
 // same server-side status filter the watcher uses.
 func fetchRunningContainers(dockerSocket string) ([]dockerContainer, error) {
