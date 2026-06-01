@@ -56,6 +56,19 @@ const (
 	DefaultFinalizeWindow    = 10 * time.Second
 	DefaultGraveyardTTL      = 300 * time.Second
 	maxPendingInvestigations = 100
+
+	// DefaultMaxEvidenceCheckWait caps how long the timeout dispatch will
+	// defer to an in-flight evidence check. It must be >= the LLM client
+	// timeout (60s, internal/llm/client.go) so the check always either
+	// completes or the LLM call itself times out first; a result arriving
+	// after this cap is dropped by design (the store-layer monotonic
+	// resolution is the backstop for that residual).
+	DefaultMaxEvidenceCheckWait = 70 * time.Second
+
+	// defaultDispatchRetryInterval is how often investigationLoop re-checks
+	// whether a deferred timeout can finalize. Stored on the Coordinator so
+	// tests can shrink it for determinism.
+	defaultDispatchRetryInterval = 500 * time.Millisecond
 )
 
 // DispatchFunc is called when a pending alert is finalized.
@@ -198,18 +211,24 @@ type FinalizedOutcome struct {
 
 // Coordinator manages pending alert investigations and the graveyard.
 type Coordinator struct {
-	mu             sync.Mutex
-	pending        map[string]*PendingAlert
-	graveyard      map[string]*FinalizedOutcome
-	checking       map[string]bool // v0.52: singleflight guard for evidence checks
-	catchAll       *CatchAllTracker
-	selfSuppress   *SelfSuppressor
-	evidenceWindow time.Duration
-	finalizeWindow time.Duration
-	graveyardTTL   time.Duration
-	dispatch       DispatchFunc
-	evidenceCheck  EvidenceCheckFunc
-	ctx            context.Context
+	mu        sync.Mutex
+	pending   map[string]*PendingAlert
+	graveyard map[string]*FinalizedOutcome
+	checking  map[string]bool // v0.52: singleflight guard for evidence checks
+	// v0.53: start time of each in-flight evidence check, keyed identically
+	// to `checking`. dispatchTimedOut consults this to defer (bounded) to a
+	// check that is racing the finalize deadline.
+	checkingSince         map[string]time.Time
+	catchAll              *CatchAllTracker
+	selfSuppress          *SelfSuppressor
+	evidenceWindow        time.Duration
+	finalizeWindow        time.Duration
+	graveyardTTL          time.Duration
+	maxEvidenceCheckWait  time.Duration
+	dispatchRetryInterval time.Duration
+	dispatch              DispatchFunc
+	evidenceCheck         EvidenceCheckFunc
+	ctx                   context.Context
 
 	// Section 3 follow-up: telemetry for the
 	// host-aware coordinator key. Counts new investigations created with
@@ -222,19 +241,21 @@ type Coordinator struct {
 
 // Config holds coordinator settings.
 type Config struct {
-	EvidenceWindow    time.Duration
-	FinalizeWindow    time.Duration
-	GraveyardTTL      time.Duration
-	CatchAllThreshold int
+	EvidenceWindow       time.Duration
+	FinalizeWindow       time.Duration
+	GraveyardTTL         time.Duration
+	MaxEvidenceCheckWait time.Duration
+	CatchAllThreshold    int
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		EvidenceWindow:    DefaultEvidenceWindow,
-		FinalizeWindow:    DefaultFinalizeWindow,
-		GraveyardTTL:      DefaultGraveyardTTL,
-		CatchAllThreshold: DefaultCatchAllThreshold,
+		EvidenceWindow:       DefaultEvidenceWindow,
+		FinalizeWindow:       DefaultFinalizeWindow,
+		GraveyardTTL:         DefaultGraveyardTTL,
+		MaxEvidenceCheckWait: DefaultMaxEvidenceCheckWait,
+		CatchAllThreshold:    DefaultCatchAllThreshold,
 	}
 }
 
@@ -249,18 +270,24 @@ func New(ctx context.Context, cfg Config, dispatch DispatchFunc, evidenceCheck E
 	if cfg.GraveyardTTL == 0 {
 		cfg.GraveyardTTL = DefaultGraveyardTTL
 	}
+	if cfg.MaxEvidenceCheckWait == 0 {
+		cfg.MaxEvidenceCheckWait = DefaultMaxEvidenceCheckWait
+	}
 	c := &Coordinator{
-		pending:        make(map[string]*PendingAlert),
-		graveyard:      make(map[string]*FinalizedOutcome),
-		checking:       make(map[string]bool),
-		catchAll:       NewCatchAllTracker(cfg.CatchAllThreshold, verifyFunc),
-		selfSuppress:   selfSuppress,
-		evidenceWindow: cfg.EvidenceWindow,
-		finalizeWindow: cfg.FinalizeWindow,
-		graveyardTTL:   cfg.GraveyardTTL,
-		dispatch:       dispatch,
-		evidenceCheck:  evidenceCheck,
-		ctx:            ctx,
+		pending:               make(map[string]*PendingAlert),
+		graveyard:             make(map[string]*FinalizedOutcome),
+		checking:              make(map[string]bool),
+		checkingSince:         make(map[string]time.Time),
+		catchAll:              NewCatchAllTracker(cfg.CatchAllThreshold, verifyFunc),
+		selfSuppress:          selfSuppress,
+		evidenceWindow:        cfg.EvidenceWindow,
+		finalizeWindow:        cfg.FinalizeWindow,
+		graveyardTTL:          cfg.GraveyardTTL,
+		maxEvidenceCheckWait:  cfg.MaxEvidenceCheckWait,
+		dispatchRetryInterval: defaultDispatchRetryInterval,
+		dispatch:              dispatch,
+		evidenceCheck:         evidenceCheck,
+		ctx:                   ctx,
 	}
 
 	go c.graveyardCleanup()
@@ -515,7 +542,21 @@ finalize:
 	}
 
 dispatch:
-	c.dispatchTimedOut(key)
+	// Bounded retry: dispatchTimedOut returns false while an evidence check
+	// is in flight for this key (within maxEvidenceCheckWait), letting that
+	// check own the final dispatch. Once it clears — or the cap is exceeded —
+	// dispatchTimedOut finalizes and returns true. Runs in this same
+	// goroutine (no new goroutines, no lock held across the wait).
+	for {
+		if c.dispatchTimedOut(key) {
+			return
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.dispatchRetryInterval):
+		}
+	}
 }
 
 // dispatchTimedOut handles the timeout dispatch at the end of investigationLoop.
@@ -523,14 +564,30 @@ dispatch:
 // Section 3 / Findings 4+5: builds the FinalAlert under the lock, then
 // dispatches outside the lock. Phase 3 fallback (catch-all by bytes) is
 // also evaluated under the lock with the same discipline.
-func (c *Coordinator) dispatchTimedOut(key string) {
+//
+// v0.53: returns true when the investigation is finalized (or already gone),
+// and false only when it defers to an in-flight evidence check that is racing
+// this deadline. The caller (investigationLoop) re-arms a bounded retry on
+// false so the timeout never deletes the pending entry out from under a check.
+func (c *Coordinator) dispatchTimedOut(key string) bool {
 	var finalAlert *FinalAlert
 
 	c.mu.Lock()
 	pending, ok := c.pending[key]
 	if !ok || pending.Dispatched {
 		c.mu.Unlock()
-		return
+		return true
+	}
+
+	// v0.53: an evidence check is in flight for this key. Defer the timeout
+	// (within the bounded wait) and let the check own the final dispatch —
+	// this is the fix for the dropped-verdict race where the timeout deleted
+	// the pending entry while the check was still running. checkingSince is
+	// measured from the current check's start so the cap bounds a single
+	// (possibly wedged) LLM call. Past the cap, fall through and finalize.
+	if c.checking[key] && time.Since(c.checkingSince[key]) < c.maxEvidenceCheckWait {
+		c.mu.Unlock()
+		return false
 	}
 
 	// --- Phase 3: ResponseBytes fallback for REC-miss events ---
@@ -555,7 +612,7 @@ func (c *Coordinator) dispatchTimedOut(key string) {
 			log.Printf("[coordinator] Investigation resolved: CATCH-ALL FALLBACK (REC-miss) key=%s events=%d reason=%s",
 				key, pending.EventCount, truncateStr(fallbackReason, 100))
 			c.dispatch(*finalAlert)
-			return
+			return true
 		}
 	}
 
@@ -567,6 +624,7 @@ func (c *Coordinator) dispatchTimedOut(key string) {
 	c.mu.Unlock()
 
 	c.dispatch(*finalAlert)
+	return true
 }
 
 // tryEvidenceCheck snapshots the pending alert, runs the (pure) evidence
@@ -597,6 +655,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		return false
 	}
 	c.checking[key] = true
+	c.checkingSince[key] = time.Now()
 	snapshot := *pending
 	c.mu.Unlock()
 
@@ -608,6 +667,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 
 	c.mu.Lock()
 	delete(c.checking, key) // release singleflight guard
+	delete(c.checkingSince, key)
 	pending, ok = c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		c.mu.Unlock()
@@ -801,6 +861,17 @@ func (c *Coordinator) graveyardCleanup() {
 			for key, tomb := range c.graveyard {
 				if now.Sub(tomb.FinalizedAt) > c.graveyardTTL || (tomb.EvidenceBased && now.Sub(tomb.FinalizedAt) > 30*time.Second) {
 					delete(c.graveyard, key)
+				}
+			}
+			// v0.53: sweep stale singleflight entries. In the normal case the
+			// evidence check clears these itself; this only catches a check
+			// that never returns (wedged LLM past its own timeout), which
+			// would otherwise grow the maps unbounded. 2x the cap guarantees
+			// any legitimate check has long finished and cleared its entry.
+			for key, since := range c.checkingSince {
+				if now.Sub(since) > 2*c.maxEvidenceCheckWait {
+					delete(c.checkingSince, key)
+					delete(c.checking, key)
 				}
 			}
 			c.mu.Unlock()
