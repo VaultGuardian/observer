@@ -149,7 +149,8 @@ func (lc *liveCollector) reconcileOnce(ctx context.Context) {
 	}
 
 	inv := classifyContainers(containers, lc.config.ExcludeContainers)
-	capped := lc.applyNamespaceCap(inv.Public) // shared sort+cap+dropped-logging
+	capped, dropped := lc.applyNamespaceCap(inv.Public) // shared sort+cap+dropped-logging
+	lc.retainCoverage(inv, dropped)                     // refresh the coverage-status model
 
 	desired := make(map[string]desiredCapture, len(capped))
 	for _, pc := range capped {
@@ -187,8 +188,7 @@ func (lc *liveCollector) reconcileOnce(ctx context.Context) {
 func (lc *liveCollector) applyOpen(ctx context.Context, a reconcileAction) {
 	pc := a.desired.pc
 	snifferPorts := unionPorts(lc.config.Ports, privatePorts(pc.Ports))
-	nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, lc.config.Interface, lc.vxlanPort)
-	nc.ports = privatePorts(pc.Ports)
+	nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, privatePorts(pc.Ports), lc.config.Interface, lc.vxlanPort)
 	if err := lc.startCapture(ctx, nc, lc.deps.openerFor(pc, nc)); err != nil {
 		// lastError already set on nc by startCapture; entry stays in the map
 		// (matches startup behavior). Siblings unaffected.
@@ -216,8 +216,7 @@ func (lc *liveCollector) applyRepair(ctx context.Context, a reconcileAction) {
 
 	pc := a.desired.pc
 	snifferPorts := unionPorts(lc.config.Ports, privatePorts(pc.Ports))
-	nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, lc.config.Interface, lc.vxlanPort)
-	nc.ports = privatePorts(pc.Ports)
+	nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, privatePorts(pc.Ports), lc.config.Interface, lc.vxlanPort)
 	if err := lc.startCapture(ctx, nc, lc.deps.openerFor(pc, nc)); err != nil {
 		log.Printf("[rec] Reconcile: reopen for %q failed: %v — continuing", pc.Name, err)
 	}

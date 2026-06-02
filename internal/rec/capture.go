@@ -56,14 +56,21 @@ func (lc *liveCollector) startCapture(parent context.Context, nc *namespaceCaptu
 
 	fd, err := open()
 	if err != nil {
+		// lastError/startedAt are read by Coverage() under capMu; this instance is
+		// already published in the captures map, so guard the writes with capMu to
+		// keep that read race-free. running stays an atomic, set outside the lock.
+		lc.capMu.Lock()
 		nc.lastError = err.Error()
+		lc.capMu.Unlock()
 		nc.running.Store(false)
 		cancel()
 		return err
 	}
 
+	lc.capMu.Lock()
 	nc.startedAt = time.Now()
 	nc.lastError = ""
+	lc.capMu.Unlock()
 	nc.running.Store(true)
 
 	nc.wg.Add(3)

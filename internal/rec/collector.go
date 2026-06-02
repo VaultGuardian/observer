@@ -39,6 +39,12 @@ type EvidenceCollector interface {
 	// Safe to call from any goroutine. Returns zero stats if disabled.
 	Stats() RECStats
 
+	// Coverage returns a snapshot of what REC is covering right now (active
+	// captures + skipped/excluded/cap-dropped classifications + host-fallback
+	// state). Safe to call from any goroutine. Returns a "disabled" snapshot if
+	// the collector is a no-op.
+	Coverage() RECCoverage
+
 	// --- Fix 1: VIP Lane for Malicious Evidence ---
 
 	// PinVIP registers interest in evidence for a malicious event.
@@ -211,6 +217,7 @@ type noOpCollector struct {
 func (n *noOpCollector) Start(ctx context.Context) error                                 { return nil }
 func (n *noOpCollector) Enabled() bool                                                   { return false }
 func (n *noOpCollector) Stats() RECStats                                                 { return RECStats{} }
+func (n *noOpCollector) Coverage() RECCoverage                                           { return RECCoverage{Mode: "disabled"} }
 func (n *noOpCollector) PinVIP(eventID string, correlationKey string, req LookupRequest) {}
 func (n *noOpCollector) PrePin(eventID string, req LookupRequest)                        {}
 func (n *noOpCollector) SetVIPCallback(fn func(correlationKey string))                   {}
@@ -310,6 +317,16 @@ type liveCollector struct {
 	reconcileCh chan struct{}
 	deps        autoDetectDeps
 	vxlanPort   uint16
+
+	// Session 4: retained discovery classification for the coverage-status
+	// model. Auto-detect mode writes lastInventory + droppedByCap at startup and
+	// on every reconcile (the classify+cap step); Coverage() reads them. Guarded
+	// by coverageMu, which is NEVER held simultaneously with capMu — Coverage()
+	// snapshots captures under capMu, releases it, then reads the inventory under
+	// coverageMu. Legacy NSContainer mode never populates these (no discovery).
+	coverageMu    sync.Mutex
+	lastInventory discoveryInventory
+	droppedByCap  []publicContainer
 }
 
 func (lc *liveCollector) Start(ctx context.Context) error {
@@ -379,7 +396,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// configured namespace, host fallback on failure, same logs.
 	log.Printf("[rec] Auto-discovery disabled — REC_NS_CONTAINER pinned to %q (legacy single-namespace mode)", lc.config.NSContainer)
 
-	nc := lc.buildNamespaceCapture(lc.config.NSContainer, "", lc.config.Ports, iface, vxlanPort)
+	nc := lc.buildNamespaceCapture(lc.config.NSContainer, "", lc.config.Ports, nil, iface, vxlanPort)
 
 	captureMode := "host"
 	open := func() (int, error) {
@@ -394,8 +411,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 		}
 		log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
 			info.Name, info.PID)
-		nc.containerID = info.ID
-		nc.pid = info.PID
+		lc.setCaptureIdentity(nc, info.ID, info.PID)
 		fd, nsErr := openSocketInNamespace(info.PID)
 		if nsErr != nil {
 			log.Printf("[rec] Namespace socket failed: %v — falling back to host capture", nsErr)
@@ -449,13 +465,20 @@ func (lc *liveCollector) startAutoDetect(ctx context.Context, iface string, vxla
 	inv := classifyContainers(containers, lc.config.ExcludeContainers)
 	logInventory(inv)
 
+	// Cap up front (shared sort+cap+dropped-logging) and retain the full
+	// classification + dropped set for the coverage-status model. Retain runs
+	// before the host-fallback check below so Skipped/Excluded/DroppedByCap are
+	// reported even when we fall back to a host capture.
+	capped, dropped := lc.applyNamespaceCap(inv.Public)
+	lc.retainCoverage(inv, dropped)
+
 	if len(inv.Public) == 0 {
 		// Fallback 2 (benign): nothing public to monitor — host capture backstop.
 		log.Printf("[rec] Auto-detect: no public-facing containers discovered — falling back to single host capture")
 		return lc.startHost(ctx, iface, vxlanPort, deps.hostOpen)
 	}
 
-	started, attempted := lc.startDiscoveredCaptures(ctx, inv.Public, iface, vxlanPort, deps.openerFor)
+	started, attempted := lc.startDiscoveredCaptures(ctx, capped, iface, vxlanPort, deps.openerFor)
 	if started == 0 {
 		// Fallback 3 (NOT benign): every namespace socket failed to open. This
 		// indicates a broken namespace mechanism, not absent work — call it out
@@ -480,8 +503,11 @@ func (lc *liveCollector) startAutoDetect(ctx context.Context, iface string, vxla
 // applies the REC_MAX_NAMESPACES cap, and logs each container dropped by the cap
 // as a SECURITY BLIND SPOT. It is the single source of truth for cap + sort +
 // dropped-logging shared by the startup path (startDiscoveredCaptures) and the
-// Session 7 runtime reconcile. Mutates and returns the kept prefix of public.
-func (lc *liveCollector) applyNamespaceCap(public []publicContainer) []publicContainer {
+// Session 7 runtime reconcile. Mutates and returns the kept prefix of public,
+// plus the containers dropped by the cap (Session 4: retained for the
+// coverage-status model rather than only logged). dropped is a fresh slice so
+// the caller can retain it without aliasing the kept prefix's backing array.
+func (lc *liveCollector) applyNamespaceCap(public []publicContainer) (kept, dropped []publicContainer) {
 	sort.Slice(public, func(i, j int) bool {
 		if public[i].Name != public[j].Name {
 			return public[i].Name < public[j].Name
@@ -494,33 +520,33 @@ func (lc *liveCollector) applyNamespaceCap(public []publicContainer) []publicCon
 		max = DefaultMaxNamespaces
 	}
 	if len(public) > max {
-		for _, pc := range public[max:] {
+		dropped = append(dropped, public[max:]...)
+		for _, pc := range dropped {
 			log.Printf("[rec] WARNING: REC_MAX_NAMESPACES=%d reached — NOT monitoring public container %q (%s) — SECURITY BLIND SPOT",
 				max, pc.Name, formatPublishes(pc.Ports))
 		}
 		public = public[:max]
 	}
-	return public
+	return public, dropped
 }
 
-// startDiscoveredCaptures builds and starts one capture per public container,
-// applying the REC_MAX_NAMESPACES cap (sorted deterministically by name). A
-// per-container open failure records its lastError and is skipped; siblings keep
-// running. Returns the number started and the number attempted (post-cap).
+// startDiscoveredCaptures builds and starts one capture per public container.
+// The caller (startAutoDetect) has already applied the REC_MAX_NAMESPACES cap,
+// so public is the kept (post-cap) set. A per-container open failure records its
+// lastError and is skipped; siblings keep running. Returns the number started
+// and the number attempted.
 func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []publicContainer, iface string, vxlanPort uint16,
 	openerFor func(pc publicContainer, nc *namespaceCapture) func() (int, error)) (started, attempted int) {
-
-	public = lc.applyNamespaceCap(public)
 
 	for _, pc := range public {
 		attempted++
 		// Seed the sniffer with the union (defaults + this container's private
-		// ports) so content-learning still works for anything else.
+		// ports) so content-learning still works for anything else. nc.ports
+		// records only the container-side (private) ports as metadata; it is set
+		// inside buildNamespaceCapture (before the capMu publish) so Coverage()
+		// can read it race-free.
 		snifferPorts := unionPorts(lc.config.Ports, privatePorts(pc.Ports))
-		nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, iface, vxlanPort)
-		// nc.ports records only the container-side (private) ports as metadata;
-		// the sniffer above is intentionally seeded with the wider union.
-		nc.ports = privatePorts(pc.Ports)
+		nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, privatePorts(pc.Ports), iface, vxlanPort)
 		if err := lc.startCapture(ctx, nc, openerFor(pc, nc)); err != nil {
 			log.Printf("[rec] Namespace capture for %q failed: %v — continuing with others", pc.Name, err)
 			continue
@@ -537,7 +563,7 @@ func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []p
 // It emits NO startup log and launches NO collector-level goroutine — callers
 // decide logging (startup tell vs. quiet runtime line).
 func (lc *liveCollector) openHostCapture(ctx context.Context, iface string, vxlanPort uint16, hostOpen func(nc *namespaceCapture) (int, error)) (*namespaceCapture, error) {
-	nc := lc.buildNamespaceCapture("host", "", lc.config.Ports, iface, vxlanPort)
+	nc := lc.buildNamespaceCapture("host", "", lc.config.Ports, nil, iface, vxlanPort)
 	if err := lc.startCapture(ctx, nc, func() (int, error) { return hostOpen(nc) }); err != nil {
 		return nil, fmt.Errorf("REC capture failed to start: %w", err)
 	}
@@ -569,8 +595,7 @@ func (lc *liveCollector) dockerNamespaceOpener(pc publicContainer, nc *namespace
 		}
 		log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
 			info.Name, info.PID)
-		nc.containerID = info.ID
-		nc.pid = info.PID
+		lc.setCaptureIdentity(nc, info.ID, info.PID)
 		fd, nsErr := openSocketInNamespace(info.PID)
 		if nsErr != nil {
 			return -1, fmt.Errorf("opening namespace socket for %s: %w", pc.Name, nsErr)
@@ -583,7 +608,11 @@ func (lc *liveCollector) dockerNamespaceOpener(pc publicContainer, nc *namespace
 // wraps it in a namespaceCapture, and registers it under capMu. Key = name (or
 // "host"); on collision with a non-empty container ID the key is suffixed with the
 // short ID so scaled replicas (same base name) are each monitored, not overwritten.
-func (lc *liveCollector) buildNamespaceCapture(name, id string, snifferPorts []int, iface string, vxlanPort uint16) *namespaceCapture {
+//
+// privPorts is the container-side (private) port metadata recorded on the
+// instance; it is set BEFORE the capMu publish so Coverage() can read nc.ports
+// race-free under capMu (host/legacy callers pass nil — no discovered ports).
+func (lc *liveCollector) buildNamespaceCapture(name, id string, snifferPorts, privPorts []int, iface string, vxlanPort uint16) *namespaceCapture {
 	s := newSniffer(lc.buffer, iface, snifferPorts, lc.config.LearnedPortCap, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
 	// Wire this instance's sniffer into the SHARED VIP handler. Every parsed
 	// response fires this callback regardless of which namespace captured it —
@@ -591,7 +620,7 @@ func (lc *liveCollector) buildNamespaceCapture(name, id string, snifferPorts []i
 	// resolve against one store.
 	s.onCapture = lc.handleCapturedResponse
 
-	nc := &namespaceCapture{name: name, containerID: id, sniffer: s}
+	nc := &namespaceCapture{name: name, containerID: id, ports: privPorts, sniffer: s}
 
 	lc.capMu.Lock()
 	key := name
@@ -604,6 +633,19 @@ func (lc *liveCollector) buildNamespaceCapture(name, id string, snifferPorts []i
 	lc.captures[key] = nc
 	lc.capMu.Unlock()
 	return nc
+}
+
+// setCaptureIdentity records the opener-resolved container ID + PID on nc under
+// capMu. The opener resolves these AFTER the instance is published into the
+// captures map, so the write must be synchronized with Coverage()'s
+// capMu-guarded read. No caller holds capMu when its opener runs (the open
+// closure executes inside startCapture, after buildNamespaceCapture released
+// capMu), so this never deadlocks.
+func (lc *liveCollector) setCaptureIdentity(nc *namespaceCapture, id string, pid int) {
+	lc.capMu.Lock()
+	nc.containerID = id
+	nc.pid = pid
+	lc.capMu.Unlock()
 }
 
 // logStarted emits the aggregate startup line, byte-identical across legacy,
