@@ -185,6 +185,7 @@ func (s *Server) Start() error {
 	mux.Handle("/api/findings", s.requireAuth(http.HandlerFunc(s.handleFindings)))
 	mux.Handle("/api/findings/counts", s.requireAuth(http.HandlerFunc(s.handleFindingCounts)))
 	mux.Handle("/api/stats", s.requireAuth(http.HandlerFunc(s.handleStats)))
+	mux.Handle("/api/rec/coverage", s.requireAuth(http.HandlerFunc(s.handleRECCoverage)))
 	mux.Handle("/api/patterns", s.requireAuth(http.HandlerFunc(s.handlePatterns)))
 	mux.Handle("/api/patterns/delete", s.requireAuth(http.HandlerFunc(s.handleDeletePattern)))
 	mux.Handle("/api/decisions", s.requireAuth(http.HandlerFunc(s.handleDecisions)))
@@ -486,6 +487,20 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, result)
+}
+
+// handleRECCoverage surfaces the REC coverage-status model: what REC is
+// capturing right now and the actionable blind spots (skipped / excluded /
+// dropped-by-cap). Pure observability — Coverage() is race-safe and changes no
+// capture decision. When REC is disabled the no-op collector returns
+// RECCoverage{Mode:"disabled"}, which serializes fine, so no special-casing.
+func (s *Server) handleRECCoverage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jsonOK(w, s.collector.Coverage())
 }
 
 // GET /api/patterns?scope=docker:captain-nginx&verdict=alert

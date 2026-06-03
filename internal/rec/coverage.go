@@ -16,59 +16,59 @@ type RECCoverage struct {
 	//   "host-fallback" — auto-detect mode degraded to the single host capture
 	//   "legacy"        — REC_NS_CONTAINER pinned to one namespace
 	//   "disabled"      — collector is a no-op
-	Mode string
+	Mode string `json:"mode"`
 
 	// HostFallbackActive reports the host-fallback invariant: in auto-detect mode
 	// the "host" capture is active IFF zero namespace instances are live. Coverage
 	// only reports this — it never changes it.
-	HostFallbackActive bool
+	HostFallbackActive bool `json:"host_fallback_active"`
 
 	// MaxNamespaces is the effective REC_MAX_NAMESPACES cap (resolved default).
-	MaxNamespaces int
+	MaxNamespaces int `json:"max_namespaces"`
 
 	// Active is one entry per live capture source, EXCLUDING the host-fallback
 	// entry in auto-detect mode. A degraded capture (Running=false with LastError
 	// set) still appears here so the dashboard shows "degraded", not a vanished
 	// source (partial-failure isolation).
-	Active []CoverageCapture
+	Active []CoverageCapture `json:"active"`
 
 	// Skipped / Excluded / DroppedByCap are the non-covered classifications,
 	// retained from the latest discovery + cap. Empty in legacy mode (no
 	// discovery) and until the first auto-detect classification runs.
-	Skipped      []CoverageSkipped
-	Excluded     []CoverageExcluded
-	DroppedByCap []CoverageDropped
+	Skipped      []CoverageSkipped  `json:"skipped"`
+	Excluded     []CoverageExcluded `json:"excluded"`
+	DroppedByCap []CoverageDropped  `json:"dropped_by_cap"`
 }
 
 // CoverageCapture describes one active capture source.
 type CoverageCapture struct {
-	Name        string
-	ContainerID string // 12-char shortID; empty for the host capture
-	Ports       []int  // container-side (private) ports
-	PID         int
-	Running     bool
-	LastError   string
-	StartedAt   time.Time
+	Name        string    `json:"name"`
+	ContainerID string    `json:"container_id"` // 12-char shortID; empty for the host capture
+	Ports       []int     `json:"ports"`        // container-side (private) ports
+	PID         int       `json:"pid"`
+	Running     bool      `json:"running"`
+	LastError   string    `json:"last_error"`
+	StartedAt   time.Time `json:"started_at"`
 }
 
 // CoverageSkipped is a running container REC chose not to monitor (internal- or
 // loopback-only), with the human-readable reason.
 type CoverageSkipped struct {
-	Name   string
-	Reason string
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // CoverageExcluded is an externally-reachable container suppressed by
 // REC_EXCLUDE_CONTAINERS.
 type CoverageExcluded struct {
-	Name  string
-	Ports []int // container-side (private) ports
+	Name  string `json:"name"`
+	Ports []int  `json:"ports"` // container-side (private) ports
 }
 
 // CoverageDropped is a public container NOT monitored because the
 // REC_MAX_NAMESPACES cap was reached — a security blind spot.
 type CoverageDropped struct {
-	Name string
+	Name string `json:"name"`
 }
 
 // retainCoverage stores the latest discovery classification + cap-dropped set

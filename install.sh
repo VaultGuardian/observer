@@ -556,6 +556,62 @@ case "$1" in
     echo "[vaultguardian] To remove all data: sudo rm -rf /var/lib/observer /etc/vaultguardian"
     echo "[vaultguardian] To remove this CLI: sudo rm /usr/local/bin/vaultguardian"
     ;;
+  rec)
+    SUB="${2:-status}"
+    if [ "$SUB" != "status" ]; then
+      echo "[vaultguardian] Unknown 'rec' subcommand: $SUB"
+      echo "Usage: vaultguardian rec status"
+      exit 1
+    fi
+
+    ENV_FILE="/etc/vaultguardian/observer.env"
+    KEY_FILE="/etc/vaultguardian/dashboard.key"
+
+    # Resolve the dashboard port at runtime from the live config. observer.env
+    # is 0600 root-only, so read it with sudo — a non-sudo read silently fails
+    # and would always fall back to 9090, ignoring a customized port. The
+    # `|| true` keeps a missing file / no match from aborting under `set -e`.
+    PORT=9090
+    PORT_LINE=$(sudo grep '^DASHBOARD_PORT=' "$ENV_FILE" 2>/dev/null || true)
+    if [ -n "$PORT_LINE" ]; then
+      PORT="${PORT_LINE#DASHBOARD_PORT=}"
+    fi
+
+    # Read the bearer token at runtime (DASHBOARD_KEY_FILE default; root-only
+    # 0600). `|| true` so a missing key prints the friendly message below
+    # instead of aborting under `set -e`.
+    TOKEN=$(sudo cat "$KEY_FILE" 2>/dev/null || true)
+    if [ -z "$TOKEN" ]; then
+      echo "[vaultguardian] Dashboard key missing or empty at $KEY_FILE"
+      echo "[vaultguardian] Has Observer been installed and started at least once? Check the install."
+      exit 1
+    fi
+
+    URL="http://127.0.0.1:$PORT/api/rec/coverage"
+    BODY=$(curl -fsS "$URL" -H "Authorization: Bearer $TOKEN" 2>/dev/null || true)
+    if [ -z "$BODY" ]; then
+      echo "[vaultguardian] Observer API not reachable on 127.0.0.1:$PORT"
+      exit 1
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+      echo "$BODY" | jq .
+      echo ""
+      # Null-guard every array: nil Go slices marshal as null, not [], so a bare
+      # `.skipped | length` would error in the all-green (no blind spots) case.
+      echo "$BODY" | jq -r '
+        "Mode: \(.mode)  ·  active captures: \((.active // []) | length)",
+        "Blind spots — skipped: \((.skipped // []) | length), excluded: \((.excluded // []) | length), dropped_by_cap: \((.dropped_by_cap // []) | length)",
+        ((.skipped // [])[]        | "  skipped:        \(.name) — \(.reason)"),
+        ((.excluded // [])[]       | "  excluded:       \(.name)"),
+        ((.dropped_by_cap // [])[] | "  dropped_by_cap: \(.name)")
+      '
+    elif command -v python3 >/dev/null 2>&1; then
+      echo "$BODY" | python3 -m json.tool
+    else
+      echo "$BODY"
+    fi
+    ;;
   *)
     echo "VaultGuardian Observer CLI"
     echo ""
@@ -565,6 +621,7 @@ case "$1" in
     echo "  logs              Tail observer logs"
     echo "  status            Service status + recent logs"
     echo "  stats             Latest pipeline stats"
+    echo "  rec status        REC coverage: active captures + blind spots"
     echo "  restart           Restart observer"
     echo "  version           Show current + available versions"
     echo "  uninstall         Stop and remove Observer"
