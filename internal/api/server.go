@@ -353,6 +353,7 @@ func (s *Server) handleFindings(w http.ResponseWriter, r *http.Request) {
 	ip := r.URL.Query().Get("ip")
 	eventID := r.URL.Query().Get("event_id")
 	limitStr := r.URL.Query().Get("limit")
+	unresolved := r.URL.Query().Get("unresolved") == "1"
 
 	limit := 50
 	if limitStr != "" {
@@ -379,11 +380,11 @@ func (s *Server) handleFindings(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case ip != "":
-		findings, err = s.store.QueryByIP(ctx, ip, limit)
+		findings, err = s.store.QueryByIP(ctx, ip, limit, unresolved)
 	case verdict != "":
-		findings, err = s.store.QueryByVerdict(ctx, verdict, limit)
+		findings, err = s.store.QueryByVerdict(ctx, verdict, limit, unresolved)
 	default:
-		findings, err = s.store.QueryRecent(ctx, limit)
+		findings, err = s.store.QueryRecent(ctx, limit, unresolved)
 	}
 
 	if err != nil {
@@ -761,6 +762,18 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateLLMDecisionReview(r.Context(), req.ID, req.Review); err != nil {
 		jsonError(w, "update failed: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Resolve the linked finding (best-effort). Any human review — confirm,
+	// correct, or ignore — is a triage decision that closes the loop on the
+	// originating finding. Already-resolved or missing findings are a silent
+	// no-op: the review itself succeeded.
+	if decision, err := s.store.GetLLMDecision(r.Context(), req.ID); err != nil {
+		log.Printf("[api] Warning: decision #%d lookup for finding resolution failed: %v", req.ID, err)
+	} else if decision.EventID != "" {
+		if err := s.store.UpdateFindingResolution(r.Context(), decision.EventID, "resolved", "human_review", ""); err != nil {
+			log.Printf("[api] Warning: finding resolution for %s skipped: %v", decision.EventID, err)
+		}
 	}
 
 	log.Printf("[api] Decision #%d reviewed: status=%s verdict=%s pattern_deleted=%v",

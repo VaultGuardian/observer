@@ -157,6 +157,34 @@ func TestTrustedResolutionFromPending_NoRegression(t *testing.T) {
 	}
 }
 
+// TestQueryRecentUnresolvedFilter: unresolvedOnly restricts results to
+// findings still eligible for resolution; off by default.
+func TestQueryRecentUnresolvedFilter(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	insertPending(t, s, "evt_uf_pending")
+	insertPending(t, s, "evt_uf_resolved")
+	if err := s.UpdateFindingResolution(ctx, "evt_uf_resolved", "resolved", "rec_evidence", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	all, err := s.QueryRecent(ctx, 50, false)
+	if err != nil {
+		t.Fatalf("query recent (all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("unfiltered query returned %d findings; want 2", len(all))
+	}
+
+	unresolved, err := s.QueryRecent(ctx, 50, true)
+	if err != nil {
+		t.Fatalf("query recent (unresolved): %v", err)
+	}
+	if len(unresolved) != 1 || unresolved[0].EventID != "evt_uf_pending" {
+		t.Fatalf("unresolved query = %+v; want only evt_uf_pending", unresolved)
+	}
+}
+
 func containsEvent(fs []Finding, eventID string) bool {
 	for _, f := range fs {
 		if f.EventID == eventID {

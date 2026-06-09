@@ -396,6 +396,7 @@ type LLMDecisionCounts struct {
 	Pending          int64            `json:"pending"`
 	Confirmed        int64            `json:"confirmed"`
 	Corrected        int64            `json:"corrected"`
+	Ignored          int64            `json:"ignored"`
 	ByTier           map[string]int64 `json:"by_tier"`
 	ByClassification map[string]int64 `json:"by_classification"`
 }
@@ -415,6 +416,7 @@ func (s *Store) GetLLMDecisionCounts(ctx context.Context) (*LLMDecisionCounts, e
 	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM llm_decisions WHERE review_status = 'pending'").Scan(&counts.Pending)
 	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM llm_decisions WHERE review_status = 'confirmed'").Scan(&counts.Confirmed)
 	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM llm_decisions WHERE review_status = 'corrected'").Scan(&counts.Corrected)
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM llm_decisions WHERE review_status = 'ignored'").Scan(&counts.Ignored)
 
 	// By tier
 	rows, err := s.db.QueryContext(ctx, "SELECT tier, COUNT(*) FROM llm_decisions GROUP BY tier")

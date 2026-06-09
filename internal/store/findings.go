@@ -183,10 +183,18 @@ func (s *Store) QueryUnresolvedMalicious(ctx context.Context, olderThan time.Dur
 // Existing Query Methods (unchanged)
 // =============================================================================
 
+// unresolvedFilter matches findings that have not reached a terminal
+// resolution. Mirrors UpdateFindingResolution's base eligibility expression.
+const unresolvedFilter = "(resolution_status = '' OR resolution_status = 'pending' OR resolution_status IS NULL)"
+
 // QueryByIP returns all findings from a specific source IP, most recent first.
-func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding, error) {
+func (s *Store) QueryByIP(ctx context.Context, ip string, limit int, unresolvedOnly bool) ([]Finding, error) {
 	if limit <= 0 {
 		limit = 100
+	}
+	filter := ""
+	if unresolvedOnly {
+		filter = " AND " + unresolvedFilter
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT event_id, timestamp, source_type, source_name,
@@ -198,7 +206,7 @@ func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding,
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
 		FROM findings
-		WHERE source_ip = ?
+		WHERE source_ip = ?`+filter+`
 		ORDER BY timestamp DESC
 		LIMIT ?`, ip, limit)
 	if err != nil {
@@ -209,9 +217,13 @@ func (s *Store) QueryByIP(ctx context.Context, ip string, limit int) ([]Finding,
 }
 
 // QueryByVerdict returns findings matching a specific verdict, most recent first.
-func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) ([]Finding, error) {
+func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int, unresolvedOnly bool) ([]Finding, error) {
 	if limit <= 0 {
 		limit = 100
+	}
+	filter := ""
+	if unresolvedOnly {
+		filter = " AND " + unresolvedFilter
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT event_id, timestamp, source_type, source_name,
@@ -223,7 +235,7 @@ func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) (
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
 		FROM findings
-		WHERE verdict = ?
+		WHERE verdict = ?`+filter+`
 		ORDER BY timestamp DESC
 		LIMIT ?`, verdict, limit)
 	if err != nil {
@@ -234,9 +246,13 @@ func (s *Store) QueryByVerdict(ctx context.Context, verdict string, limit int) (
 }
 
 // QueryRecent returns the most recent findings across all verdicts.
-func (s *Store) QueryRecent(ctx context.Context, limit int) ([]Finding, error) {
+func (s *Store) QueryRecent(ctx context.Context, limit int, unresolvedOnly bool) ([]Finding, error) {
 	if limit <= 0 {
 		limit = 50
+	}
+	filter := ""
+	if unresolvedOnly {
+		filter = " WHERE " + unresolvedFilter
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT event_id, timestamp, source_type, source_name,
@@ -247,7 +263,7 @@ func (s *Store) QueryRecent(ctx context.Context, limit int) ([]Finding, error) {
 		       normalized_line, normalized_hash, downgraded, downgrade_reason, notified,
 		       COALESCE(evidence_body_hash,''), COALESCE(evidence_status_code,0),
 		       COALESCE(evidence_content_type,''), COALESCE(resolution_status,'')
-		FROM findings
+		FROM findings`+filter+`
 		ORDER BY timestamp DESC
 		LIMIT ?`, limit)
 	if err != nil {
