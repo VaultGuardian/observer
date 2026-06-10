@@ -126,6 +126,9 @@ func (e *Evidence) ForJournal() string {
 			e.Transport.BodyPreviewHash,
 			e.Transport.CaptureMode,
 		)
+		if e.Transport.RequestDuration > 0 {
+			s += fmt.Sprintf(" ReqDur=%s LatencySrc=%s", e.Transport.RequestDuration, e.Transport.LatencySource)
+		}
 		if e.Disclosure != nil {
 			s += fmt.Sprintf(" Format=%s Disclosure=%q", e.Disclosure.Format, e.Disclosure.DisclosureSummary)
 		}
