@@ -103,6 +103,11 @@ type CapturedResponse struct {
 	// match on method+path+host+status+time. Not a hard filter.
 	UserAgent string
 
+	// Wall-clock time the paired request's first segment was parsed on
+	// the wire (pendingRequest.timestamp). Zero when the response was
+	// never paired (orphan path) — orphans must NOT get a value.
+	RequestTimestamp time.Time
+
 	// --- Response fields ---
 
 	// HTTP status code. Used as a HARD FILTER in correlation.

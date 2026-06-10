@@ -301,6 +301,7 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 			captured.Path = pendingReq.path
 			captured.Host = pendingReq.host
 			captured.UserAgent = pendingReq.userAgent
+			captured.RequestTimestamp = pendingReq.timestamp
 
 			// Insert into ring buffer and fire VIP callback OUTSIDE flow lock.
 			s.sniffer.buffer.Insert(captured)

@@ -754,6 +754,15 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		CapturedAt:      best.Timestamp,
 		ResponseLatency: absDuration(best.Timestamp.Sub(req.Timestamp)),
 	}
+	// True wire-pair duration — only when the response was paired with its
+	// request on the wire (orphans have zero RequestTimestamp). Negative or
+	// zero deltas (clock weirdness, same-instant) are treated as absent.
+	if !best.RequestTimestamp.IsZero() {
+		if d := best.Timestamp.Sub(best.RequestTimestamp); d > 0 {
+			transport.RequestDuration = d
+			transport.LatencySource = "wire_pair"
+		}
+	}
 
 	// Build disclosure analysis (Layer 2)
 	disclosure := classifyAndRedact(best.BodyPreview, best.ContentType)

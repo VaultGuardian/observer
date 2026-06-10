@@ -64,7 +64,7 @@ func TestRedactHTMLAttributes_PositionalAttrs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := redactHTMLAttributes(tt.tag)
+			got, _ := redactHTMLAttributes(tt.tag)
 			if got != tt.want {
 				t.Errorf("redactHTMLAttributes(%q)\n  got:  %q\n  want: %q", tt.tag, got, tt.want)
 			}
@@ -109,7 +109,7 @@ func TestRedactHTMLAttributes_SecretNamedAttrs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := redactHTMLAttributes(tt.tag)
+			got, _ := redactHTMLAttributes(tt.tag)
 			if got != tt.want {
 				t.Errorf("redactHTMLAttributes(%q)\n  got:  %q\n  want: %q", tt.tag, got, tt.want)
 			}
@@ -147,7 +147,7 @@ func TestRedactHTMLAttributes_DoesNotRedactBenign(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := redactHTMLAttributes(tt.tag)
+			got, _ := redactHTMLAttributes(tt.tag)
 			if got != tt.want {
 				t.Errorf("redactHTMLAttributes(%q)\n  got:  %q\n  want: %q", tt.tag, got, tt.want)
 			}
@@ -230,7 +230,7 @@ func TestRedactHTMLAttributes_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := redactHTMLAttributes(tt.tag)
+			got, _ := redactHTMLAttributes(tt.tag)
 			if got != tt.want {
 				t.Errorf("redactHTMLAttributes(%q)\n  got:  %q\n  want: %q", tt.tag, got, tt.want)
 			}
@@ -265,5 +265,88 @@ func TestAttrNameLooksSecret(t *testing.T) {
 		if attrNameLooksSecret(strings.ToLower(n)) {
 			t.Errorf("attrNameLooksSecret(%q) = true, want false", n)
 		}
+	}
+}
+
+// =============================================================================
+// SensitiveRedactions counting (Session A plumbing)
+// =============================================================================
+//
+// The count is a side-channel over EXISTING redaction behavior — the golden
+// preview assertions pin the redacted output strings byte-for-byte so the
+// counter can never drift the redaction itself.
+
+func TestClassifyAndRedact_SensitiveRedactionCounts(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		contentType string
+		wantFormat  DetectedFormat
+		wantCount   int
+		wantPreview string // golden — exact pre-existing redaction output
+	}{
+		{
+			name:        "json with secret-bearing key",
+			body:        `{"password":"hunter2","status":"ok"}`,
+			contentType: "application/json",
+			wantFormat:  FormatJSON,
+			wantCount:   1,
+			wantPreview: "{\n  \"password\": \"[REDACTED]\",\n  \"status\": \"ok\"\n}",
+		},
+		{
+			name:        "dotenv body",
+			body:        "DB_PASSWORD=hunter2\nAPI_KEY=abc123",
+			contentType: "",
+			wantFormat:  FormatDotenv,
+			wantCount:   2,
+			wantPreview: "DB_PASSWORD=[REDACTED]\nAPI_KEY=[REDACTED]",
+		},
+		{
+			name:        "clean short json",
+			body:        `{"status":"ok"}`,
+			contentType: "application/json",
+			wantFormat:  FormatJSON,
+			wantCount:   0,
+			wantPreview: "{\n  \"status\": \"ok\"\n}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := classifyAndRedact([]byte(tt.body), tt.contentType)
+			if a.Format != tt.wantFormat {
+				t.Fatalf("Format = %q, want %q", a.Format, tt.wantFormat)
+			}
+			if a.SensitiveRedactions != tt.wantCount {
+				t.Errorf("SensitiveRedactions = %d, want %d", a.SensitiveRedactions, tt.wantCount)
+			}
+			if a.redactedPreview != tt.wantPreview {
+				t.Errorf("redacted preview changed:\n  got:  %q\n  want: %q", a.redactedPreview, tt.wantPreview)
+			}
+		})
+	}
+}
+
+func TestClassifyAndRedact_FailClosedPathsCountZero(t *testing.T) {
+	// Empty body, binary body, unknown format — redaction never runs,
+	// SensitiveRedactions stays 0.
+	for _, tc := range []struct {
+		name        string
+		body        []byte
+		contentType string
+	}{
+		{"empty body", nil, ""},
+		{"binary body", []byte{0x7f, 'E', 'L', 'F', 0x00, 0x01}, ""},
+		{"unknown format", []byte("just some plain text with no structure"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := classifyAndRedact(tc.body, tc.contentType)
+			if a.SensitiveRedactions != 0 {
+				t.Errorf("SensitiveRedactions = %d, want 0", a.SensitiveRedactions)
+			}
+			if a.redactedPreview != "" {
+				t.Errorf("fail-closed path produced a preview: %q", a.redactedPreview)
+			}
+		})
 	}
 }

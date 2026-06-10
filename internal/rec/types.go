@@ -61,6 +61,8 @@ type TransportEvidence struct {
 	ContentLength   int64         `json:"content_length"`
 	CapturedAt      time.Time     `json:"captured_at"`
 	ResponseLatency time.Duration `json:"response_latency,omitempty"`
+	RequestDuration time.Duration `json:"request_duration,omitempty"`
+	LatencySource   string        `json:"latency_source,omitempty"`
 	BodyPreviewHash string        `json:"body_preview_hash"`
 	CaptureMode     string        `json:"capture_mode"`
 }
@@ -73,6 +75,11 @@ type DisclosureAnalysis struct {
 	Format              DetectedFormat `json:"format"`
 	RedactionConfidence Confidence     `json:"redaction_confidence"`
 	DisclosureSummary   string         `json:"disclosure_summary"`
+	// Number of values the redactors actually stripped as sensitive from
+	// the body preview. 0 means redaction ran but found nothing to strip;
+	// it does NOT mean the body is safe (fail-closed formats carry that
+	// via Format/RedactionConfidence).
+	SensitiveRedactions int `json:"sensitive_redactions,omitempty"`
 	redactedPreview     string
 }
 

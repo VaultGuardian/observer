@@ -195,10 +195,11 @@ func isEnvKey(b []byte) bool {
 //   - content="..." on <meta> → content="[REDACTED]"
 //   - Any attribute value matching secret patterns (token, key, session, etc.)
 
-func redactHTML(body []byte) string {
+func redactHTML(body []byte) (string, int) {
 	s := string(body)
 	var out strings.Builder
 	out.Grow(len(s))
+	redactions := 0
 
 	i := 0
 	for i < len(s) {
@@ -238,7 +239,8 @@ func redactHTML(body []byte) string {
 			}
 
 			// Redact sensitive attributes in the tag
-			redactedTag := redactHTMLAttributes(tag)
+			redactedTag, n := redactHTMLAttributes(tag)
+			redactions += n
 			out.WriteString(redactedTag)
 			i = tagEnd
 		} else {
@@ -258,7 +260,7 @@ func redactHTML(body []byte) string {
 	if len(result) > 2048 {
 		result = result[:2048] + "...[TRUNCATED]"
 	}
-	return result
+	return result, redactions
 }
 
 // redactHTMLAttributes redacts sensitive attribute values in a single HTML tag.
@@ -277,12 +279,12 @@ func redactHTML(body []byte) string {
 // parsing query strings for token-shaped parameters. Loses some URL
 // structure for LLM classification but prevents query-param leakage
 // without a brittle URL parser running over potentially malformed bytes.
-func redactHTMLAttributes(tag string) string {
+func redactHTMLAttributes(tag string) (string, int) {
 	if len(tag) < 2 || tag[0] != '<' {
-		return tag
+		return tag, 0
 	}
 	if tag[1] == '/' || tag[1] == '!' {
-		return tag // closing tag, comment, or doctype — nothing to redact
+		return tag, 0 // closing tag, comment, or doctype — nothing to redact
 	}
 
 	// Walk past tag name.
@@ -296,6 +298,7 @@ func redactHTMLAttributes(tag string) string {
 	var b strings.Builder
 	b.Grow(len(tag) + 16)
 	b.WriteString(tag[:i])
+	redactions := 0
 
 	for i < len(tag) {
 		// Whitespace between attrs (or before '>').
@@ -307,7 +310,7 @@ func redactHTMLAttributes(tag string) string {
 
 		if i >= len(tag) || tag[i] == '>' || tag[i] == '/' {
 			b.WriteString(tag[i:])
-			return b.String()
+			return b.String(), redactions
 		}
 
 		// Attribute name.
@@ -338,7 +341,7 @@ func redactHTMLAttributes(tag string) string {
 			i++
 		}
 		if i >= len(tag) {
-			return b.String()
+			return b.String(), redactions
 		}
 
 		// Value: quoted or unquoted.
@@ -357,10 +360,11 @@ func redactHTMLAttributes(tag string) string {
 				// us LLM signal.
 				if isSecret {
 					b.WriteString(`"[REDACTED]"`)
+					redactions++
 				} else {
 					b.WriteString(tag[valStart:])
 				}
-				return b.String()
+				return b.String(), redactions
 			}
 			i = i + closeIdx + 1 // past closing quote
 		} else {
@@ -372,12 +376,13 @@ func redactHTMLAttributes(tag string) string {
 
 		if isSecret {
 			b.WriteString(`"[REDACTED]"`)
+			redactions++
 		} else {
 			b.WriteString(tag[valStart:valEnd])
 		}
 	}
 
-	return b.String()
+	return b.String(), redactions
 }
 
 // isHTMLSpace reports whether b is HTML whitespace as defined by the parser
@@ -458,27 +463,28 @@ var secretAttrNameTokens = []string{
 //   - Strings containing @ (emails)
 //   - Strings that look like base64 (mostly alphanumeric + /+=, >20 chars)
 
-func redactJSON(body []byte) string {
+func redactJSON(body []byte) (string, int) {
 	var parsed interface{}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "" // malformed JSON → fail closed
+		return "", 0 // malformed JSON → fail closed
 	}
 
-	redacted := redactJSONValue(parsed, "", 0)
+	redactions := 0
+	redacted := redactJSONValue(parsed, "", 0, &redactions)
 
 	out, err := json.MarshalIndent(redacted, "", "  ")
 	if err != nil {
-		return ""
+		return "", 0
 	}
 
 	result := string(out)
 	if len(result) > 2048 {
 		result = result[:2048] + "\n...[TRUNCATED]"
 	}
-	return result
+	return result, redactions
 }
 
-func redactJSONValue(v interface{}, parentKey string, depth int) interface{} {
+func redactJSONValue(v interface{}, parentKey string, depth int, redactions *int) interface{} {
 	if depth > 10 {
 		return "[MAX_DEPTH]"
 	}
@@ -487,28 +493,32 @@ func redactJSONValue(v interface{}, parentKey string, depth int) interface{} {
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(val))
 		for k, child := range val {
-			out[k] = redactJSONValue(child, k, depth+1)
+			out[k] = redactJSONValue(child, k, depth+1, redactions)
 		}
 		return out
 
 	case []interface{}:
 		out := make([]interface{}, len(val))
 		for i, child := range val {
-			out[i] = redactJSONValue(child, parentKey, depth+1)
+			out[i] = redactJSONValue(child, parentKey, depth+1, redactions)
 		}
 		return out
 
 	case string:
 		if isSensitiveKey(parentKey) {
+			*redactions++
 			return "[REDACTED]"
 		}
 		if len(val) > 50 {
+			*redactions++
 			return "[REDACTED:long_string]"
 		}
 		if strings.Contains(val, "@") && strings.Contains(val, ".") {
+			*redactions++
 			return "[REDACTED:email]"
 		}
 		if looksLikeBase64(val) {
+			*redactions++
 			return "[REDACTED:encoded]"
 		}
 		// Keep short, non-sensitive string values
@@ -596,9 +606,10 @@ func looksLikeBase64(s string) bool {
 // Pure secrets — always redact ALL values. The key names tell the story:
 // "DB_PASSWORD=<REDACTED>" is enough for the LLM to know this is a config leak.
 
-func redactDotenv(body []byte) string {
+func redactDotenv(body []byte) (string, int) {
 	var out strings.Builder
 	lines := strings.Split(string(body), "\n")
+	redactions := 0
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -626,6 +637,7 @@ func redactDotenv(body []byte) string {
 			out.WriteString(prefix)
 			out.WriteString(key)
 			out.WriteString("=[REDACTED]")
+			redactions++
 		} else {
 			// Not a KEY=VALUE line — pass through (could be a comment variant)
 			out.WriteString(line)
@@ -636,7 +648,7 @@ func redactDotenv(body []byte) string {
 		}
 	}
 
-	return out.String()
+	return out.String(), redactions
 }
 
 // =============================================================================
@@ -648,9 +660,10 @@ func redactDotenv(body []byte) string {
 //
 // For /etc/shadow: keep username (field 0), redact everything else.
 
-func redactPasswd(body []byte) string {
+func redactPasswd(body []byte) (string, int) {
 	var out strings.Builder
 	lines := strings.Split(string(body), "\n")
+	redactions := 0
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -670,15 +683,18 @@ func redactPasswd(body []byte) string {
 				fields[3], // GID — keep
 				fields[6], // shell — keep
 			))
+			redactions += 3 // hash, GECOS, home — the three markers written above
 		} else if len(fields) >= 2 && strings.Contains(fields[1], "$") {
 			// shadow format: user:$hash$...:... — keep only username
 			out.WriteString(fields[0])
 			for j := 1; j < len(fields); j++ {
 				out.WriteString(":[REDACTED]")
+				redactions++
 			}
 		} else {
 			// Unknown format — redact entire line
 			out.WriteString("[REDACTED]")
+			redactions++
 		}
 
 		if i < len(lines)-1 {
@@ -686,7 +702,7 @@ func redactPasswd(body []byte) string {
 		}
 	}
 
-	return out.String()
+	return out.String(), redactions
 }
 
 // =============================================================================
@@ -733,16 +749,16 @@ func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 
 	switch format {
 	case FormatDotenv:
-		analysis.redactedPreview = redactDotenv(bodyPreview)
+		analysis.redactedPreview, analysis.SensitiveRedactions = redactDotenv(bodyPreview)
 		analysis.DisclosureSummary = "DOTENV/CONFIG STRUCTURE DETECTED"
 	case FormatPasswd:
-		analysis.redactedPreview = redactPasswd(bodyPreview)
+		analysis.redactedPreview, analysis.SensitiveRedactions = redactPasswd(bodyPreview)
 		analysis.DisclosureSummary = "PASSWD FILE STRUCTURE DETECTED"
 	case FormatJSON:
-		analysis.redactedPreview = redactJSON(bodyPreview)
+		analysis.redactedPreview, analysis.SensitiveRedactions = redactJSON(bodyPreview)
 		analysis.DisclosureSummary = "JSON STRUCTURE DETECTED"
 	case FormatHTML:
-		analysis.redactedPreview = redactHTML(bodyPreview)
+		analysis.redactedPreview, analysis.SensitiveRedactions = redactHTML(bodyPreview)
 		analysis.DisclosureSummary = "HTML CONTENT DETECTED"
 	case FormatBinary:
 		analysis.redactedPreview = ""
