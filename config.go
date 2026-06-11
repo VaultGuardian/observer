@@ -100,6 +100,17 @@ type Config struct {
 	Tier1Effort string // "low", "medium", "high" — default "low"
 	Tier2Effort string // "low", "medium", "high" — default "medium"
 
+	// SlowResponseThresholdMs gates the Path-1 transport-only downgrade in
+	// the evidence callback. When REC measured a real wire-paired request
+	// duration (LatencySource == "wire_pair") at or above this many
+	// milliseconds, a 403/404/405/410 is NOT auto-downgraded — the timing
+	// may itself be evidence (time-based blind injection), so the event
+	// falls through to body-aware reclassification with the latency in the
+	// prompt. Absent or sub-threshold durations downgrade as before.
+	// SLOW_RESPONSE_THRESHOLD_MS, default 3000. Zero or negative disables
+	// the gate (always-downgrade, the pre-gate behavior).
+	SlowResponseThresholdMs int
+
 	// Dashboard API
 	DashboardPort           int
 	DashboardKeyFile        string
@@ -135,9 +146,12 @@ func LoadConfig() Config {
 		MaxConcurrentLLM:    getEnvInt("LLM_SLOTS", 4),
 		Tier1Effort:         getEnv("LLM_TIER1_EFFORT", "low"),
 		Tier2Effort:         getEnv("LLM_TIER2_EFFORT", "medium"),
-		DashboardPort:       9090,
-		DashboardKeyFile:    getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
-		DashboardBindAddr:   getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
+		// SLOW_RESPONSE_THRESHOLD_MS allows zero/negative (= disable gate).
+		// Resolved below since getEnvInt rejects non-positive values.
+		SlowResponseThresholdMs: 3000,
+		DashboardPort:           9090,
+		DashboardKeyFile:        getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
+		DashboardBindAddr:       getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
 		// REC reassembly tuning — response-only, bounds are tunable.
 		RECReassemblyMaxBody:   getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
@@ -258,6 +272,17 @@ func LoadConfig() Config {
 			cfg.RECLearnedPortCap = n
 		} else {
 			log.Printf("[observer] Invalid REC_LEARNED_PORT_CAP=%q — using default %d", raw, cfg.RECLearnedPortCap)
+		}
+	}
+
+	// Parse slow-response threshold. Allows zero/negative (= disable the
+	// transport-downgrade gate entirely; every 403/404/405/410 downgrades
+	// unconditionally as before).
+	if raw := getEnv("SLOW_RESPONSE_THRESHOLD_MS", ""); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			cfg.SlowResponseThresholdMs = n
+		} else {
+			log.Printf("[observer] Invalid SLOW_RESPONSE_THRESHOLD_MS=%q — using default %d", raw, cfg.SlowResponseThresholdMs)
 		}
 	}
 

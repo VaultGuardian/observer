@@ -659,6 +659,23 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	snapshot := *pending
 	c.mu.Unlock()
 
+	// Panic backstop: if the evidence callback panics, the singleflight
+	// guard must still be cleared or this key wedges (timeouts keep
+	// deferring to a check that will never finish) until the janitor sweep.
+	// The normal path clears the guard inline in Step 3, under the same
+	// lock acquisition that re-reads pending — this defer fires only when
+	// that clear was never reached. A panic while HOLDING c.mu is already
+	// fatal to the coordinator and out of scope here.
+	guardCleared := false
+	defer func() {
+		if !guardCleared {
+			c.mu.Lock()
+			delete(c.checking, key)
+			delete(c.checkingSince, key)
+			c.mu.Unlock()
+		}
+	}()
+
 	// --- Step 2: Evidence check on the snapshot, no shared-state mutation ---
 	decision := c.evidenceCheck(&snapshot)
 
@@ -668,6 +685,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	c.mu.Lock()
 	delete(c.checking, key) // release singleflight guard
 	delete(c.checkingSince, key)
+	guardCleared = true
 	pending, ok = c.pending[key]
 	if !ok || pending.Resolved || pending.Dispatched {
 		c.mu.Unlock()

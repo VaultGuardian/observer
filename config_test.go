@@ -35,3 +35,29 @@ func TestRECReassemblyIdleTimeoutEnvOverride(t *testing.T) {
 		t.Errorf("REC_REASSEMBLY_IDLE_TIMEOUT=2s → %s; want 2s (env override must win)", cfg.RECReassemblyIdleTimeout)
 	}
 }
+
+// SLOW_RESPONSE_THRESHOLD_MS must accept explicit zero/negative (= gate
+// disabled) — getEnvInt rejects non-positive values, so this field is
+// resolved by a dedicated block like REC_LEARNED_PORT_CAP.
+func TestSlowResponseThresholdMs(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"default", "", 3000},
+		{"zero_disables", "0", 0},
+		{"negative_disables", "-5", -5},
+		{"override", "5000", 5000},
+		{"garbage_falls_back", "abc", 3000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SLOW_RESPONSE_THRESHOLD_MS", tc.env)
+			cfg := LoadConfig()
+			if cfg.SlowResponseThresholdMs != tc.want {
+				t.Errorf("SLOW_RESPONSE_THRESHOLD_MS=%q → %d; want %d", tc.env, cfg.SlowResponseThresholdMs, tc.want)
+			}
+		})
+	}
+}

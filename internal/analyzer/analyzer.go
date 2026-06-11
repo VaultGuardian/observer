@@ -42,6 +42,14 @@ type AnalysisResult struct {
 	LLMConfidence     float64      `json:"llm_confidence,omitempty"`
 	LLMPatternLearned bool         `json:"llm_pattern_learned,omitempty"`
 	LLMVerdict        *llm.Verdict `json:"-"` // full verdict with call metadata for audit trail
+
+	// LLMClampedToAlert: the T1 LLM said action=malicious for an HTTP event,
+	// and the applied verdict was capped to alert — outcome claims require
+	// response evidence (T2). The LLMVerdict above keeps the model's original
+	// action; the divergence is intentional and queryable (the audit row's
+	// Action stays "malicious", FinalVerdict records "alert"). Set on leader
+	// AND followers so routing records the truth for every coalesced event.
+	LLMClampedToAlert bool `json:"llm_clamped_to_alert,omitempty"`
 }
 
 // LLMScheduler controls concurrent LLM access across all tiers.
@@ -93,6 +101,7 @@ type classifyFlightResult struct {
 	Reason         string                    // populated for "error"
 	Match          *patternstore.MatchResult // populated for "pattern" (in-flight re-check hit)
 	Err            error                     // populated for "error" (currently informational)
+	ClampedToAlert bool                      // T1 LLM said malicious on an HTTP event; effective action capped to alert
 }
 
 // SetPrePinFunc registers the REC evidence pre-pin callback.
@@ -124,6 +133,12 @@ type Stats struct {
 	// should review the [analyzer] DISCLOSURE_OVERRIDE / DISCLOSURE_REFUSE_LEARN
 	// log lines to identify offending patterns or LLM behavior to correct.
 	DisclosureOverrides atomic.Int64 `json:"disclosure_overrides"`
+
+	// T1 LLM "malicious" verdicts on HTTP events capped to "alert" —
+	// outcome-claiming verdicts require response evidence (T2 escalation is
+	// the legitimate path to malicious). Counted once per coalesced flight,
+	// like LLMCalls. See the [clamp] log lines for the affected events.
+	T1MaliciousClamped atomic.Int64 `json:"t1_malicious_clamped"`
 }
 
 // StatsSnapshot is a plain copy for logging/serialization.
@@ -138,6 +153,7 @@ type StatsSnapshot struct {
 	Retried             int64 `json:"retried"`
 	RetriedPatternHit   int64 `json:"retried_pattern_hit"`
 	DisclosureOverrides int64 `json:"disclosure_overrides"`
+	T1MaliciousClamped  int64 `json:"t1_malicious_clamped"`
 }
 
 // New creates an Analyzer with the given components.
@@ -214,10 +230,11 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// says "alert" for a clean 404 probe. One bad call, cached forever, 70 emails.
 	// Same lesson as stack traces: don't let the LLM vote on structural facts.
 	//
-	// SAFETY: If the path or query string contains attack indicators (encoded
-	// payloads, SQL injection, path traversal), we let the LLM classify it.
-	// The payload is evidence regardless of status code. Same for high-risk
-	// disclosures — they bypass this gate via the guard above.
+	// POLICY (v0.47 override): suppression is pure status-based — attack
+	// indicators in the path do NOT escape this gate (a failed probe is a
+	// failed probe regardless of what was probed; see isFailedProbe). Only
+	// high-risk disclosures bypass it, via the guard above — those are
+	// actual data leakage in the line, not scanner intent.
 	if !hasDisclosure {
 		if reason, ok := isFailedProbe(evt.NormalizedLine); ok {
 			a.stats.NoiseSuppressed.Add(1)
@@ -455,8 +472,25 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 		a.hints.Add(evt.ScopeKey(), hints)
 	}
 
+	// --- Step 3c: T1 malicious clamp for HTTP events ---
+	// A T1 verdict judges only the REQUEST; "malicious" is an outcome claim,
+	// and outcomes require response evidence (T2 escalation is the legitimate
+	// path to malicious). Computed HERE, before learning, so the learned hash
+	// lands in the ALERT bucket — clamping only at verdict-mapping time would
+	// let the pattern tier resurrect malicious-without-evidence on the next
+	// identical line. verdict itself is never mutated: it is the immutable
+	// original that resultRouter records to the audit trail. Non-HTTP events
+	// (no method/path in either line form) are untouched.
+	effectiveAction := verdict.Action
+	if verdict.Action == "malicious" && eventHasHTTPIdentity(evt) {
+		effectiveAction = "alert"
+		fr.ClampedToAlert = true
+		a.stats.T1MaliciousClamped.Add(1) // once per flight (leader), like LLMCalls
+		log.Printf("[clamp] T1 LLM verdict malicious capped to alert for HTTP event %s — outcome claims require response evidence", evt.ID)
+	}
+
 	// --- Step 4: Learn from the LLM's response (leader-only) ---
-	fr.PatternLearned = a.learnFromVerdict(evt, verdict)
+	fr.PatternLearned = a.learnFromVerdict(evt, verdict, effectiveAction)
 	fr.Source = "llm"
 	fr.Verdict = verdict
 	return fr
@@ -513,6 +547,10 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 
 	default: // "llm"
 		v := mapActionToVerdict(fr.Verdict.Action)
+		if fr.ClampedToAlert {
+			// Applied verdict only — fr.Verdict stays the immutable original.
+			v = patternstore.VerdictAlert
+		}
 		result := AnalysisResult{
 			Event:             evt,
 			Verdict:           v,
@@ -520,6 +558,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 			Source:            "llm",
 			LLMClassification: fr.Verdict.Classification,
 			LLMConfidence:     fr.Verdict.Confidence,
+			LLMClampedToAlert: fr.ClampedToAlert,
 		}
 		if isLeader {
 			// Only the leader carries the learn flag and the full verdict
@@ -547,9 +586,16 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 //   - malicious / alert: hash only, NEVER generalized
 //   - allow / suppress: hash at >= 0.70, generalized at >= 0.85
 //   - low confidence (< 0.70): nothing is learned
-func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool {
+//
+// effectiveAction is the action actually applied to the event — usually
+// verdict.Action, but "alert" when the T1 malicious clamp fired. Passed
+// separately rather than via a mutated verdict copy: verdict is the immutable
+// original the audit trail records, and a divergent copy invites accidental
+// sharing. Learning follows the APPLIED action so the hash lands in the
+// bucket future events will actually be routed by.
+func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effectiveAction string) bool {
 	scopeKey := evt.ScopeKey()
-	v := mapActionToVerdict(verdict.Action)
+	v := mapActionToVerdict(effectiveAction)
 
 	// === Hash-learning gate (v0.47 F2) ===
 	// Below 0.70 confidence we learn NOTHING. A low-confidence allow/suppress
@@ -621,7 +667,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict) bool
 	// alerts without burning another LLM call. Stored as VerdictAlert — semantically
 	// distinct from VerdictMalicious (suspicious vs confirmed-bad). Hash-only, no patterns,
 	// no generalization. The conservative trust model is preserved.
-	if verdict.Action == "alert" {
+	if effectiveAction == "alert" {
 		a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
 		return false
 	}
@@ -722,6 +768,7 @@ func (a *Analyzer) GetStats() StatsSnapshot {
 		Retried:             a.stats.Retried.Load(),
 		RetriedPatternHit:   a.stats.RetriedPatternHit.Load(),
 		DisclosureOverrides: a.stats.DisclosureOverrides.Load(),
+		T1MaliciousClamped:  a.stats.T1MaliciousClamped.Load(),
 	}
 }
 
@@ -974,6 +1021,19 @@ var reHTTPQuoted = regexp.MustCompile(
 var reHTTPBare = regexp.MustCompile(
 	`^(` + httpMethodsRE + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
+// reHTTPMorgan: Format 4 — Express/morgan access logs (captain-captain):
+// "GET /api/keys 200 0.563 ms - 83". No HTTP/x.x token; the status follows
+// the path directly, so the strict "<status> <time> ms - <bytes|->" tail is
+// what keeps this from firing on arbitrary "METHOD path 200 ..." lines.
+//
+// KEEP IN SYNC with reMorganHTTP in the root package (httpparse.go) — the
+// router uses that one to decide an event IS HTTP (coordinator routing, REC
+// lookup) while the clamp/learning gates here use this one. If they drift,
+// morgan lines become HTTP to the router but invisible to the T1 clamp —
+// exactly the LLM-malicious-with-no-evidence gap this format closes.
+var reHTTPMorgan = regexp.MustCompile(
+	`^(` + httpMethodsRE + `)\s+(\S+)\s+(\d{3})\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+|-)`)
+
 // parseHTTPIdentity extracts (method, path, status) from a normalized log
 // line using the structured Format 1/2/3 parsers. Returns zero values for
 // non-HTTP lines (error logs, syslog, etc.) — callers must treat the empty
@@ -992,7 +1052,25 @@ func parseHTTPIdentity(normalizedLine string) (method, path, status string) {
 	if m := reHTTPBare.FindStringSubmatch(normalizedLine); m != nil {
 		return m[1], m[2], m[3]
 	}
+	// Format 4 tried LAST, mirroring httpparse.go's ordering — nginx-format
+	// lines with an HTTP/x.x token never reach it.
+	if m := reHTTPMorgan.FindStringSubmatch(normalizedLine); m != nil {
+		return m[1], m[2], m[3]
+	}
 	return "", "", ""
+}
+
+// eventHasHTTPIdentity reports whether either line form parses to an HTTP
+// access-log identity (method + path). Checks BOTH normalized and raw because
+// resultRouter's isHTTP derives method from raw OR normalized; checking only
+// one would let the router treat an event as HTTP while the T1 clamp didn't
+// fire (clamp/routing mismatch).
+func eventHasHTTPIdentity(evt *event.Event) bool {
+	if m, p, _ := parseHTTPIdentity(evt.NormalizedLine); m != "" && p != "" {
+		return true
+	}
+	m, p, _ := parseHTTPIdentity(evt.Line)
+	return m != "" && p != ""
 }
 
 // hasAttackPayloadForLearning reports whether a line carries an actual attack

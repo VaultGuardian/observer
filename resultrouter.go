@@ -35,6 +35,14 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 	// --- Record LLM decision to audit trail ---
 	if result.Source == "llm" && result.LLMVerdict != nil {
 		v := result.LLMVerdict
+		// Classification/Action are the model's immutable originals; when the
+		// T1 clamp fired, PatternBucket records where the hash actually
+		// landed (alert) and FinalVerdict carries the applied verdict — the
+		// divergence from Action ("malicious") is intentional and queryable.
+		patternBucket := v.Action
+		if result.LLMClampedToAlert {
+			patternBucket = "alert"
+		}
 		r.db.RecordLLMDecision(context.Background(), &store.LLMDecision{
 			EventID:          evt.ID,
 			Timestamp:        evt.Timestamp,
@@ -57,7 +65,7 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 			PatternValue:     v.Pattern,
 			SourceHint:       v.SourceHint,
 			PatternLearned:   result.LLMPatternLearned,
-			PatternBucket:    v.Action,
+			PatternBucket:    patternBucket,
 			CacheKey:         v.Pattern,
 			FinalVerdict:     string(result.Verdict),
 		})
@@ -184,6 +192,13 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	//   - Pattern store verdict is NOT modified.
 	//
 	// SAFETY: 400 excluded from first cut. Ship conservative, add after logs.
+	//
+	// NOTE (Jun 2026): this shortcut bypasses the slow-response gate
+	// (SLOW_RESPONSE_THRESHOLD_MS) for pattern-tier repeats — no REC lookup
+	// happens here, so a slow time-based-blind 404 repeat is downgraded on
+	// status alone while a fresh LLM event with the same timing would be
+	// held for body-aware reclassification. Backlog: "extend slow-gate to
+	// status shortcut".
 	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
 		reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server — HTTP %d confirms failure", result.Source, statusCode)
 
@@ -291,6 +306,19 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		notifSeverity = notifier.SeveritySuspicious
 	}
 
+	// pendingClassification is the APPLIED operational state carried into the
+	// coordinator pending alert / direct-dispatch finding; the model's
+	// immutable original stays in the llm_decisions audit row. Without this,
+	// a T1-clamped original "malicious" leaks into the evidence callback's
+	// escalation math — ReclassifyWithEvidence receives it as
+	// originalClassification and isEscalation("malicious","malicious") is
+	// false, so an evidence-confirmed breach on a clamped event could never
+	// escalate or notify.
+	pendingClassification := result.LLMClassification
+	if result.LLMClampedToAlert {
+		pendingClassification = "suspicious"
+	}
+
 	respBytes := extractResponseBytes(evt.Line)
 
 	// --- HTTP alerts: route through coordinator for evidence huddle ---
@@ -384,7 +412,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			Line:           evt.Line,
 			Verdict:        string(result.Verdict),
 			Severity:       severity,
-			Classification: result.LLMClassification,
+			Classification: pendingClassification,
 			Host:           host,
 			StatusCode:     statusCode,
 			ResponseBytes:  respBytes,
@@ -452,7 +480,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		HTTPStatus:           statusCode,
 		ResponseBytes:        respBytes,
 		Verdict:              string(result.Verdict),
-		Classification:       result.LLMClassification,
+		Classification:       pendingClassification,
 		Confidence:           result.LLMConfidence,
 		Reason:               result.Reason,
 		MatchedVia:           result.Source,

@@ -1,6 +1,12 @@
 package main
 
-import "sync"
+import (
+	"sync"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/vaultguardian/observer/internal/llm"
+)
 
 // =============================================================================
 // Re-Classification Cache
@@ -39,6 +45,23 @@ type reclassCacheEntry struct {
 type reclassCache struct {
 	mu      sync.RWMutex
 	entries map[string]reclassCacheEntry // bodyPreviewHash → result
+
+	// flight coalesces concurrent T2 reclassifications of the same redacted
+	// body shape into a single in-flight LLM call (same key namespace as
+	// entries: the redacted shape hash). It lives alongside the durable
+	// cache so the two share a lifecycle, but the correction-path delete()
+	// does not interact with in-flight calls. Zero value is ready to use.
+	flight singleflight.Group
+}
+
+// reclassFlightResult is the shared outcome of one coalesced T2
+// reclassification. Mirrors analyzer.classifyFlightResult: the leader is
+// identified by LeaderEventID == its own snapshot.EventID — NOT by
+// singleflight's shared bool (the leader can also observe shared==true).
+// Followers read Reclass but never mutate it.
+type reclassFlightResult struct {
+	Reclass       *llm.ReclassifyVerdict
+	LeaderEventID string
 }
 
 func newReclassCache() *reclassCache {

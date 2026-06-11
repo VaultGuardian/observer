@@ -547,6 +547,14 @@ type ReclassifyVerdict struct {
 	Action         string  `json:"action"`
 	Downgraded     bool    `json:"downgraded"` // true if severity was reduced
 	Escalated      bool    `json:"escalated"`  // true if severity was increased (e.g. suspicious → malicious)
+	// GenericResponse is the model's positive assertion that the body is a
+	// generic, templated page (app shell, framework error page, login
+	// redirect, default 404) that contains no request-specific or sensitive
+	// data. Required field in the response schema; if the model omits it,
+	// json.Unmarshal leaves the zero value false — fail closed. Taken from
+	// the LLM as-is (unlike Downgraded/Escalated, which are recomputed
+	// client-side).
+	GenericResponse bool `json:"generic_response"`
 
 	// Call metadata (populated by the client, not the LLM)
 	PromptTokens     int    `json:"-"`
@@ -572,6 +580,8 @@ func (c *Client) ReclassifyWithEvidence(
 	contentType string,
 	contentLength int64,
 	safeBodyPreview string,
+	requestDuration time.Duration,
+	latencySource string,
 ) (*ReclassifyVerdict, error) {
 
 	systemPrompt := `You are a security response analyzer. You previously classified a log line as suspicious or malicious. Now you have the server's actual HTTP response.
@@ -607,13 +617,24 @@ the attack did not succeed visibly. Classify as recon_failed + suppress.
 
 === END WHAT TO LOOK FOR ===
 
-Respond ONLY with a JSON object:
+Respond ONLY with a JSON object. ALL fields are REQUIRED:
 {
   "classification": "safe" | "suspicious" | "malicious" | "recon_failed" | "recon_success",
   "confidence": 0.0 to 1.0,
   "reason": "brief explanation of what the response evidence shows",
-  "action": "allow" | "malicious" | "suppress" | "alert"
+  "action": "allow" | "malicious" | "suppress" | "alert",
+  "generic_response": true | false
 }
+
+GENERIC_RESPONSE FIELD (required):
+Set "generic_response" to true ONLY when the response body is a generic,
+templated page — an application shell, framework default error page, login
+redirect, or default 404 — that contains NO request-specific data and NO
+sensitive data. In other words: the server would serve these exact same bytes
+to anyone, for any request. This is a POSITIVE assertion that the body is
+boilerplate. "No breach evident" is NOT sufficient — a body can lack
+compromise evidence and still be request-specific or contain stripped
+sensitive values. When unsure, set it to false.
 
 RULES:
 - If the response body is a standard framework page (Laravel, Rails, Django, Express, etc.), error page, login page, or API status — the attack FAILED. The application ignored the malicious input. Classify as "recon_failed" + "suppress" with a reason explaining it's a normal response.
@@ -622,6 +643,7 @@ RULES:
 - The attack payload in the REQUEST still happened. You are judging the OUTCOME based on the RESPONSE.
 - A 200 status code does NOT mean the attack succeeded. Many apps return 200 for their default page regardless of query parameters.
 - A 403/404 with a large body could be a custom error page — check the content.
+- TIMING EVIDENCE: if an observed server processing time is provided and it is anomalously long for an error/4xx response to an injection-shaped request (e.g. SQL injection carrying SLEEP, WAITFOR DELAY, BENCHMARK, pg_sleep, or other time-based blind payloads), the delay itself can be evidence that the injected statement EXECUTED — successful time-based blind injection. Do NOT downgrade solely because the status code looks like a rejection when the timing is anomalous; weigh the timing as positive evidence.
 
 ESCALATION RULES — when to UPGRADE severity:
 - If the response body contains KEY=VALUE pairs with credentials (passwords, API keys, secret keys, tokens) → classify as "malicious" + "malicious". This is confirmed credential exposure.
@@ -677,6 +699,12 @@ Based on this response evidence, did the attack succeed or did the server ignore
 		contentLength,
 		safeBodyPreview,
 	)
+
+	// Wire-paired request duration, when REC measured one. Say nothing when
+	// absent — mentioning unavailability would only invite speculation.
+	if latencySource == "wire_pair" && requestDuration > 0 {
+		userPrompt += fmt.Sprintf("\n\nObserved server processing time: %d ms.", requestDuration.Milliseconds())
+	}
 
 	reqBody := map[string]interface{}{
 		"model": c.model,

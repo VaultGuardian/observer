@@ -742,15 +742,31 @@ func makeEvidenceCheckCallback(
 		if evidence != nil && evidence.Transport != nil {
 			code := evidence.Transport.StatusCode
 			if transportDowngradeCodes[code] {
-				reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
-				log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
-					snapshot.Key, code, evidence.CandidateCount)
-				return coordinator.EvidenceDecision{
-					Downgraded:      true,
-					Reason:          reason,
-					Evidence:        evidence,
-					EvidenceJournal: evidence.ForJournal(),
-					BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+				// Slow-response gate: a rejection-looking status that took
+				// anomalously long on the wire may itself be evidence
+				// (time-based blind injection — the Jun 11 2026 scanner
+				// incident class). Only real wire-paired durations close
+				// this gap; absent/unpaired durations downgrade exactly as
+				// before, deliberately — no regression for orphans.
+				if cfg.SlowResponseThresholdMs > 0 &&
+					evidence.Transport.RequestDuration > 0 &&
+					evidence.Transport.LatencySource == "wire_pair" &&
+					evidence.Transport.RequestDuration >= time.Duration(cfg.SlowResponseThresholdMs)*time.Millisecond {
+					log.Printf("[reclassify] Transport downgrade withheld: status=%d duration=%s key=%s",
+						code, evidence.Transport.RequestDuration, snapshot.Key)
+					// Fall through to Path 2 (body-aware) — the LLM sees
+					// the latency via the reclassify prompt.
+				} else {
+					reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
+					log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
+						snapshot.Key, code, evidence.CandidateCount)
+					return coordinator.EvidenceDecision{
+						Downgraded:      true,
+						Reason:          reason,
+						Evidence:        evidence,
+						EvidenceJournal: evidence.ForJournal(),
+						BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+					}
 				}
 			}
 		}
@@ -803,6 +819,16 @@ func makeEvidenceCheckCallback(
 			} else {
 				classification = "suspicious"
 			}
+		}
+		if snapshot.Verdict == "alert" && classification == "malicious" {
+			// Backstop for the T1-clamp leak: a clamped event routes at
+			// verdict "alert", but a sender may still carry the model's
+			// immutable original "malicious" as Classification. Feeding that
+			// to ReclassifyWithEvidence as originalClassification makes
+			// isEscalation("malicious","malicious") false — an
+			// evidence-confirmed breach on a clamped event could never
+			// escalate or notify. Normalize to the applied state.
+			classification = "suspicious"
 		}
 
 		bodyHash := rec.HashBody([]byte(evidence.SafeBodyPreview))
@@ -864,83 +890,158 @@ func makeEvidenceCheckCallback(
 			}
 		}
 
-		release, ok := scheduler.AcquireBlocking(ctx)
-		if !ok {
-			log.Printf("[reclassify] Context cancelled waiting for LLM slot")
-			// Return what evidence we have so catch-all re-arm can still fire.
+		// --- Path 2b: coalesced LLM reclassification ---
+		// Concurrent events with the same redacted body shape coalesce into
+		// one LLM flight, keyed on bodyHash. The leader is identified by its
+		// own snapshot.EventID on the shared result (the analyzer's
+		// LeaderEventID convention — never singleflight's shared bool).
+		// ORDERING (load-bearing, see ExpectedEndpoint header comment): the
+		// ExpectedEndpoint check and cache.get above stay OUTSIDE and BEFORE
+		// this group — operator-explicit truth never waits on, or shares, an
+		// LLM flight, and a cache hit never enters one. ctx is the single
+		// app context shared by every caller, so a leader cancellation is a
+		// follower cancellation — no divergence.
+		//
+		// Followers inherit the leader's verdict wholesale, including a
+		// Downgraded computed against the LEADER's originalClassification.
+		// The durable cache already replays entries with exactly this
+		// leader-relative semantics, so coalescing introduces nothing new.
+		res, flightErr, _ := cache.flight.Do(bodyHash, func() (interface{}, error) {
+			release, ok := scheduler.AcquireBlocking(ctx)
+			if !ok {
+				return nil, fmt.Errorf("context cancelled waiting for LLM slot")
+			}
+			// defer (not inline): a panic in ReclassifyWithEvidence must not
+			// leak the scheduler slot. The slot is therefore held through the
+			// Lane-A put and the audit write (bounded by its 5s timeout) —
+			// same pattern as the analyzer's runClassifyFlight.
+			defer release()
+			reclass, err := llmClient.ReclassifyWithEvidence(
+				ctx,
+				classification,
+				snapshot.Reason,
+				snapshot.Line,
+				evidence.Transport.StatusCode,
+				evidence.Transport.ContentType,
+				evidence.Transport.ContentLength,
+				evidence.SafeBodyPreview,
+				evidence.Transport.RequestDuration,
+				evidence.Transport.LatencySource,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			// One audit row per flight: real token counts belong to the real
+			// call, so only the leader records a decision. Runs BEFORE the
+			// Lane-A cache.put — see the gate below.
+			auditCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			auditErr := db.RecordLLMDecision(auditCtx, &store.LLMDecision{
+				EventID:          snapshot.EventID,
+				Timestamp:        time.Now(),
+				Tier:             "reclassify",
+				Model:            cfg.LLMModel,
+				ReasoningEffort:  cfg.Tier2Effort,
+				PromptTokens:     reclass.PromptTokens,
+				CompletionTokens: reclass.CompletionTokens,
+				LatencyMs:        reclass.LatencyMs,
+				SourceScope:      snapshot.ScopeKey,
+				RawLine:          snapshot.Line,
+				NormalizedLine:   snapshot.NormalizedLine,
+				EvidencePreview:  evidence.SafeBodyPreview,
+				EvidenceStatus:   evidence.Transport.StatusCode,
+				EvidenceType:     evidence.Transport.ContentType,
+				EvidenceHash:     evidence.Transport.BodyPreviewHash,
+				LLMResponseRaw:   reclass.ResponseRaw,
+				Classification:   reclass.Classification,
+				Action:           reclass.Action,
+				Confidence:       reclass.Confidence,
+				Reason:           reclass.Reason,
+				CacheKey:         bodyHash,
+				FinalVerdict:     reclass.Classification,
+				Escalated:        reclass.Escalated,
+				Downgraded:       reclass.Downgraded,
+			})
+			auditCancel()
+			if auditErr != nil {
+				log.Printf("[reclassify] WARN: audit write failed for %s: %v", snapshot.EventID, auditErr)
+			}
+
+			// Two-lane durable caching (intended behavior change, Jun 2026).
+			// Lane A — durable entry ONLY for downgrades with POSITIVE proof
+			// of boilerplate: the LLM attests generic_response AND redaction
+			// stripped zero sensitive values from the body.
+			// Lane B — everything else (escalations, non-generic downgrades,
+			// any body where the redactors stripped sensitive values) gets
+			// NO durable entry: concurrent identical bodies still coalesce
+			// via this flight group; sequential recurrences get a fresh LLM
+			// call. Replaying a benign verdict requires positive proof the
+			// body is boilerplate; replaying an escalation would cost one
+			// extra LLM call and buys a fresh look at every sensitive body.
+			// Cache key (redacted shape hash) and the hit path are unchanged
+			// — Lane B entries simply never exist.
+			//
+			// Gated on the audit write succeeding: a durable benign verdict
+			// must always have a llm_decisions row behind it, because the
+			// operator correction path invalidates this cache via the
+			// decision's CacheKey — an orphaned cache entry is
+			// uncorrectable. Skipping the put on audit failure is
+			// self-healing: the next identical body re-runs the LLM and
+			// re-attempts the audit.
+			//
+			// Known gap (accepted Jun 2026): stripped <script>/<style> blocks
+			// do NOT count toward SensitiveRedactions — deliberate, since
+			// counting them would empty Lane A for HTML. A shape whose only
+			// sensitive content lived inside those opaque blocks can
+			// therefore be durably cached as benign. This is the same
+			// visibility the per-event LLM has (it sees the stripped
+			// preview), so caching is no blinder than classifying. Real fix
+			// is the redaction-visibility work (backlog).
+			if auditErr == nil && reclass.Downgraded && reclass.GenericResponse &&
+				evidence.Disclosure != nil && evidence.Disclosure.SensitiveRedactions == 0 {
+				cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
+			}
+
+			return &reclassFlightResult{Reclass: reclass, LeaderEventID: snapshot.EventID}, nil
+		})
+		if flightErr != nil {
+			// Leader error (LLM failure or slot ctx-cancel) propagates to
+			// every waiter: evidence attached, verdict unchanged.
+			log.Printf("[reclassify] Error: %v — not changing verdict", flightErr)
 			return coordinator.EvidenceDecision{
 				Evidence:        evidence,
 				EvidenceJournal: evidence.ForJournal(),
 				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
 			}
 		}
-		reclass, err := llmClient.ReclassifyWithEvidence(
-			ctx,
-			classification,
-			snapshot.Reason,
-			snapshot.Line,
-			evidence.Transport.StatusCode,
-			evidence.Transport.ContentType,
-			evidence.Transport.ContentLength,
-			evidence.SafeBodyPreview,
-		)
-		release()
-		if err != nil {
-			log.Printf("[reclassify] Error: %v — not changing verdict", err)
-			return coordinator.EvidenceDecision{
-				Evidence:        evidence,
-				EvidenceJournal: evidence.ForJournal(),
-				BodyPreviewHash: evidence.Transport.BodyPreviewHash,
-			}
-		}
+		fr := res.(*reclassFlightResult)
+		reclass := fr.Reclass
 
-		cache.put(bodyHash, reclass.Downgraded, reclass.Escalated, reclass.Reason, reclass.Classification)
-
-		auditCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := db.RecordLLMDecision(auditCtx, &store.LLMDecision{
-			EventID:          snapshot.EventID,
-			Timestamp:        time.Now(),
-			Tier:             "reclassify",
-			Model:            cfg.LLMModel,
-			ReasoningEffort:  cfg.Tier2Effort,
-			PromptTokens:     reclass.PromptTokens,
-			CompletionTokens: reclass.CompletionTokens,
-			LatencyMs:        reclass.LatencyMs,
-			SourceScope:      snapshot.ScopeKey,
-			RawLine:          snapshot.Line,
-			NormalizedLine:   snapshot.NormalizedLine,
-			EvidencePreview:  evidence.SafeBodyPreview,
-			EvidenceStatus:   evidence.Transport.StatusCode,
-			EvidenceType:     evidence.Transport.ContentType,
-			EvidenceHash:     evidence.Transport.BodyPreviewHash,
-			LLMResponseRaw:   reclass.ResponseRaw,
-			Classification:   reclass.Classification,
-			Action:           reclass.Action,
-			Confidence:       reclass.Confidence,
-			Reason:           reclass.Reason,
-			CacheKey:         bodyHash,
-			FinalVerdict:     reclass.Classification,
-			Escalated:        reclass.Escalated,
-			Downgraded:       reclass.Downgraded,
-		}); err != nil {
-			log.Printf("[reclassify] WARN: audit write failed for %s: %v", snapshot.EventID, err)
+		reason := reclass.Reason
+		journal := evidence.ForJournal()
+		if fr.LeaderEventID != snapshot.EventID {
+			// Follower: no slot, no LLM call, no audit row. The note explains
+			// the missing llm_decisions row and names the leader whose call
+			// produced this verdict.
+			note := "coalesced with " + fr.LeaderEventID
+			reason += " (" + note + ")"
+			journal += " | " + note
 		}
-		auditCancel()
 
 		if reclass.Downgraded {
 			log.Printf("[DOWNGRADED] Original=%s→%s Reason=%s",
-				classification, reclass.Classification, reclass.Reason)
+				classification, reclass.Classification, reason)
 		} else if reclass.Escalated {
 			log.Printf("[ESCALATED] Original=%s→%s Reason=%s",
-				classification, reclass.Classification, reclass.Reason)
+				classification, reclass.Classification, reason)
 		}
 		return coordinator.EvidenceDecision{
 			Downgraded:      reclass.Downgraded,
 			Escalated:       reclass.Escalated,
-			Reason:          reclass.Reason,
+			Reason:          reason,
 			NewSeverity:     reclass.Classification,
 			Evidence:        evidence,
-			EvidenceJournal: evidence.ForJournal(),
+			EvidenceJournal: journal,
 			BodyPreviewHash: evidence.Transport.BodyPreviewHash,
 		}
 	}
@@ -1130,13 +1231,17 @@ func makeVerifyCallback(
 			if !acquired {
 				return &coordinator.VerifyResult{Confirmed: false, Reason: "context cancelled waiting for LLM slot"}
 			}
+			// defer (not inline): a panic in ReclassifyWithEvidence must not
+			// leak the scheduler slot.
+			defer release()
 			reclass, err := llmClient.ReclassifyWithEvidence(ctx,
 				"suspicious",
 				"Catch-all verification probe",
 				fmt.Sprintf("%s %s → %d", verifyMethod, path, resp.StatusCode),
 				resp.StatusCode, contentType, bodyLen, safePreview,
+				// Live probe — no wire-paired transport timing on this path.
+				0, "",
 			)
-			release()
 
 			if err != nil {
 				log.Printf("[verify] LLM error: %v — not confirming", err)
@@ -1465,6 +1570,13 @@ func runReconciler(ctx context.Context, db *store.Store) {
 
 			finalized := 0
 			for _, f := range findings {
+				// Observability only — the reconciler never auto-downgrades.
+				// The T1 clamp caps LLM-matched HTTP verdicts at alert, so an
+				// LLM-matched malicious reaching the timeout path means the
+				// clamp has a gap (or predates it).
+				if f.MatchedVia == "llm" && f.Verdict == "malicious" {
+					log.Printf("[reconciler] WARN: LLM-matched malicious finalized without evidence (event=%s) — should be impossible after the T1 clamp; investigate", f.EventID)
+				}
 				err := db.UpdateFindingResolution(ctx, f.EventID, "evidence_unavailable", "timeout", "")
 				if err != nil {
 					log.Printf("[reconciler] Failed to finalize %s: %v", f.EventID, err)

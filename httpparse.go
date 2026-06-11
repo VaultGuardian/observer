@@ -77,6 +77,12 @@ var reNormalizedHTTPBare = regexp.MustCompile(
 // Host stays empty — a morgan line carries no host; buffer.Lookup skips the
 // host filter when req.Host=="" so these events still correlate on
 // method+path+status+time-window.
+//
+// KEEP IN SYNC with reHTTPMorgan in internal/analyzer (parseHTTPIdentity) —
+// this parser decides an event IS HTTP for routing/REC, the analyzer's twin
+// drives the T1 malicious clamp and the learning gates. If they drift,
+// morgan lines route as HTTP but escape the clamp — LLM-malicious with no
+// evidence, the exact gap Format 4 parity closes.
 var reMorganHTTP = regexp.MustCompile(
 	`^(` + httpMethods + `)\s+(\S+)\s+(\d{3})\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+|-)`)
 
