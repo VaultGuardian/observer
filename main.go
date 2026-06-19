@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -510,6 +511,17 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 		// finding-write branches below.
 		evStatus, evCode, evCT, evHash, evMode := evidenceFields(alert.Evidence)
 
+		// Bare source name for the finding's SourceName column. Human corrections
+		// reconstruct scope as SourceType+":"+SourceName, so storing the full
+		// ScopeKey here would yield a phantom "docker:docker:<name>" scope the
+		// analyzer never matches. Prefer the carried bare name; fall back to
+		// stripping the SourceType prefix off ScopeKey for the catch-all path,
+		// which doesn't funnel through buildFinalAlert.
+		sourceName := alert.SourceName
+		if sourceName == "" && alert.ScopeKey != "" && alert.SourceType != "" {
+			sourceName = strings.TrimPrefix(alert.ScopeKey, alert.SourceType+":")
+		}
+
 		if alert.Downgraded {
 			log.Printf("[DOWNGRADED] EventID=%s key=%s events=%d Original→recon_failed Reason=%s",
 				alert.EventID, alert.Key, alert.EventCount, alert.DowngradeReason)
@@ -523,7 +535,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				EventID:              alert.EventID,
 				Timestamp:            alert.Timestamp,
 				SourceType:           alert.SourceType,
-				SourceName:           alert.ScopeKey,
+				SourceName:           sourceName,
 				DestHost:             alert.Host,
 				HTTPMethod:           alert.HTTPMethod,
 				HTTPPath:             alert.HTTPPath,
@@ -587,7 +599,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				EventID:              alert.EventID,
 				Timestamp:            alert.Timestamp,
 				SourceType:           alert.SourceType,
-				SourceName:           alert.ScopeKey,
+				SourceName:           sourceName,
 				DestHost:             alert.Host,
 				HTTPMethod:           alert.HTTPMethod,
 				HTTPPath:             alert.HTTPPath,
@@ -636,7 +648,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			EventID:              alert.EventID,
 			Timestamp:            alert.Timestamp,
 			SourceType:           alert.SourceType,
-			SourceName:           alert.ScopeKey,
+			SourceName:           sourceName,
 			DestHost:             alert.Host,
 			HTTPMethod:           alert.HTTPMethod,
 			HTTPPath:             alert.HTTPPath,

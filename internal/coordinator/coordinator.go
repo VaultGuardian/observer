@@ -108,6 +108,11 @@ type FinalAlert struct {
 	EventID    string
 	ScopeKey   string
 	SourceType string
+	// SourceName is the BARE source identity (e.g. "captain-nginx"), NOT the
+	// full ScopeKey ("docker:captain-nginx"). Carried from PendingAlert.SourceName
+	// so the dispatch finding stores a bare name; human corrections reconstruct
+	// scope as SourceType+":"+SourceName and must not double-prefix.
+	SourceName string
 	Reason     string
 	MatchedVia string
 	Hash       string
@@ -346,6 +351,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 				ScopeKey:        alert.ScopeKey,
 				Key:             key, // Section 3 follow-up: real coordinator key
 				SourceType:      alert.SourceType,
+				SourceName:      alert.SourceName,
 				Reason:          alert.Reason,
 				MatchedVia:      alert.MatchedVia,
 				Hash:            alert.Hash,
@@ -805,6 +811,7 @@ func buildFinalAlert(pending *PendingAlert, shape finalShape) *FinalAlert {
 		ScopeKey:        pending.ScopeKey,
 		Key:             pending.Key, // Section 3 follow-up: real coordinator key for logs/DB
 		SourceType:      pending.SourceType,
+		SourceName:      pending.SourceName,
 		Reason:          reason,
 		MatchedVia:      pending.MatchedVia,
 		Hash:            pending.Hash,

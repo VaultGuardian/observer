@@ -128,6 +128,35 @@ func waitForDispatch(t *testing.T, fd *fakeDispatcher, n int, within time.Durati
 	t.Fatalf("timed out waiting for %d dispatch(es); got %d", n, fd.count())
 }
 
+// TestBuildFinalAlertCarriesBareSourceName guards the scope double-prefix fix:
+// buildFinalAlert must copy PendingAlert.SourceName (the BARE identity) into
+// FinalAlert.SourceName, NOT the full ScopeKey. Storing ScopeKey there caused
+// human corrections to reconstruct a phantom "docker:docker:<name>" scope.
+func TestBuildFinalAlertCarriesBareSourceName(t *testing.T) {
+	pending := &PendingAlert{
+		EventID:    "evt_scope",
+		ScopeKey:   "docker:captain-nginx",
+		SourceType: "docker",
+		SourceName: "captain-nginx",
+		Verdict:    "alert",
+		Severity:   "alert",
+	}
+
+	final := buildFinalAlert(pending, finalShape{})
+
+	if final.SourceName != "captain-nginx" {
+		t.Fatalf("FinalAlert.SourceName = %q, want bare %q", final.SourceName, "captain-nginx")
+	}
+	if final.SourceName == final.ScopeKey {
+		t.Fatalf("FinalAlert.SourceName must be the bare name, not the full ScopeKey %q", final.ScopeKey)
+	}
+	// The whole point: SourceType + ":" + SourceName must reconstruct the
+	// canonical scope, not double-prefix it.
+	if got := final.SourceType + ":" + final.SourceName; got != "docker:captain-nginx" {
+		t.Fatalf("reconstructed scope = %q, want %q", got, "docker:captain-nginx")
+	}
+}
+
 // TestTimeoutDefersToInFlightDowngrade is the core regression: the finalize
 // deadline fires while a VIP-initiated evidence check is in flight; the
 // timeout must defer (no suspicious dispatch, pending preserved) and the
