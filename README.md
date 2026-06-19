@@ -4,7 +4,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/Go-1.25-00ADD8.svg)](go.mod) [![Platform](https://img.shields.io/badge/platform-Linux%2FDocker-lightgrey.svg)]()
 
-Observer is a single Go binary that watches your Docker and Linux logs, classifies suspicious activity, and — when it can — captures the server's response to answer the question most security tools skip:
+Observer is a single Go binary that watches your Docker and Linux logs, classifies suspicious activity, and when it can, captures the server's response to answer the question most security tools skip:
 
 > **Did the attack actually work?**
 
@@ -38,7 +38,7 @@ The product decision: **email on confirmed impact, log everything else.**
 
 Two real attacks caught in production. Both look the same at the request layer. Observer treats them very differently because of what the server actually returned.
 
-### Failed attack — Netgear botnet probe
+### Failed attack: Netgear botnet probe
 
 An IoT botnet tried to exploit a Netgear router vulnerability to download and execute malware:
 
@@ -50,16 +50,16 @@ GET /setup.cgi?cmd=rm+-rf+/tmp/*;wget+malware;sh+netgear
 
 What Observer did:
 
-1. **Tier 1 classification:** the LLM read the log line, identified command execution via `setup.cgi`, returned `malicious` at 0.78 confidence. No pattern was learned (malicious verdicts deliberately do not auto-learn broad patterns).
-2. **Coordinator held for evidence:** instead of firing immediately, the finding was held 2–5 seconds while REC delivered the response.
+1. **Tier 1 classification:** the LLM read the log line, identified command execution via `setup.cgi`, returned `malicious` at 0.78 confidence. Only the exact normalized hash was cached; no broad pattern was learned (malicious verdicts deliberately do not auto-learn prefix/regex/contains patterns).
+2. **Coordinator held for evidence:** instead of firing immediately, the finding was held through a 5-second evidence window (10-second finalize) while REC delivered the response.
 3. **REC captured the HTTP response:** the reverse proxy returned `404 Not Found`. The path doesn't exist on this server.
 4. **Final verdict: `recon` (downgraded by evidence).** Recorded as probe intelligence. **No email**, no incident.
 
 That's one alert saved. Multiply by the thousands of automated probes a public server sees daily. A dedicated Probes view to separate failed-probe intelligence from active findings is coming in v1.1; today, recon events are visible in the findings list filtered by verdict.
 
-### Successful attack — CVE-2025-55182 (React2Shell)
+### Successful attack: CVE-2025-55182 (React2Shell)
 
-We deployed a vulnerable Next.js 15.0.0 test container and fired the public PoC for [CVE-2025-55182](https://nvd.nist.gov/vuln/detail/CVE-2025-55182) — a CVSS 10.0 pre-auth RCE that achieved arbitrary code execution as root. The attacker dumped `/etc/passwd`:
+We deployed a vulnerable Next.js 15.0.0 test container and fired the public PoC for [CVE-2025-55182](https://nvd.nist.gov/vuln/detail/CVE-2025-55182), a CVSS 10.0 pre-auth RCE that achieved arbitrary code execution as root. The attacker dumped `/etc/passwd`:
 
 ![Observer React2Shell escalation](docs/images/react2shell-escalated.png)
 
@@ -73,7 +73,7 @@ We deployed a vulnerable Next.js 15.0.0 test container and fired the public PoC 
   MatchedVia=seeded (non-HTTP malicious, direct dispatch)
 ```
 
-A seeded pattern matched `root:x:0:0:root` in the container's output. Verdict: `malicious`, instantly, deterministically. **Email sent. Zero LLM calls** — the credential dump tripped a hard-coded seed before the AI was even consulted.
+A seeded pattern matched `root:x:0:0:root` in the container's output. Verdict: `malicious`, instantly, deterministically. **Email sent. Zero LLM calls.** The credential dump tripped a hard-coded seed before the AI was even consulted.
 
 Same Tier 1 shape as the Netgear case. Different Tier 2 outcome. Different operator experience.
 
@@ -81,22 +81,20 @@ Same Tier 1 shape as the Netgear case. Different Tier 2 outcome. Different opera
 
 ## How it works
 
-Observer's pipeline is deterministic-first. The LLM is consulted only for events Observer hasn't seen before — typically under 5% of traffic in production.
+Observer's pipeline is deterministic-first. The LLM is consulted only for events Observer hasn't seen before, typically under 5% of traffic in production.
 
 ```
 log line arrives (Docker container or journald)
    │
    ▼
-deterministic filters    stack traces, failed HTTP probes, SSH brute force
-   │
-   ▼
 policy engine            SSH logins, user creation, privilege escalation
-   │
+   │                     runs first; identity-based, trusted-IP allowlist
    ▼
-seed patterns            credential dumps, reverse shells, private keys
-   │
+deterministic filters    stack traces, failed HTTP probes, SSH brute force
+   │                     (inside the analyzer)
    ▼
 pattern store            4 buckets × 4 tiers (hash → prefix → regex → contains)
+   │                     seeded malicious patterns live here as contains-tier entries
    │                     known-good?  → skip silently
    │                     known-noise? → suppress silently
    │                     known-bad?   → coordinator holds for evidence
@@ -121,15 +119,14 @@ verdict                  recon       → record as probe intelligence, no email
 
 ### Pipeline layers
 
-1. **Deterministic filters** — Stack traces, failed HTTP probes, SSH brute force. Structural detection. Never touches the LLM.
-2. **Policy engine** — SSH logins, user creation, privilege escalation, `authorized_keys` modification. Identity-based decisions with trusted IP allowlist.
-3. **Seed patterns** — Credential file contents (`root:x:0:0:`), private keys (`BEGIN RSA PRIVATE KEY`), reverse shells (`bash -i >& /dev/tcp`), download-and-execute chains (`curl | sh`). Deterministic substring match, instant `malicious` verdict, direct email dispatch.
-4. **Pattern store** — Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). In-memory lookups, no network round-trip. Cache hit rate runs above 97% in production once the system has seen a few days of traffic.
-5. **LLM classifier** — OpenAI-compatible API. Intent × outcome classification. Local Ollama by default, hosted endpoint optional. Bounded retry queue handles backpressure.
-6. **REC (Response Evidence Capture)** — AF_PACKET sniffer inside the reverse proxy's network namespace. Full TCP reassembly via gopacket. Captures HTTP responses, redacts secrets structurally, correlates with alerts. VIP lane protects malicious evidence from traffic-flood eviction.
-7. **Coordinator** — Groups alerts, holds for evidence (2–5 s), downgrades false alarms, dispatches findings. Email only on confirmed impact.
-8. **Catch-all suppression** — Learns server response fingerprints (host, status, body hash). Auto-downgrades repeated identical responses across different attack paths.
-9. **Evidence reconciler** — Background process finalizes unresolved findings. Marks as `evidence_unavailable` after a timeout if REC never captured a response — honest, not silent.
+1. **Policy engine**: SSH logins, user creation, privilege escalation, `authorized_keys` modification. Runs first. Identity-based decisions with a trusted-IP allowlist.
+2. **Deterministic filters**: Stack traces, failed HTTP probes, SSH brute force. Structural detection inside the analyzer. Never touches the LLM.
+3. **Pattern store**: Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). In-memory lookups, no network round-trip. Curated seed patterns (credential file contents, private keys, reverse shells, download-and-execute and destructive commands) are pre-loaded here as contains-tier malicious entries, so a seed match is an instant `malicious` verdict with direct email dispatch. Cache hit rate runs above 97% in production once the system has seen a few days of traffic.
+4. **LLM classifier**: OpenAI-compatible API. Intent × outcome classification. Local Ollama by default, hosted endpoint optional. Bounded retry queue handles backpressure.
+5. **REC (Response Evidence Capture)**: AF_PACKET sniffer inside the reverse proxy's network namespace. Full TCP reassembly via gopacket. Captures HTTP responses, redacts secrets structurally, correlates with alerts. VIP lane protects malicious evidence from traffic-flood eviction.
+6. **Coordinator**: Groups alerts, holds for evidence (5 s evidence window, 10 s finalize), downgrades false alarms, dispatches findings. Email only on confirmed impact.
+7. **Catch-all suppression**: Learns server response fingerprints (host, status, body hash). Auto-downgrades repeated identical responses across different attack paths.
+8. **Evidence reconciler**: Background process finalizes unresolved findings. Marks as `evidence_unavailable` after a timeout if REC never captured a response. Honest, not silent.
 
 The whole thing ships as one Go binary. Single static build, no CGO, runs as a systemd service.
 
@@ -150,7 +147,7 @@ This means:
 - **API costs are zero.** Ollama is free; the only cost is the compute to run it.
 - **Air-gapped deployments work.** If your environment can't reach the public internet, Observer still works as long as Ollama is reachable on the LAN.
 
-The installer asks which provider you want before configuring — Ollama or any OpenAI-compatible endpoint (OpenAI, Together, Groq, vLLM, Anthropic via OpenAI-compatible proxy, or your own self-hosted gateway). Observer uses standard `POST /v1/chat/completions`. There's no vendor lock-in.
+The installer asks which provider you want before configuring: Ollama or any OpenAI-compatible endpoint (OpenAI, Together, Groq, vLLM, Anthropic via OpenAI-compatible proxy, or your own self-hosted gateway). Observer uses standard `POST /v1/chat/completions`. There's no vendor lock-in.
 
 For regulated environments, the local-Ollama path helps avoid the first privacy objection: logs do not need to leave your network for classification.
 
@@ -160,13 +157,15 @@ For regulated environments, the local-Ollama path helps avoid the first privacy 
 
 | Verdict | Meaning | Emails? |
 |---|---|---|
-| `recon` | Suspicious request that didn't work — failed probe, hit a 404/403/410/405, or got blocked upstream. Recorded as probe intelligence. | No |
+| `recon` | Suspicious request that didn't work: failed probe, hit a 400/403/404/405/410, or got blocked upstream. Recorded as probe intelligence. | No |
 | `alert` | Suspicious request, outcome unclear. Logged with whatever evidence Observer has. | Configurable |
 | `malicious` | Confirmed impact. REC captured a response containing evidence of exploitation, or a seeded pattern matched. | **Yes** |
-| `policy` | Operator-defined deny rules. Always escalates regardless of outcome. | Yes |
+| `policy` | Operator-defined identity rules (SSH logins, user creation, privilege escalation, `authorized_keys`). Escalating hits are stored as `malicious` with classification `policy_escalated` and emailed; lower-risk hits (trusted-IP SSH login, failed sudo) resolve to `allow`/`alert` with no email. | Conditional |
 | `allow` | Known-safe traffic shape. Cached, never re-classified. | No |
 | `suppress` | Known-noise pattern (operational scanners, health checks). Counted but not surfaced. | No |
 | `evidence_unavailable` | Observer flagged the request but couldn't capture a response. Honest, not silent. | No |
+
+> `evidence_unavailable` is a resolution state the reconciler stamps on a finding when REC never captured a response. It is applied on top of the finding's existing verdict, not a verdict in its own right.
 
 Observer tries to avoid escalating failed probes and known noise, but it does not downgrade evidence of impact. If response evidence, seeded patterns, or policy rules show compromise or disclosure, the event escalates.
 
@@ -176,13 +175,13 @@ Observer tries to avoid escalating failed probes and known noise, but it does no
 
 Below is the OpenAI usage chart from one operator running Observer across three production servers for a 30-day window:
 
-![OpenAI usage — 30 days, 3 servers running Observer](docs/images/openai-usage-30d.png)
+![OpenAI usage over 30 days, 3 servers running Observer](docs/images/openai-usage-30d.png)
 
-**Total spend: $34.02** for 30 days across 3 servers — 35,888 LLM requests, ~88M tokens. Those 35,888 requests are the *novel* events that missed the deterministic cache and reached the cloud model; the vast majority of traffic was classified locally and never cost a thing.
+**Total spend: $34.02** for 30 days across 3 servers: 35,888 LLM requests, ~88M tokens. Those 35,888 requests are the *novel* events that missed the deterministic cache and reached the cloud model; the vast majority of traffic was classified locally and never cost a thing.
 
-That total includes two anomalous spike days — Apr 28 ($9.24) and Apr 29 ($11.24) — a runaway-loop bug shipped during development. Backing those out, baseline 30-day spend across all 3 servers was about **$13.50**, or roughly **15 cents per server per day**.
+That total includes two anomalous spike days (Apr 28 at $9.24 and Apr 29 at $11.24) from a runaway-loop bug shipped during development. Backing those out, baseline 30-day spend across all 3 servers was about **$13.50**, or roughly **15 cents per server per day**.
 
-Per-request cost works out to around **$0.0009** — under a tenth of a cent per event that reached the LLM.
+Per-request cost works out to around **$0.0009**, under a tenth of a cent per event that reached the LLM.
 
 The reason it's cheap is **not** that the LLM is cheap. It's that the LLM is rarely consulted. The deterministic-first pipeline (hash cache + pattern store + seeded matches + REC short-circuits) handles 97%+ of events without ever calling the LLM. Cloud-API cost scales with novel events, not with traffic volume.
 
@@ -222,14 +221,14 @@ Then write the systemd unit and `/etc/vaultguardian/observer.env` by hand. The `
 The installer prompts for:
 - LLM provider (Ollama or any OpenAI-compatible endpoint). It probes for a local Ollama instance and recommends it by default; the cloud path is an explicit opt-in.
 - LLM model name
-- Server nickname (used in alert emails — defaults to system hostname)
+- Server nickname (used in alert emails; defaults to system hostname)
 - Dashboard API port (default `9090`)
 - Resend API key, alert destination address, and sender ("From") address (optional). The From address defaults to Resend's pre-verified sandbox sender (`onboarding@resend.dev`), so email works out of the box before you've verified your own domain.
 - Whether to enable Response Evidence Capture (REC)
 
-Re-running the installer over an existing install detects your `/etc/vaultguardian/observer.env` and **preserves it** — your settings (bind address, CORS allowlist, REC tuning, notifier config) are kept, the configuration prompts are skipped, and only the binary and systemd unit are refreshed. To change settings, edit the env file directly and `systemctl restart observer`; to reconfigure from scratch, remove the env file first. For binary-only upgrades, prefer `vaultguardian update`.
+Re-running the installer over an existing install detects your `/etc/vaultguardian/observer.env` and **preserves it**: your settings (bind address, CORS allowlist, REC tuning, notifier config) are kept, the configuration prompts are skipped, and only the binary and systemd unit are refreshed. To change settings, edit the env file directly and `systemctl restart observer`; to reconfigure from scratch, remove the env file first. For binary-only upgrades, prefer `vaultguardian update`.
 
-Docker containers are monitored automatically if Docker is present. If not, Observer watches everything via journald — the policy engine, classification, and email alerts all work on a bare-metal server with nothing but `sshd`.
+Docker containers are monitored automatically if Docker is present. If not, Observer watches everything via journald. The policy engine, classification, and email alerts all work on a bare-metal server with nothing but `sshd`.
 
 After install, manage with the CLI:
 
@@ -237,6 +236,7 @@ After install, manage with the CLI:
 vaultguardian status          # Service status + recent logs
 vaultguardian logs            # Tail logs
 vaultguardian stats           # Pipeline performance
+vaultguardian rec status      # REC coverage + port status
 vaultguardian update          # Update to latest release
 vaultguardian update v0.48    # Update to a specific version
 vaultguardian restart         # Restart observer
@@ -261,7 +261,7 @@ Configuration is environment variables, loaded from `/etc/vaultguardian/observer
 | `JOURNALD_ENABLED` | (unset) | Set to `true` to watch host journald |
 | `EXCLUDE_CONTAINERS` | | Comma-separated container names to skip |
 | `JOURNALD_EXCLUDE_UNITS` | | Additional systemd units to suppress |
-| `HOSTNAME` | (system hostname) | Label for this server, included in alert emails alongside the IP. The installer's "server nickname" prompt writes this. |
+| `HOSTNAME` | (empty; falls back to system hostname) | Label for this server, included in alert emails alongside the IP. The installer's "server nickname" prompt writes this. |
 
 ### LLM
 
@@ -301,7 +301,7 @@ Additional REC tuning knobs exist (`REC_FLOW_*`, `REC_REASSEMBLY_MAX_BUFFERED_PA
 | Variable | Default | Description |
 |---|---|---|
 | `DASHBOARD_PORT` | `9090` | Port the API listens on |
-| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address — defaults to localhost only |
+| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address; defaults to localhost only |
 | `DASHBOARD_KEY_FILE` | `/etc/vaultguardian/dashboard.key` | Path to bearer token file (auto-generated) |
 | `DASHBOARD_ALLOWED_ORIGINS` | (none) | Comma-separated CORS allowlist; empty = no CORS headers |
 
@@ -330,9 +330,10 @@ When configured, escalation emails include the `HOSTNAME` (above) and the server
 
 **Seed patterns (deterministic, no LLM needed):**
 - System credential file contents (`root:x:0:0:root`) in any log stream → instant escalation
-- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`) → instant escalation
-- Reverse shells (`bash -i >& /dev/tcp`) → instant escalation
+- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`, `BEGIN EC PRIVATE KEY`, `BEGIN PRIVATE KEY`) → instant escalation
+- Reverse shells (`bash -i >& /dev/tcp`, `nc -e /bin/sh`) → instant escalation
 - Remote code execution chains (`curl | sh`, `wget | sh`, `base64 -d | bash`) → instant escalation
+- Destructive commands (`rm -rf /`) → instant escalation
 
 **LLM classification (learns over time):**
 - SQL injection, shell injection, PHP wrappers, encoded exploits
@@ -342,7 +343,7 @@ When configured, escalation emails include the `HOSTNAME` (above) and the server
 - Data exfiltration patterns (command output, env dumps, credential leaks)
 
 **Deterministic suppression (never hits the LLM):**
-- Failed HTTP probes — `400`/`403`/`404`/`405`/`410` responses, regardless of path or payload. A 404 on `/.env` is still a 404; nothing was disclosed at the router. The only thing that bypasses this filter is **actual disclosure evidence in the log line itself** (e.g., a credential dump in the response body), which escalates regardless of status code. Body-parser exploits that succeed (XXE, deserialization, Log4Shell) generate downstream log lines — process spawns, file reads, response disclosures — that the seed patterns, policy engine, and REC catch with confirmed-impact evidence rather than request-shape suspicion.
+- Failed HTTP probes: `400`/`403`/`404`/`405`/`410` responses, regardless of path or payload. A 404 on `/.env` is still a 404; nothing was disclosed at the router. The only thing that bypasses this filter is **actual disclosure evidence in the log line itself** (e.g., a credential dump in the response body), which escalates regardless of status code. Body-parser exploits that succeed (XXE, deserialization, Log4Shell) generate downstream log lines (process spawns, file reads, response disclosures) that the seed patterns, policy engine, and REC catch with confirmed-impact evidence rather than request-shape suspicion.
 - Application stack traces (Node.js, Python, Go, Java)
 - SSH brute force (thousands per day on every public server)
 - Nginx file-not-found errors
@@ -393,7 +394,7 @@ Honest disclaimers. Security tools that overclaim are worse than security tools 
 - **Not a replacement for patching.** Observer telling you an attack failed because it hit a 404 doesn't mean the application is secure. Patch your stuff.
 - **Not a full SIEM.** Observer focuses on log security and response-evidence verification. It doesn't do log aggregation across infrastructure, compliance reporting, or long-term forensic storage. If you have a SIEM, Observer complements it; it does not replace it.
 - **Not a firewall or IPS.** Observer observes. It doesn't block traffic, drop connections, or modify packets. Use it alongside a real edge filter.
-- **Not magic exploit detection.** REC captures HTTP response evidence when it can. Edge cases — mid-stream attach during Observer restart, responses generated upstream of the sniffed device, encrypted tunnels that don't traverse the sniffed namespace — produce findings without evidence. Observer marks those `evidence_unavailable` rather than guessing.
+- **Not magic exploit detection.** REC captures HTTP response evidence when it can. Edge cases (mid-stream attach during Observer restart, responses generated upstream of the sniffed device, encrypted tunnels that don't traverse the sniffed namespace) produce findings without evidence. Observer marks those `evidence_unavailable` rather than guessing.
 - **Not a guarantee.** No security tool is. Observer reduces alert fatigue and surfaces real impact when it can. It does not eliminate the need for skilled operators.
 
 ---
@@ -401,11 +402,16 @@ Honest disclaimers. Security tools that overclaim are worse than security tools 
 ## Project structure
 
 ```
-├── main.go                     # Pipeline wiring, coordinator, retry queue, reconciler
-├── seeds.go                    # Curated malicious pattern seeds
+├── main.go                     # Pipeline wiring, coordinator, reconciler
+├── llmscheduler.go             # Bounded LLM retry / scheduler queue
 ├── resultrouter.go             # Shared classification outcome handler
+├── reclasscache.go             # Reclassification (evidence) cache
+├── httpparse.go                # HTTP request/response parsing helpers
+├── seeds.go                    # Curated malicious pattern seeds
 ├── config.go                   # Environment variable configuration
 ├── install.sh                  # One-command installer
+├── release.sh                  # Build, test, tag, and publish a release
+├── docs/                       # Configuration reference + images
 ├── internal/
 │   ├── analyzer/               # Normalize → match → classify → learn
 │   ├── api/                    # REST API + bearer token auth
@@ -413,7 +419,7 @@ Honest disclaimers. Security tools that overclaim are worse than security tools 
 │   ├── event/                  # Canonical event model
 │   ├── llm/                    # LLM client, Tier 1 + Tier 2 prompts
 │   ├── normalizer/             # Source-specific log normalization
-│   ├── notifier/               # Email (Resend), webhook
+│   ├── notifier/               # Email (Resend) + webhook (APNS/FCM/SMS present, not yet exposed)
 │   ├── patternstore/           # 4-bucket, 4-tier pattern matching
 │   ├── policy/                 # Deterministic pre-LLM policy engine
 │   ├── rec/                    # Response Evidence Capture (AF_PACKET)
@@ -472,9 +478,9 @@ If you're unsure whether your use case falls within the license, open an issue a
 - **Security disclosures:** `security@vaultguardian.io` (PGP key on the website)
 - **General questions:** [GitHub Discussions](https://github.com/VaultGuardian/observer/discussions) or `hello@vaultguardian.io`
 
-Observer came out of building [VaultDEC-1](https://vaultguardian.io). DEC-1 is a Layer 2 invisible inline bridge that severs the connection to the backup server when it sees exfiltration starting — and that part turned out to be the easy half. The harder problem was that DEC-1 only catches the attacker on the way out. By the time they're trying to leave, they've already been on the network, already navigated to whatever they were looking for, already decided what to take.
+Observer came out of building [VaultDEC-1](https://vaultguardian.io). DEC-1 is a Layer 2 invisible inline bridge that severs the connection to the backup server when it sees exfiltration starting, and that part turned out to be the easy half. The harder problem was that DEC-1 only catches the attacker on the way out. By the time they're trying to leave, they've already been on the network, already navigated to whatever they were looking for, already decided what to take.
 
-Observer is the half of the story that runs earlier — the probes, the recon, the failed and successful exploits — so an operator can know *while* an attacker is on the box, not after.
+Observer is the half of the story that runs earlier, covering the probes, the recon, the failed and successful exploits, so an operator can know *while* an attacker is on the box, not after.
 
 If it's useful to you, a star on the repo helps it find other people in the same situation.
 
