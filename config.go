@@ -17,6 +17,7 @@ type Config struct {
 	LLMModel          string
 	LLMAPIKey         string
 	SelfID            string
+	Hostname          string
 	ExcludeContainers map[string]bool
 
 	// Response Evidence Capture
@@ -174,6 +175,16 @@ func LoadConfig() Config {
 		RECFlowMaxRespPerFlow:    getEnvInt("REC_FLOW_MAX_RESP_PER_FLOW", 64),
 		RECFlowRespOrphanTimeout: getEnvDuration("REC_FLOW_RESP_ORPHAN_TIMEOUT", 2*time.Second),
 		RECFlowReqExpireTimeout:  getEnvDuration("REC_FLOW_REQ_EXPIRE_TIMEOUT", 30*time.Second),
+	}
+
+	// Hostname is the label shown in alert emails. Falls back to the
+	// system hostname when HOSTNAME is unset. Distinct from SelfID, which
+	// drives self-log-skip and is left env-only on purpose.
+	cfg.Hostname = cfg.SelfID
+	if cfg.Hostname == "" {
+		if h, err := os.Hostname(); err == nil {
+			cfg.Hostname = h
+		}
 	}
 
 	// Parse dashboard port

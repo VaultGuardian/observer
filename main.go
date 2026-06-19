@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -102,6 +103,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("[observer] Failed to load notification config: %v", err)
 	}
+	notifCfg.Hostname = cfg.Hostname
+	notifCfg.ServerIP = detectPrimaryIP()
+	log.Printf("[notifier] alerts labeled host=%q ip=%q", notifCfg.Hostname, notifCfg.ServerIP)
 	dispatch, err := notifier.NewDispatcher(notifCfg)
 	if err != nil {
 		log.Fatalf("[observer] Failed to init notifications: %v", err)
@@ -1700,4 +1704,19 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			})
 		}
 	}
+}
+
+// detectPrimaryIP returns the egress IPv4 of this host using a UDP dial that
+// selects the outbound interface without sending any packets. Returns "" on
+// any error; callers treat empty as "IP unknown" and omit it from alerts.
+func detectPrimaryIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil {
+		return ua.IP.String()
+	}
+	return ""
 }

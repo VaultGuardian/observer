@@ -22,6 +22,12 @@ type Config struct {
 	Routing    RoutingConfig     `yaml:"routing"`
 	RateLimits RateLimitConfig   `yaml:"rate_limits"`
 	QuietHours *QuietHoursConfig `yaml:"quiet_hours,omitempty"`
+
+	// Server-identity labels stamped onto every dispatched alert. Populated
+	// at startup (not from YAML): Hostname is the operator-facing label,
+	// ServerIP the detected egress IP (empty when detection fails).
+	Hostname string `yaml:"-"`
+	ServerIP string `yaml:"-"`
 }
 
 // --- Channel configs (populated from env vars) ---
@@ -199,13 +205,13 @@ func applyDefaults(cfg *Config) {
 }
 
 func generateDefaultConfig(path string) error {
-	content := `# VaultGuardian Observer — Notification Config
+	content := `# VaultGuardian Observer Notification Config
 # Auto-generated on first run. Edit to customize.
 #
 # Secrets (API keys, tokens) are configured via environment variables.
 # This file controls behavior only: routing, rate limits, quiet hours.
 
-# Severity routing — which channels fire for which threat level.
+# Severity routing: which channels fire for which threat level.
 # Available channels: webhook, email, sms, push/ios, push/fcm
 routing:
   malicious:  [webhook, email, sms, push/ios, push/fcm]  # all hands on deck
@@ -221,7 +227,7 @@ rate_limits:
   push_ios: "30s"
   push_fcm: "30s"
 
-# Quiet hours — silence noisy channels overnight.
+# Quiet hours: silence noisy channels overnight.
 # Uncomment to enable.
 # quiet_hours:
 #   start: "23:00"

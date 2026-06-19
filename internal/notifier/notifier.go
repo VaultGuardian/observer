@@ -47,6 +47,8 @@ type Alert struct {
 	Confidence     float64       `json:"confidence,omitempty" yaml:"confidence,omitempty"`
 	Timestamp      time.Time     `json:"timestamp" yaml:"timestamp"`
 	Evidence       *rec.Evidence `json:"evidence,omitempty" yaml:"evidence,omitempty"` // REC response evidence (Phase 1: enrichment-only)
+	Hostname       string        `json:"hostname,omitempty" yaml:"hostname,omitempty"`
+	ServerIP       string        `json:"server_ip,omitempty" yaml:"server_ip,omitempty"`
 }
 
 // Notifier is the interface every notification channel implements.
@@ -159,6 +161,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) int {
 		return 0
 	default:
 	}
+
+	// Stamp the server-identity labels onto the enqueued copy. alert is a
+	// value parameter, so this single write covers every channel fan-out
+	// below (and the webhook, which embeds the whole Alert).
+	alert.Hostname = d.config.Hostname
+	alert.ServerIP = d.config.ServerIP
 
 	allowedChannels := d.config.Routing.ChannelsFor(alert.Severity)
 	enqueued := 0
@@ -408,5 +416,11 @@ func formatAlertTitle(alert Alert) string {
 	case SeverityAlert:
 		icon = "ℹ️"
 	}
-	return fmt.Sprintf("%s [%s] %s — %s", icon, alert.Severity, alert.ContainerName, alert.Reason)
+	title := fmt.Sprintf("%s [%s] %s: %s", icon, alert.Severity, alert.ContainerName, alert.Reason)
+	if alert.Hostname != "" {
+		// Prefix the firing host so multi-server operators can tell at a
+		// glance which box raised the alert straight from the subject line.
+		title = fmt.Sprintf("[%s] %s", alert.Hostname, title)
+	}
+	return title
 }

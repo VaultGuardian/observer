@@ -162,6 +162,24 @@ func formatEmailHTML(alert Alert) string {
       </div>`, esc(string(alert.Evidence.Status)))
 	}
 
+	// Server-identity row. Shown only when a hostname is present:
+	// "hostname (ip)" when the egress IP was detected, hostname alone
+	// otherwise. Both values are attacker-irrelevant but escaped defensively
+	// per the esc() P0 invariant. Empty hostname adds no markup at all.
+	serverRow := ""
+	if alert.Hostname != "" {
+		serverVal := esc(alert.Hostname)
+		if alert.ServerIP != "" {
+			serverVal = fmt.Sprintf(`%s <span style="color:#9ca3af;">(%s)</span>`,
+				esc(alert.Hostname), esc(alert.ServerIP))
+		}
+		serverRow = fmt.Sprintf(`
+        <tr>
+          <td style="padding:8px 0;color:#6b7280;width:120px;">Server</td>
+          <td style="padding:8px 0;">%s</td>
+        </tr>`, serverVal)
+	}
+
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px;background:#f9fafb;">
@@ -170,7 +188,7 @@ func formatEmailHTML(alert Alert) string {
       <h2 style="margin:0;font-size:16px;font-weight:600;">VaultGuardian Observer Alert</h2>
     </div>
     <div style="padding:24px;">
-      <table style="width:100%%;border-collapse:collapse;font-size:14px;">
+      <table style="width:100%%;border-collapse:collapse;font-size:14px;">%s
         <tr>
           <td style="padding:8px 0;color:#6b7280;width:120px;">Severity</td>
           <td style="padding:8px 0;font-weight:600;">%s</td>
@@ -206,6 +224,7 @@ func formatEmailHTML(alert Alert) string {
 </body>
 </html>`,
 		severityColor,               // not attacker-controlled (switch output)
+		serverRow,                   // already escaped field-by-field above
 		esc(string(alert.Severity)), // enum but escape defensively
 		esc(alert.ContainerName),    // ATTACKER-CONTROLLED
 		esc(alert.ContainerID[:minInt(12, len(alert.ContainerID))]), // hex but escape defensively
