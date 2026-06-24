@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — build, checksum, and publish an Observer release.
+# release.sh - build, checksum, and publish an Observer release.
 #
 # Usage:
 #   ./release.sh vX.Y.Z "Release title" "Release notes"
@@ -10,7 +10,7 @@
 # as assets on a GitHub release. Runs the same gofmt/vet/test gate as CI
 # first so a broken build never ships.
 #
-# Commit/push and server deploy (`vaultguardian update vX.Y.Z`) stay manual —
+# Commit/push and server deploy (`vaultguardian update vX.Y.Z`) stay manual -
 # this script only cuts the release.
 set -euo pipefail
 VERSION="${1:-}"
@@ -26,13 +26,13 @@ if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
   echo "version must look like vX.Y.Z (got: $VERSION)"
   exit 1
 fi
-command -v gh >/dev/null 2>&1 || { echo "gh CLI not found — install + 'gh auth login'"; exit 1; }
-gh auth status >/dev/null 2>&1 || { echo "gh not authenticated — run 'gh auth login'"; exit 1; }
+command -v gh >/dev/null 2>&1 || { echo "gh CLI not found - install + 'gh auth login'"; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "gh not authenticated - run 'gh auth login'"; exit 1; }
 # --- pre-release gate (same as CI) ---
 echo "==> gofmt / vet / test"
 unformatted=$(gofmt -l .)
 if [ -n "$unformatted" ]; then
-  echo "gofmt issues — fix before releasing:"; echo "$unformatted"; exit 1
+  echo "gofmt issues - fix before releasing:"; echo "$unformatted"; exit 1
 fi
 go vet ./...
 go test ./... -count=1
@@ -40,7 +40,7 @@ go test ./... -count=1
 echo "==> building $VERSION (linux/amd64)"
 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.Version=$VERSION" -o observer .
 # Confirm the version actually baked in by running the real artifact (the
-# build target is linux/amd64; if this host can execute it, verify — otherwise
+# build target is linux/amd64; if this host can execute it, verify - otherwise
 # skip rather than false-alarm). NOTE: `go run .` would recompile WITHOUT the
 # ldflags and always report "dev", so we must run the built binary itself.
 if BUILT_VER=$(./observer --version 2>/dev/null | awk '{print $2}'); then

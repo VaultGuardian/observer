@@ -1,0 +1,21 @@
+[Unit]
+Description=VaultGuardian Observer
+# Wait for the network to be ACTUALLY usable (DNS + routing), not just
+# the interface coming up. Without After=network-online.target, Observer
+# can start before DNS resolves, fail its first LLM call, and burn a
+# RestartSec cycle on every reboot.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/observer
+Restart=always
+RestartSec=5
+
+# Secrets and configuration are loaded from a 0600 file outside the unit
+# (systemd unit files are typically world-readable, which would expose API keys
+# to local users on the box).
+EnvironmentFile=/etc/vaultguardian/observer.env
+
+[Install]
+WantedBy=multi-user.target

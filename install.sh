@@ -1,5 +1,5 @@
 #!/bin/bash
-# VaultGuardian Observer — Install Script
+# VaultGuardian Observer - Install Script
 # Usage: sudo bash install.sh
 #        curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 set -e
@@ -39,7 +39,7 @@ else
     HAVE_TTY=0
 fi
 
-# ask PROMPT VARNAME — interactive read from the tty (fd 3) when available,
+# ask PROMPT VARNAME - interactive read from the tty (fd 3) when available,
 # otherwise leaves VARNAME empty so the caller's default fallback applies.
 ask() {
     local __prompt="$1" __var="$2" __val=""
@@ -55,7 +55,7 @@ ask() {
 # -------------------------------------------------------------------
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   VaultGuardian Observer — Installer     ║${NC}"
+echo -e "${CYAN}║   VaultGuardian Observer - Installer     ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -133,14 +133,14 @@ if [ -S /var/run/docker.sock ]; then
     DOCKER_FOUND=true
     ok "Docker detected"
 else
-    warn "Docker socket not found — Docker monitoring will be disabled"
+    warn "Docker socket not found - Docker monitoring will be disabled"
 fi
 
 if command -v journalctl >/dev/null 2>&1; then
     JOURNALD_FOUND=true
     ok "journald detected"
 else
-    warn "journald not found — host OS monitoring will be disabled"
+    warn "journald not found - host OS monitoring will be disabled"
 fi
 
 if [ "$DOCKER_FOUND" = false ] && [ "$JOURNALD_FOUND" = false ]; then
@@ -153,7 +153,7 @@ fi
 if [ "$PRESERVE_ENV" = true ]; then
     echo ""
     info "Existing configuration found at $CONFIG_DIR/observer.env"
-    info "Preserving your settings — skipping configuration prompts."
+    info "Preserving your settings - skipping configuration prompts."
     info "To change settings: edit $CONFIG_DIR/observer.env directly, then"
     info "                    'systemctl restart observer'"
     info "To reconfigure from scratch: remove the env file and re-run this script"
@@ -165,23 +165,23 @@ else
     echo ""
 
 # -------------------------------------------------------------------
-# LLM provider — local first, cloud as opt-in.
+# LLM provider - local first, cloud as opt-in.
 # -------------------------------------------------------------------
 # Observer's binary defaults to local Ollama (LLM_URL=http://llm:11434,
 # LLM_MODEL=qwen2.5:7b). The installer mirrors that: it probes for a
 # running Ollama on the loopback, recommends Local when found, and falls
 # back to Cloud only when the operator explicitly chooses it. Cloud is
-# never the silent default — picking it requires an explicit keystroke
+# never the silent default - picking it requires an explicit keystroke
 # and an API key the user must paste.
 # -------------------------------------------------------------------
 echo "  Observer can classify events with a LOCAL LLM (Ollama) or a CLOUD LLM"
 echo "  (any OpenAI-compatible endpoint: OpenAI, Together, Groq, vLLM, etc.)."
 echo ""
-echo "  Local  — logs never leave your network, \$0 API cost, air-gap friendly."
-echo "  Cloud  — no LLM setup, but logs go to a third-party API."
+echo "  Local  - logs never leave your network, \$0 API cost, air-gap friendly."
+echo "  Cloud  - no LLM setup, but logs go to a third-party API."
 echo ""
 
-# Probe for a running Ollama on the loopback. Short timeout — we don't
+# Probe for a running Ollama on the loopback. Short timeout - we don't
 # want a hanging port to stall the installer.
 OLLAMA_URL=""
 for url in "http://127.0.0.1:11434" "http://localhost:11434"; do
@@ -200,7 +200,7 @@ else
     DEFAULT_PROVIDER="L"
 fi
 
-ask "  Provider — [L]ocal / [C]loud [$DEFAULT_PROVIDER]: " PROVIDER_CHOICE
+ask "  Provider - [L]ocal / [C]loud [$DEFAULT_PROVIDER]: " PROVIDER_CHOICE
 PROVIDER_CHOICE="${PROVIDER_CHOICE:-$DEFAULT_PROVIDER}"
 
 case "$PROVIDER_CHOICE" in
@@ -219,7 +219,7 @@ case "$PROVIDER_CHOICE" in
         [ -n "$API_KEY" ] || fail "API key is required for cloud LLM"
         ;;
     *)
-        # Local (Ollama) branch — default
+        # Local (Ollama) branch - default
         DEFAULT_LLM_URL="${OLLAMA_URL:-http://localhost:11434}"
         echo ""
         ask "  Ollama URL [$DEFAULT_LLM_URL]: " LLM_URL
@@ -241,7 +241,7 @@ esac
 
 echo ""
 
-# Server nickname — used in alert emails so multi-host operators can tell
+# Server nickname - used in alert emails so multi-host operators can tell
 # which box fired. Defaults to the system hostname. Stored as HOSTNAME in
 # the env file because that's the env var the binary already reads
 # (config.go: SelfID = getEnv("HOSTNAME", "")).
@@ -264,12 +264,12 @@ ALERT_EMAIL_FROM=""
 if [ -n "$RESEND_KEY" ]; then
     ask "  Alert destination email address: " ALERT_EMAIL
     if [ -z "$ALERT_EMAIL" ]; then
-        warn "No destination email provided — email alerts disabled"
+        warn "No destination email provided - email alerts disabled"
         RESEND_KEY=""  # don't write a half-configured email block
     else
         # The 'From' address must be verified in the USER'S Resend account.
-        # Default to onboarding@resend.dev — Resend's pre-verified sandbox
-        # sender — so first-time installs work immediately without domain
+        # Default to onboarding@resend.dev - Resend's pre-verified sandbox
+        # sender - so first-time installs work immediately without domain
         # setup. Users can switch to their own verified domain later by
         # editing ALERT_EMAIL_FROM in the env file.
         echo ""
@@ -307,7 +307,7 @@ rm -f observer
 
 # Try public release URL via curl. -L follows redirects (the
 # releases/latest/download URL is a 302 to the actual asset).
-# Fall back to gh CLI when curl can't reach the asset — covers private
+# Fall back to gh CLI when curl can't reach the asset - covers private
 # repos, pre-release tags, and rate-limited unauthenticated requests.
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/observer"
 SHA_URL="https://github.com/${REPO}/releases/latest/download/observer.sha256"
@@ -319,11 +319,11 @@ if curl -fsSL --retry 3 -o observer "$DOWNLOAD_URL"; then
         GOT_SHA=true
     fi
 elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    warn "Public download failed — trying gh CLI"
+    warn "Public download failed - trying gh CLI"
     if ! gh release download --repo "$REPO" --pattern "observer"; then
         fail "Download failed via both curl and gh. Check network and that the repo has a release named 'observer'."
     fi
-    # Pull the checksum asset too (ignore failure — older releases may lack it).
+    # Pull the checksum asset too (ignore failure - older releases may lack it).
     gh release download --repo "$REPO" --pattern "observer.sha256" 2>/dev/null && GOT_SHA=true || true
     ok "Downloaded via gh CLI"
 else
@@ -331,7 +331,7 @@ else
 fi
 
 # Verify the binary against the published SHA256 when available. A mismatch
-# means the download was corrupted or tampered with — refuse to install.
+# means the download was corrupted or tampered with - refuse to install.
 if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
     EXPECTED=$(awk '{print $1}' observer.sha256)
     ACTUAL=$(sha256sum observer | awk '{print $1}')
@@ -339,14 +339,14 @@ if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
         ok "SHA256 verified: $ACTUAL"
     else
         rm -f observer observer.sha256
-        fail "SHA256 MISMATCH — refusing to install.
+        fail "SHA256 MISMATCH - refusing to install.
        expected: $EXPECTED
        actual:   $ACTUAL
        The download may be corrupted or tampered with. Aborting."
     fi
     rm -f observer.sha256
 else
-    warn "No published checksum found for this release — skipping verification."
+    warn "No published checksum found for this release - skipping verification."
     warn "(Releases from v0.55.4+ publish observer.sha256 alongside the binary.)"
 fi
 
@@ -426,7 +426,7 @@ DASHBOARD_PORT=$DASHBOARD_PORT
 HOSTNAME=$SERVER_NICK
 
 # Dashboard binding.
-#   127.0.0.1 = localhost only (default, safest — for self-hosted setups)
+#   127.0.0.1 = localhost only (default, safest - for self-hosted setups)
 #   0.0.0.0   = all interfaces (for hosted dashboards via proxy/VPN; firewall the port)
 DASHBOARD_BIND_ADDR=127.0.0.1
 
@@ -476,7 +476,7 @@ REPO="VaultGuardian/observer"
 BIN="/usr/local/bin/observer"
 SERVICE="observer"
 
-# download_binary <version> — fetches observer to ./observer
+# download_binary <version> - fetches observer to ./observer
 # version: "latest" or a tag like "v0.53.0"
 download_binary() {
     local version="$1"
@@ -568,7 +568,7 @@ case "$1" in
     KEY_FILE="/etc/vaultguardian/dashboard.key"
 
     # Resolve the dashboard port at runtime from the live config. observer.env
-    # is 0600 root-only, so read it with sudo — a non-sudo read silently fails
+    # is 0600 root-only, so read it with sudo - a non-sudo read silently fails
     # and would always fall back to 9090, ignoring a customized port. The
     # `|| true` keeps a missing file / no match from aborting under `set -e`.
     PORT=9090
@@ -601,8 +601,8 @@ case "$1" in
       # `.skipped | length` would error in the all-green (no blind spots) case.
       echo "$BODY" | jq -r '
         "Mode: \(.mode)  ·  active captures: \((.active // []) | length)",
-        "Blind spots — skipped: \((.skipped // []) | length), excluded: \((.excluded // []) | length), dropped_by_cap: \((.dropped_by_cap // []) | length)",
-        ((.skipped // [])[]        | "  skipped:        \(.name) — \(.reason)"),
+        "Blind spots - skipped: \((.skipped // []) | length), excluded: \((.excluded // []) | length), dropped_by_cap: \((.dropped_by_cap // []) | length)",
+        ((.skipped // [])[]        | "  skipped:        \(.name) - \(.reason)"),
         ((.excluded // [])[]       | "  excluded:       \(.name)"),
         ((.dropped_by_cap // [])[] | "  dropped_by_cap: \(.name)")
       '
@@ -651,7 +651,7 @@ echo ""
 if systemctl is-active --quiet observer; then
     echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
     if [ "$EXISTING_INSTALL" = true ]; then
-        echo -e "${GREEN}║   Observer upgraded — running!           ║${NC}"
+        echo -e "${GREEN}║   Observer upgraded - running!           ║${NC}"
     else
         echo -e "${GREEN}║   Observer is running!                   ║${NC}"
     fi
@@ -659,14 +659,14 @@ if systemctl is-active --quiet observer; then
     echo ""
 
     if [ "$PRESERVE_ENV" = true ]; then
-        # Upgrade with preserved config — keep the banner minimal. The
+        # Upgrade with preserved config - keep the banner minimal. The
         # user already knows their config; we'd have to source the env
         # file (which has spaces in some values like ALERT_EMAIL_FROM)
         # to recap it, and that's more risk than value.
         ok "Configuration preserved: $ENV_FILE"
         info "Inspect with: sudo cat $ENV_FILE   (root-only)"
     else
-        # Dashboard URL — show the actual bind address, not the box's external IP.
+        # Dashboard URL - show the actual bind address, not the box's external IP.
         # By default we bind to 127.0.0.1 (May 4 hardening), so advertising
         # `http://<hostname -I>:9090` would tell the user to visit an address
         # that won't accept connections. Show 127.0.0.1 + an SSH tunnel hint;
@@ -687,10 +687,10 @@ if systemctl is-active --quiet observer; then
 
     echo ""
     info "Quick commands:"
-    echo "  vaultguardian logs      — Watch live logs"
-    echo "  vaultguardian status    — Check health"
-    echo "  vaultguardian stats     — Pipeline statistics"
-    echo "  vaultguardian update    — Update to latest version"
+    echo "  vaultguardian logs      - Watch live logs"
+    echo "  vaultguardian status    - Check health"
+    echo "  vaultguardian stats     - Pipeline statistics"
+    echo "  vaultguardian update    - Update to latest version"
     echo ""
     info "First 20 log lines:"
     journalctl -u observer -n 20 --no-pager

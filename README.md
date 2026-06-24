@@ -197,26 +197,42 @@ One command on any Linux server:
 curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 ```
 
-For people who prefer not to pipe curl to sudo bash (reasonable, especially on a security tool!), the manual path:
+Observer installs a systemd service and reads container network namespaces, so it needs root.
+
+## Manual install
+
+If you'd rather not pipe a script to root (reasonable, especially on a security tool), install by hand. The repo ships `observer.env.example` and `observer.service` so the manual path produces exactly what the script writes.
 
 ```bash
-# Find the latest release
-LATEST=$(curl -fsSL https://api.github.com/repos/VaultGuardian/observer/releases/latest \
-  | grep '"tag_name"' | cut -d'"' -f4)
+# Download the binary and its checksum from the latest release
+curl -fsSL https://github.com/VaultGuardian/observer/releases/latest/download/observer -o observer
+curl -fsSL https://github.com/VaultGuardian/observer/releases/latest/download/observer.sha256 -o observer.sha256
 
-# Download the binary
-curl -fsSL "https://github.com/VaultGuardian/observer/releases/download/${LATEST}/observer" \
-  -o observer
+# Verify, then install the binary
+sha256sum -c observer.sha256
+sudo install -m755 observer /usr/local/bin/observer
 
-# Verify the SHA256 against the release page on GitHub
-sha256sum observer
+# Create the data and config directories
+sudo mkdir -p /var/lib/observer /etc/vaultguardian
 
-# Install
-sudo mv observer /usr/local/bin/
-sudo chmod +x /usr/local/bin/observer
+# Install the config, then edit it (set HOSTNAME, the LLM endpoint, optional email)
+sudo cp observer.env.example /etc/vaultguardian/observer.env
+sudo chmod 600 /etc/vaultguardian/observer.env
+sudo $EDITOR /etc/vaultguardian/observer.env
+
+# Install the systemd unit and start the service
+sudo cp observer.service /etc/systemd/system/observer.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now observer
 ```
 
-Then write the systemd unit and `/etc/vaultguardian/observer.env` by hand. The `install.sh` script handles both for you in the one-liner path; the unit content it writes is identical to what you'd write manually.
+The one-liner above is the convenience path. It does the same steps and verifies the published SHA256 before installing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
+```
+
+The `vaultguardian` CLI is optional and only installed by the script. Manual installs operate the service directly with `systemctl` and `journalctl`, for example `systemctl status observer` and `journalctl -u observer -f`.
 
 The installer prompts for:
 - LLM provider (Ollama or any OpenAI-compatible endpoint). It probes for a local Ollama instance and recommends it by default; the cloud path is an explicit opt-in.
