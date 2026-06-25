@@ -270,7 +270,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	result := a.patterns.Match(evt.ScopeKey(), evt.Hash, evt.NormalizedLine)
 	if result != nil {
 		if hasDisclosure && (result.Verdict == patternstore.VerdictSuppress || result.Verdict == patternstore.VerdictAllow) {
-			log.Printf("[analyzer] DISCLOSURE_OVERRIDE: cached %s verdict rejected for scope=%s tier=%s pattern=%q — high-risk disclosure present, forcing LLM re-classification",
+			log.Printf("[analyzer] DISCLOSURE_OVERRIDE: cached %s verdict rejected for scope=%s tier=%s pattern=%q - high-risk disclosure present, forcing LLM re-classification",
 				result.Verdict, evt.ScopeKey(), result.Tier, truncateForLog(result.Pattern.Value, 60))
 			a.stats.DisclosureOverrides.Add(1)
 			// Fall through to LLM classification (do not increment PatternHits).
@@ -486,7 +486,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 		effectiveAction = "alert"
 		fr.ClampedToAlert = true
 		a.stats.T1MaliciousClamped.Add(1) // once per flight (leader), like LLMCalls
-		log.Printf("[clamp] T1 LLM verdict malicious capped to alert for HTTP event %s — outcome claims require response evidence", evt.ID)
+		log.Printf("[clamp] T1 LLM verdict malicious capped to alert for HTTP event %s - outcome claims require response evidence", evt.ID)
 	}
 
 	// --- Step 4: Learn from the LLM's response (leader-only) ---
@@ -525,7 +525,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 		return AnalysisResult{
 			Event:   evt,
 			Verdict: patternstore.VerdictUnknown,
-			Reason:  "LLM concurrency limit reached — deferred to retry queue",
+			Reason:  "LLM concurrency limit reached - deferred to retry queue",
 			Source:  "backpressure",
 		}
 
@@ -602,7 +602,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// hash matches every structurally-similar future event (hash is over the
 	// normalized line), so caching a bad hunch is permanent damage.
 	if verdict.Confidence < 0.70 {
-		log.Printf("[analyzer] Confidence %.2f < 0.70 — learning nothing for %s [action=%s]",
+		log.Printf("[analyzer] Confidence %.2f < 0.70 - learning nothing for %s [action=%s]",
 			verdict.Confidence, scopeKey, verdict.Action)
 		return false
 	}
@@ -626,7 +626,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	hasDisclosure := containsHighRiskDisclosure(evt.Line) ||
 		containsHighRiskDisclosure(evt.NormalizedLine)
 	if hasDisclosure && (v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress) {
-		log.Printf("[analyzer] DISCLOSURE_REFUSE_LEARN: refusing to learn %s for %s — line contains high-risk disclosure",
+		log.Printf("[analyzer] DISCLOSURE_REFUSE_LEARN: refusing to learn %s for %s - line contains high-risk disclosure",
 			v, scopeKey)
 		a.stats.DisclosureOverrides.Add(1)
 		return false
@@ -642,7 +642,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// on an attack-indicator line is correct behavior.
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
 		if hasAttackPayloadForLearning(evt.NormalizedLine) {
-			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s — parsed HTTP request contains attack indicators",
+			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s - parsed HTTP request contains attack indicators",
 				v, scopeKey)
 			a.stats.DisclosureOverrides.Add(1) // reuse counter — both are "refuse to learn" events
 			return false
@@ -1362,7 +1362,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 	// (handled at top of this function). Those represent actual data
 	// leakage in the log line, not scanner intent.
 	if reNginxFileNotFound.MatchString(normalizedLine) {
-		return "Deterministic: nginx file not found — failed probe", true
+		return "Deterministic: nginx file not found - failed probe", true
 	}
 
 	// --- Path 2: HTTP access log with failed status code ---
@@ -1382,6 +1382,6 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false
 	}
 
-	reason := fmt.Sprintf("Deterministic: HTTP %s — failed probe, no exfiltration possible", statusCode)
+	reason := fmt.Sprintf("Deterministic: HTTP %s - failed probe, no exfiltration possible", statusCode)
 	return reason, true
 }

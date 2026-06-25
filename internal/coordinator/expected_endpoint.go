@@ -217,7 +217,7 @@ func (t *ExpectedEndpointTracker) Check(host, method string, status int, path, b
 	t.totalSuppressed.Add(1)
 
 	reason = fmt.Sprintf(
-		"Expected endpoint: operator confirmed %s %s%s [status %d] returns sensitive-looking response by design (shape hash %.16s) — %s",
+		"Expected endpoint: operator confirmed %s %s%s [status %d] returns sensitive-looking response by design (shape hash %.16s) - %s",
 		fp.Method, fp.Host, fp.Path, fp.Status, fp.BodyPreviewHash, entryReason,
 	)
 	return true, reason

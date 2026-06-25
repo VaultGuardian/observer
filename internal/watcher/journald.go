@@ -109,7 +109,7 @@ func (j *JournaldWatcher) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		log.Printf("[journald] journalctl exited unexpectedly: %v — restarting in 2s", err)
+		log.Printf("[journald] journalctl exited unexpectedly: %v - restarting in 2s", err)
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -219,7 +219,7 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 	// scanning but journalctl --follow is still running. Without killing
 	// the process, cmd.Wait() blocks forever.
 	if err := scanner.Err(); err != nil {
-		log.Printf("[journald] Scanner error: %v — killing journalctl", err)
+		log.Printf("[journald] Scanner error: %v - killing journalctl", err)
 		cmd.Process.Kill()
 		cmd.Wait()
 		return fmt.Errorf("journal scanner: %w", err)

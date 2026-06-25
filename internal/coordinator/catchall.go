@@ -191,7 +191,7 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 			entry.State = StatePendingVerification
 			samplePath := firstPath(entry.Paths)
 
-			log.Printf("[catchall] Threshold crossed — requesting verification: host=%s method=%s status=%d hash=%.16s paths=%d sample=%s",
+			log.Printf("[catchall] Threshold crossed - requesting verification: host=%s method=%s status=%d hash=%.16s paths=%d sample=%s",
 				host, methodUpper, statusCode, bodyPreviewHash, entry.TotalPaths, samplePath)
 
 			// v0.52: Bounded verifier goroutines. Without a semaphore, a path
@@ -203,7 +203,7 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 					defer func() { <-t.verifySem }()
 					t.runVerification(fp, samplePath)
 				default:
-					log.Printf("[catchall] Verifier semaphore full — deferring verification for %s", fp)
+					log.Printf("[catchall] Verifier semaphore full - deferring verification for %s", fp)
 					t.mu.Lock()
 					if e, ok := t.entries[fp]; ok && e.State == StatePendingVerification {
 						e.State = StateCandidate // reset so it retriggers next threshold cross
@@ -219,7 +219,7 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 
 	case StateVerified:
 		entry.Suppressed++
-		reason = fmt.Sprintf("Verified catch-all: %d distinct paths on %s all returned identical %s %d response (body hash %.16s) — %s",
+		reason = fmt.Sprintf("Verified catch-all: %d distinct paths on %s all returned identical %s %d response (body hash %.16s) - %s",
 			entry.TotalPaths, host, methodUpper, statusCode, bodyPreviewHash, entry.VerifyReason)
 		return true, reason
 
@@ -298,7 +298,7 @@ func (t *CatchAllTracker) CheckFallbackByBytes(host, method string, statusCode i
 	}
 
 	verifiedEntry.Suppressed++
-	reason = fmt.Sprintf("Catch-all fallback (REC-miss): verified pattern exists for %s %s %d (hash %.16s, %d prior paths, verified bytes=%d) — log responseBytes=%d within tolerance",
+	reason = fmt.Sprintf("Catch-all fallback (REC-miss): verified pattern exists for %s %s %d (hash %.16s, %d prior paths, verified bytes=%d) - log responseBytes=%d within tolerance",
 		methodUpper, host, statusCode, verifiedFP.BodyPreviewHash, verifiedEntry.TotalPaths, verifiedEntry.ResponseBytes, responseBytes)
 
 	log.Printf("[catchall:fallback] Suppressed via byte-similar fallback: host=%s method=%s status=%d log_bytes=%d verified_bytes=%d hash=%.16s path=%s",
@@ -394,7 +394,7 @@ func (t *CatchAllTracker) SeedVerified(fps []CatchAllFingerprint, reasons []stri
 		// a database with thousands of verified catch-alls would load them
 		// all into memory at startup, bypassing the cap that Check() enforces.
 		if len(t.entries) >= maxFingerprints {
-			log.Printf("[catchall] SeedVerified: hit cap (%d) — skipped %d remaining entries", maxFingerprints, len(fps)-i)
+			log.Printf("[catchall] SeedVerified: hit cap (%d) - skipped %d remaining entries", maxFingerprints, len(fps)-i)
 			break
 		}
 

@@ -375,7 +375,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 			}
 			c.mu.Unlock()
 
-			log.Printf("[coordinator] CATCH-ALL match (Process): key=%s host=%s status=%d hash=%.16s — auto-downgrade source=%s",
+			log.Printf("[coordinator] CATCH-ALL match (Process): key=%s host=%s status=%d hash=%.16s - auto-downgrade source=%s",
 				key, alert.Host, alert.StatusCode, alert.BodyPreviewHash, alert.ScopeKey)
 			c.dispatch(finalAlert)
 			return
@@ -848,7 +848,7 @@ func buildFinalAlert(pending *PendingAlert, shape finalShape) *FinalAlert {
 // the polling cycle. Safe to call even if the investigation doesn't exist
 // or is already resolved.
 func (c *Coordinator) TryResolveVIP(correlationKey string) {
-	log.Printf("[coordinator:vip] Push notification for key=%s — attempting immediate evidence check", correlationKey)
+	log.Printf("[coordinator:vip] Push notification for key=%s - attempting immediate evidence check", correlationKey)
 	c.tryEvidenceCheck(correlationKey)
 }
 

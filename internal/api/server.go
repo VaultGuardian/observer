@@ -614,7 +614,7 @@ func loadOrGenerateToken(keyFile string) (string, error) {
 			log.Printf("[api] Dashboard token loaded from %s", keyFile)
 			return token, nil
 		}
-		log.Printf("[api] Key file %s exists but token too short — regenerating", keyFile)
+		log.Printf("[api] Key file %s exists but token too short - regenerating", keyFile)
 	}
 
 	// Generate new token
@@ -1337,7 +1337,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		}
 	}
 	if err := s.patterns.Persist(); err != nil {
-		log.Printf("[correction:expected_endpoint] Warning: pattern store persist failed after delete: %v — stale pattern may return on Observer restart", err)
+		log.Printf("[correction:expected_endpoint] Warning: pattern store persist failed after delete: %v - stale pattern may return on Observer restart", err)
 	}
 
 	// Step 2: Persist expected endpoint (UPSERT on full key tuple — idempotent re-click).

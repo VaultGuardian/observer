@@ -280,7 +280,7 @@ func defaultRules() []Rule {
 			Pattern:    regexp.MustCompile(`(?:NOT in sudoers|incorrect password attempt|authentication failure.*sudo)`),
 			Extract: func(m []string) Result {
 				return Result{
-					Reason: "Failed sudo attempt — possible privilege escalation",
+					Reason: "Failed sudo attempt - possible privilege escalation",
 				}
 			},
 			NeedsTrustCheck: false,

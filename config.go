@@ -237,7 +237,7 @@ func LoadConfig() Config {
 		if port, err := strconv.Atoi(portStr); err == nil && port > 0 && port < 65536 {
 			cfg.RECVXLANPort = uint16(port)
 		} else {
-			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q — using auto-detect", portStr)
+			log.Printf("[observer] Invalid REC_VXLAN_PORT=%q - using auto-detect", portStr)
 		}
 	}
 
@@ -282,7 +282,7 @@ func LoadConfig() Config {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
 			cfg.RECLearnedPortCap = n
 		} else {
-			log.Printf("[observer] Invalid REC_LEARNED_PORT_CAP=%q — using default %d", raw, cfg.RECLearnedPortCap)
+			log.Printf("[observer] Invalid REC_LEARNED_PORT_CAP=%q - using default %d", raw, cfg.RECLearnedPortCap)
 		}
 	}
 
@@ -293,7 +293,7 @@ func LoadConfig() Config {
 		if n, err := strconv.Atoi(raw); err == nil {
 			cfg.SlowResponseThresholdMs = n
 		} else {
-			log.Printf("[observer] Invalid SLOW_RESPONSE_THRESHOLD_MS=%q — using default %d", raw, cfg.SlowResponseThresholdMs)
+			log.Printf("[observer] Invalid SLOW_RESPONSE_THRESHOLD_MS=%q - using default %d", raw, cfg.SlowResponseThresholdMs)
 		}
 	}
 

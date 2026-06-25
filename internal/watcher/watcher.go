@@ -135,7 +135,7 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 	// Error responses are not multiplexed and would be misinterpreted as
 	// frame headers.
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[watcher] Docker API returned %d for %s — skipping", resp.StatusCode, name)
+		log.Printf("[watcher] Docker API returned %d for %s - skipping", resp.StatusCode, name)
 		return
 	}
 
@@ -174,7 +174,7 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 		// Kill the stream rather than draining attacker-controlled length.
 		const maxFrameSize = 1 << 20 // 1MB
 		if size > maxFrameSize {
-			log.Printf("[watcher] Oversized frame from %s: %d bytes — killing stream", name, size)
+			log.Printf("[watcher] Oversized frame from %s: %d bytes - killing stream", name, size)
 			return
 		}
 
@@ -251,10 +251,10 @@ func (w *Watcher) watchEvents(ctx context.Context) error {
 			// hot-loop: Decode returns EOF instantly, ctx.Err() is nil, continue
 			// loops back to Decode which returns EOF instantly again.
 			if err == io.EOF {
-				log.Printf("[watcher] Event stream closed (EOF) — will reconnect")
+				log.Printf("[watcher] Event stream closed (EOF) - will reconnect")
 				return fmt.Errorf("event stream EOF: %w", err)
 			}
-			log.Printf("[watcher] Event decode error: %v — will reconnect", err)
+			log.Printf("[watcher] Event decode error: %v - will reconnect", err)
 			return fmt.Errorf("event decode: %w", err)
 		}
 

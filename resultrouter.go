@@ -200,7 +200,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// held for body-aware reclassification. Backlog: "extend slow-gate to
 	// status shortcut".
 	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
-		reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server — HTTP %d confirms failure", result.Source, statusCode)
+		reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server - HTTP %d confirms failure", result.Source, statusCode)
 
 		log.Printf("[RECON:STATUS] EventID=%s Source=%s Status=%d Classification=%s PatternVia=%s Line=%s",
 			evt.ID, evt.ScopeKey(), statusCode, result.LLMClassification, result.Source,
@@ -262,7 +262,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	//     Promotion to "edge_generated" when upstream_response_time is
 	//     available is a future enhancement.
 	if isHTTP && isBareIP(host) && statusCode == 200 {
-		reason := fmt.Sprintf("Attack probe hit bare-IP default server (%s) — HTTP 200 is the default page, no backend application involved", host)
+		reason := fmt.Sprintf("Attack probe hit bare-IP default server (%s) - HTTP 200 is the default page, no backend application involved", host)
 
 		log.Printf("[RECON:EDGE] EventID=%s Source=%s Host=%s Status=%d Classification=%s Via=%s Line=%s",
 			evt.ID, evt.ScopeKey(), host, statusCode, result.LLMClassification, result.Source,

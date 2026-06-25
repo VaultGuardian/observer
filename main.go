@@ -112,7 +112,7 @@ func main() {
 	}
 	dispatch.PrintStatus()
 	if dispatch.ChannelCount() == 0 {
-		log.Println("[observer] No notification channels configured — alerts will be logged to stdout only")
+		log.Println("[observer] No notification channels configured - alerts will be logged to stdout only")
 	}
 
 	// ------- Init Response Evidence Capture -------
@@ -410,7 +410,7 @@ func main() {
 		case pipeline <- line:
 		default:
 			pipelineDrops.Add(1)
-			log.Println("[observer] WARNING: pipeline full — dropping log line")
+			log.Println("[observer] WARNING: pipeline full - dropping log line")
 		}
 	}
 
@@ -422,13 +422,13 @@ func main() {
 			log.Println("[observer] Starting container log watcher...")
 			for ctx.Err() == nil {
 				if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-					log.Printf("[observer] Docker watcher error: %v — restarting in 2s", err)
+					log.Printf("[observer] Docker watcher error: %v - restarting in 2s", err)
 					time.Sleep(2 * time.Second)
 				}
 			}
 		}()
 	} else {
-		log.Printf("[observer] Docker socket %s not found — skipping container watcher", cfg.DockerSocket)
+		log.Printf("[observer] Docker socket %s not found - skipping container watcher", cfg.DockerSocket)
 	}
 
 	if cfg.JournaldEnabled {
@@ -773,7 +773,7 @@ func makeEvidenceCheckCallback(
 					// Fall through to Path 2 (body-aware) — the LLM sees
 					// the latency via the reclassify prompt.
 				} else {
-					reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) — payload was rejected/ignored by the server", code)
+					reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) - payload was rejected/ignored by the server", code)
 					log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
 						snapshot.Key, code, evidence.CandidateCount)
 					return coordinator.EvidenceDecision{
@@ -813,7 +813,7 @@ func makeEvidenceCheckCallback(
 		// so the coordinator's Phase 2 catch-all re-arm can fire on the
 		// transport-side BodyPreviewHash if appropriate.
 		if evidence.SafeBodyPreview == "" {
-			log.Printf("[coordinator] Evidence check: transport available (HTTP %d) but ambiguous status, no body preview — key=%s candidates=%d format=%s",
+			log.Printf("[coordinator] Evidence check: transport available (HTTP %d) but ambiguous status, no body preview - key=%s candidates=%d format=%s",
 				evidence.Transport.StatusCode, snapshot.Key, evidence.CandidateCount,
 				func() string {
 					if evidence.Disclosure != nil {
@@ -875,7 +875,7 @@ func makeEvidenceCheckCallback(
 		}
 		if expectedEndpointTracker != nil {
 			if matched, reason := expectedEndpointTracker.Check(host, method, statusForKey, path, bodyHash); matched {
-				log.Printf("[reclassify] ExpectedEndpoint match: host=%s method=%s path=%s status=%d shape=%.16s — operator-confirmed downgrade",
+				log.Printf("[reclassify] ExpectedEndpoint match: host=%s method=%s path=%s status=%d shape=%.16s - operator-confirmed downgrade",
 					host, method, path, statusForKey, bodyHash)
 				return coordinator.EvidenceDecision{
 					Downgraded:      true,
@@ -1023,7 +1023,7 @@ func makeEvidenceCheckCallback(
 		if flightErr != nil {
 			// Leader error (LLM failure or slot ctx-cancel) propagates to
 			// every waiter: evidence attached, verdict unchanged.
-			log.Printf("[reclassify] Error: %v — not changing verdict", flightErr)
+			log.Printf("[reclassify] Error: %v - not changing verdict", flightErr)
 			return coordinator.EvidenceDecision{
 				Evidence:        evidence,
 				EvidenceJournal: evidence.ForJournal(),
@@ -1178,7 +1178,7 @@ func makeVerifyCallback(
 			// mid-stream error can produce a partial body whose prefix hash
 			// accidentally matches REC's preview — leading to false verification.
 			if readErr != nil {
-				log.Printf("[verify] Body read error: %v — skipping (fail closed)", readErr)
+				log.Printf("[verify] Body read error: %v - skipping (fail closed)", readErr)
 				continue
 			}
 
@@ -1238,7 +1238,7 @@ func makeVerifyCallback(
 					persistVerifiedCatchAll(db, ctx, fp, path, result, contentType)
 					return result
 				} else {
-					return &coordinator.VerifyResult{Confirmed: false, Reason: "redaction failed on large body — cannot verify safety"}
+					return &coordinator.VerifyResult{Confirmed: false, Reason: "redaction failed on large body - cannot verify safety"}
 				}
 			}
 
@@ -1260,7 +1260,7 @@ func makeVerifyCallback(
 			)
 
 			if err != nil {
-				log.Printf("[verify] LLM error: %v — not confirming", err)
+				log.Printf("[verify] LLM error: %v - not confirming", err)
 				return &coordinator.VerifyResult{Confirmed: false, Reason: fmt.Sprintf("LLM error: %v", err)}
 			}
 
@@ -1386,7 +1386,7 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 func seedExpectedEndpointsFromDB(db *store.Store, tracker *coordinator.ExpectedEndpointTracker) {
 	rules, err := db.LoadExpectedEndpoints(context.Background())
 	if err != nil {
-		log.Printf("[observer:warn] Failed to load expected-endpoint seeds: %v — prior Card 4 corrections are NOT active until re-clicked", err)
+		log.Printf("[observer:warn] Failed to load expected-endpoint seeds: %v - prior Card 4 corrections are NOT active until re-clicked", err)
 		return
 	}
 	if len(rules) == 0 {
@@ -1541,7 +1541,7 @@ func makeLogHandler(
 				log.Printf("[observer] Deferred to retry queue: %s %s", evt.ScopeKey(), truncate(evt.NormalizedLine, 80))
 			default:
 				retryQueueDrops.Add(1)
-				log.Println("[observer] WARNING: retry queue full — truly dropping unknown event")
+				log.Println("[observer] WARNING: retry queue full - truly dropping unknown event")
 			}
 			return
 		}
@@ -1591,7 +1591,7 @@ func runReconciler(ctx context.Context, db *store.Store) {
 				// LLM-matched malicious reaching the timeout path means the
 				// clamp has a gap (or predates it).
 				if f.MatchedVia == "llm" && f.Verdict == "malicious" {
-					log.Printf("[reconciler] WARN: LLM-matched malicious finalized without evidence (event=%s) — should be impossible after the T1 clamp; investigate", f.EventID)
+					log.Printf("[reconciler] WARN: LLM-matched malicious finalized without evidence (event=%s) - should be impossible after the T1 clamp; investigate", f.EventID)
 				}
 				err := db.UpdateFindingResolution(ctx, f.EventID, "evidence_unavailable", "timeout", "")
 				if err != nil {
@@ -1671,7 +1671,7 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			// Section 3 follow-up telemetry: hostless coordinator keys.
 			// Logged only when non-zero to avoid noise on healthy boxes.
 			if hk := coord.HostlessKeys(); hk > 0 {
-				log.Printf("[observer] Coordinator: hostless_keys=%d (events with no parseable Host — investigate normalizer if growing fast)", hk)
+				log.Printf("[observer] Coordinator: hostless_keys=%d (events with no parseable Host - investigate normalizer if growing fast)", hk)
 			}
 
 			policyMatches, policyEscalations, policyAllows, policyAlerts := policyEngine.Stats()
