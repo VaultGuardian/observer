@@ -122,6 +122,32 @@ func TestClassifyContainers(t *testing.T) {
 	}
 }
 
+// TestPrivatePorts covers the dedupe and order-preservation of privatePorts.
+// Docker returns one Port entry per host binding, so a container published on
+// both IPv4 and IPv6 yields two entries with the same PrivatePort; the reported
+// coverage must not show it twice.
+func TestPrivatePorts(t *testing.T) {
+	// Dual-stack publish: two host bindings (different PublicPort) collapse to
+	// one container-side port.
+	dupBinding := []tcpPublish{
+		{PublicPort: 80, PrivatePort: 80, IP: "0.0.0.0"},
+		{PublicPort: 3000, PrivatePort: 80, IP: "::"},
+	}
+	if got := privatePorts(dupBinding); len(got) != 1 || got[0] != 80 {
+		t.Fatalf("privatePorts(dup) = %v, want [80]", got)
+	}
+
+	// Distinct private ports pass through unchanged, in first-seen order.
+	distinct := []tcpPublish{
+		{PublicPort: 80, PrivatePort: 80, IP: "0.0.0.0"},
+		{PublicPort: 443, PrivatePort: 443, IP: "0.0.0.0"},
+	}
+	got := privatePorts(distinct)
+	if len(got) != 2 || got[0] != 80 || got[1] != 443 {
+		t.Fatalf("privatePorts(distinct) = %v, want [80 443]", got)
+	}
+}
+
 // --- helpers ---
 
 func indexByName(pcs []publicContainer) map[string]publicContainer {

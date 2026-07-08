@@ -159,7 +159,7 @@ For regulated environments, the local-Ollama path helps avoid the first privacy 
 |---|---|---|
 | `recon` | Suspicious request that didn't work: failed probe, hit a 400/403/404/405/410, or got blocked upstream. Recorded as probe intelligence. | No |
 | `alert` | Suspicious request, outcome unclear. Logged with whatever evidence Observer has. | Configurable |
-| `malicious` | Confirmed impact. REC captured a response containing evidence of exploitation, or a seeded pattern matched. | **Yes** |
+| `malicious` | Confirmed impact. REC captured a response containing evidence of exploitation, a seeded pattern matched, or the LLM identified confirmed-impact content in a non-HTTP log stream (command execution output, credential dumps in container stderr). | **Yes** |
 | `policy` | Operator-defined identity rules (SSH logins, user creation, privilege escalation, `authorized_keys`). Escalating hits are stored as `malicious` with classification `policy_escalated` and emailed; lower-risk hits (trusted-IP SSH login, failed sudo) resolve to `allow`/`alert` with no email. | Conditional |
 | `allow` | Known-safe traffic shape. Cached, never re-classified. | No |
 | `suppress` | Known-noise pattern (operational scanners, health checks). Counted but not surfaced. | No |

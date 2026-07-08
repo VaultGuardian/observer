@@ -237,10 +237,15 @@ func logInventory(inv discoveryInventory) {
 
 // privatePorts returns the container-side TCP ports of a public container — the
 // ports REC sees from inside the namespace (e.g. captain-captain's 80, not host 3000).
+// Duplicates are dropped (Docker lists one Port entry per host binding, so a
+// container published on both IPv4 and IPv6 yields two entries with the same
+// PrivatePort), preserving first-seen order.
 func privatePorts(ports []tcpPublish) []int {
+	seen := make(map[int]bool, len(ports))
 	out := make([]int, 0, len(ports))
 	for _, p := range ports {
-		if p.PrivatePort > 0 {
+		if p.PrivatePort > 0 && !seen[p.PrivatePort] {
+			seen[p.PrivatePort] = true
 			out = append(out, p.PrivatePort)
 		}
 	}
