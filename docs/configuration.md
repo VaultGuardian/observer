@@ -6,7 +6,7 @@ unit's `EnvironmentFile=` directive. The installer writes the common ones;
 everything below can be added or overridden by editing that file and running
 `systemctl restart observer`.
 
-All variables are optional unless noted — Observer ships with working
+All variables are optional unless noted; Observer ships with working
 defaults for every setting.
 
 ## Core
@@ -23,7 +23,7 @@ defaults for every setting.
 ## LLM
 
 The LLM is consulted only for events the deterministic pipeline hasn't seen
-before — typically under 5% of traffic. Defaults point at a local Ollama
+before, typically under 5% of traffic. Defaults point at a local Ollama
 instance so logs never leave your network.
 
 | Variable | Default | Description |
@@ -42,6 +42,12 @@ LLM_URL=https://api.openai.com
 LLM_MODEL=gpt-5-mini
 LLM_API_KEY=sk-xxxxxxxx
 ```
+
+> **Cloud caveat.** The cloud path sends the raw, unredacted Tier 1 log line
+> to the provider. Log lines can contain tokens in URLs, request bodies, and
+> other sensitive material. If that is unacceptable, use Ollama. Structural
+> redaction applies to Tier 2 response evidence, not to Tier 1 log lines.
+> Tier 1 redaction before cloud calls is planned.
 
 ## Dashboard API
 
@@ -70,13 +76,21 @@ REC sniffs the reverse proxy's network namespace to capture the HTTP
 responses your server actually sent, so failed probes can be downgraded and
 confirmed impact escalated.
 
+REC's requirement is generic: a reverse proxy running in Docker (so REC can
+enter its container network namespace), the plaintext proxy-to-backend hop to
+read, and the Docker socket for discovery. That covers plain `docker run`,
+docker-compose, and PaaS layers like CapRover equally. CapRover is one example,
+not a requirement; bare Docker is validated. Set `REC_NS_CONTAINER` to your
+proxy container: `captain-nginx` on CapRover, or your compose proxy service
+name on plain Docker.
+
 ### Core
 
 | Variable | Default | Description |
 |---|---|---|
 | `REC_ENABLED` | `false` | Master switch for REC |
 | `REC_INTERFACE` | (auto) | Interface to sniff; auto-detected if unset |
-| `REC_NS_CONTAINER` | (none) | Container whose network namespace REC enters (e.g. `captain-nginx`) |
+| `REC_NS_CONTAINER` | (none) | Container whose network namespace REC enters: your reverse proxy (e.g. `captain-nginx` on CapRover, or your compose proxy service name) |
 | `REC_PORTS` | `80,8080` | Comma-separated HTTP ports REC always sniffs |
 | `REC_LEARNED_PORT_CAP` | `64` | Cap on runtime-learned ports (`0` disables learning) |
 | `REC_VXLAN_PORT` | (auto) | VXLAN port override; auto-detected if unset |
@@ -87,7 +101,7 @@ confirmed impact escalated.
 | Variable | Default | Description |
 |---|---|---|
 | `REC_BUFFER_MAX_ENTRIES` | `10000` | Max buffered response entries |
-| `REC_BUFFER_MAX_BYTES` | `134217728` (128 MB) | Max total bytes held in the evidence buffer. Static ceiling — sized for scanner-burst headroom. |
+| `REC_BUFFER_MAX_BYTES` | `134217728` (128 MB) | Max total bytes held in the evidence buffer. Static ceiling, sized for scanner-burst headroom. |
 | `REC_BUFFER_MAX_AGE` | `30s` | Max age before a buffered entry is evicted |
 | `REC_BUFFER_MAX_BODY` | `2048` | Max bytes of response body retained per entry |
 

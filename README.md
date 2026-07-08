@@ -12,6 +12,16 @@ Observer is for people who want fewer security alerts, not fewer security signal
 
 ---
 
+## Coverage envelope
+
+Observer confirms attack outcomes when the impact shows up in the channels it watches: plaintext HTTP responses on the reverse-proxy-to-backend hop, container and host log lines, and timing evidence.
+
+REC watches plaintext HTTP inside container network namespaces. The supported pattern is TLS terminated at the edge with a plaintext proxy-to-backend hop. Traffic that stays encrypted past the proxy is unreadable to REC.
+
+Impact that never crosses those channels is invisible: out-of-band exfiltration, in-memory implants beaconing out, reverse shells on unwatched ports. Observer narrows "was I attacked" to "did anything observable come back". It does not answer "am I compromised" in full generality. See [What Observer is not](#what-observer-is-not) for the rest of the boundary.
+
+---
+
 ## Why Observer exists
 
 Most internet traffic to a public server is hostile. The shape is familiar:
@@ -36,7 +46,7 @@ The product decision: **email on confirmed impact, log everything else.**
 
 ## See it in action
 
-Two real attacks caught in production. Both look the same at the request layer. Observer treats them very differently because of what the server actually returned.
+Two real attacks caught on my own deployment (3 servers). Both look the same at the request layer. Observer treats them very differently because of what the server actually returned.
 
 ### Failed attack: Netgear botnet probe
 
@@ -81,7 +91,7 @@ Same Tier 1 shape as the Netgear case. Different Tier 2 outcome. Different opera
 
 ## How it works
 
-Observer's pipeline is deterministic-first. The LLM is consulted only for events Observer hasn't seen before, typically under 5% of traffic in production.
+Observer's pipeline is deterministic-first. The LLM is consulted only for events Observer hasn't seen before. On my own deployment (3 servers), that's typically under 5% of traffic.
 
 ```
 log line arrives (Docker container or journald)
@@ -121,7 +131,7 @@ verdict                  recon       → record as probe intelligence, no email
 
 1. **Policy engine**: SSH logins, user creation, privilege escalation, `authorized_keys` modification. Runs first. Identity-based decisions with a trusted-IP allowlist.
 2. **Deterministic filters**: Stack traces, failed HTTP probes, SSH brute force. Structural detection inside the analyzer. Never touches the LLM.
-3. **Pattern store**: Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). In-memory lookups, no network round-trip. Curated seed patterns (credential file contents, private keys, reverse shells, download-and-execute and destructive commands) are pre-loaded here as contains-tier malicious entries, so a seed match is an instant `malicious` verdict with direct email dispatch. Cache hit rate runs above 97% in production once the system has seen a few days of traffic.
+3. **Pattern store**: Four-bucket (allow / malicious / alert / suppress), four-tier (hash → prefix → regex → contains). In-memory lookups, no network round-trip. Curated seed patterns (credential file contents, private keys, reverse shells, download-and-execute and destructive commands) are pre-loaded here as contains-tier malicious entries, so a seed match is an instant `malicious` verdict with direct email dispatch. On my own deployment (3 servers), cache hit rate runs above 97% once the system has seen a few days of traffic.
 4. **LLM classifier**: OpenAI-compatible API. Intent × outcome classification. Local Ollama by default, hosted endpoint optional. Bounded retry queue handles backpressure.
 5. **REC (Response Evidence Capture)**: AF_PACKET sniffer inside the reverse proxy's network namespace. Full TCP reassembly via gopacket. Captures HTTP responses, redacts secrets structurally, correlates with alerts. VIP lane protects malicious evidence from traffic-flood eviction.
 6. **Coordinator**: Groups alerts, holds for evidence (5 s evidence window, 10 s finalize), downgrades false alarms, dispatches findings. Email only on confirmed impact.
@@ -143,7 +153,7 @@ LLM_MODEL=qwen2.5:7b
 
 This means:
 
-- **Your logs do not leave your network.** LLM consultation runs on the same machine (or LAN) Observer is deployed on. Nothing about your infrastructure, secrets, session tokens, request bodies, or PII gets sent to a third-party AI provider.
+- **On the Ollama path, your logs do not leave your network.** LLM consultation runs on the same machine (or LAN) Observer is deployed on. Nothing about your infrastructure, secrets, session tokens, request bodies, or PII gets sent to a third-party AI provider. (This holds only for the local Ollama path; the cloud path sends log lines to the provider. See the cloud caveat under Configuration.)
 - **API costs are zero.** Ollama is free; the only cost is the compute to run it.
 - **Air-gapped deployments work.** If your environment can't reach the public internet, Observer still works as long as Ollama is reachable on the LAN.
 
@@ -171,9 +181,9 @@ Observer tries to avoid escalating failed probes and known noise, but it does no
 
 ---
 
-## Cost in production (3 servers, 30 days)
+## Cost on my own deployment (3 servers, 30 days)
 
-Below is the OpenAI usage chart from one operator running Observer across three production servers for a 30-day window:
+Below is the OpenAI usage chart from my own deployment, running Observer across three production servers for a 30-day window:
 
 ![OpenAI usage over 30 days, 3 servers running Observer](docs/images/openai-usage-30d.png)
 
@@ -183,7 +193,7 @@ That total includes two anomalous spike days (Apr 28 at $9.24 and Apr 29 at $11.
 
 Per-request cost works out to around **$0.0009**, under a tenth of a cent per event that reached the LLM.
 
-The reason it's cheap is **not** that the LLM is cheap. It's that the LLM is rarely consulted. The deterministic-first pipeline (hash cache + pattern store + seeded matches + REC short-circuits) handles 97%+ of events without ever calling the LLM. Cloud-API cost scales with novel events, not with traffic volume.
+The reason it's cheap is **not** that the LLM is cheap. It's that the LLM is rarely consulted. On my own deployment (3 servers), the deterministic-first pipeline (hash cache + pattern store + seeded matches + REC short-circuits) handles 97%+ of events without ever calling the LLM. Cloud-API cost scales with novel events, not with traffic volume.
 
 And again: **this is the cloud-API path, which is opt-in.** The default Ollama path costs $0 in API spend regardless of event volume.
 
@@ -208,7 +218,7 @@ If you'd rather not pipe a script to root (reasonable, especially on a security 
 curl -fsSL https://github.com/VaultGuardian/observer/releases/latest/download/observer -o observer
 curl -fsSL https://github.com/VaultGuardian/observer/releases/latest/download/observer.sha256 -o observer.sha256
 
-# Verify, then install the binary
+# Check download integrity, then install the binary
 sha256sum -c observer.sha256
 sudo install -m755 observer /usr/local/bin/observer
 
@@ -226,11 +236,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now observer
 ```
 
-The one-liner above is the convenience path. It does the same steps and verifies the published SHA256 before installing:
+The one-liner above is the convenience path. It does the same steps and checks the published SHA256 before installing:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 ```
+
+The SHA256 check is a best-effort download-integrity check: the checksum is fetched from the same release as the binary, so it catches a truncated or corrupted download, not a tampered release. Anyone who can replace the binary can replace the checksum alongside it. Release signing, which would make this tamper-evident, is planned.
 
 The `vaultguardian` CLI is optional and only installed by the script. Manual installs operate the service directly with `systemctl` and `journalctl`, for example `systemctl status observer` and `journalctl -u observer -f`.
 
@@ -298,13 +310,17 @@ LLM_MODEL=gpt-5-mini
 LLM_API_KEY=sk-xxxxxxxxxxxx
 ```
 
+> **Cloud caveat.** The cloud path sends the raw, unredacted Tier 1 log line to the provider. Log lines can contain tokens in URLs, request bodies, and other sensitive material. If that is unacceptable, use Ollama. Structural redaction applies to Tier 2 response evidence, not to Tier 1 log lines. Tier 1 redaction before cloud calls is planned.
+
 ### REC (Response Evidence Capture)
+
+REC needs a reverse proxy running in Docker so it can enter the proxy's container network namespace and read the plaintext proxy-to-backend hop. It discovers the target over the Docker socket. That covers plain `docker run`, docker-compose, and PaaS layers like CapRover equally; CapRover is one example, not a requirement. Bare Docker is validated. On CapRover the proxy container is named `captain-nginx`; on plain Docker or compose it is whatever you named your proxy service.
 
 | Variable | Default | Description |
 |---|---|---|
 | `REC_ENABLED` | `false` | Master switch for REC |
 | `REC_INTERFACE` | (auto) | Interface to sniff |
-| `REC_NS_CONTAINER` | | Container whose namespace REC enters (e.g. `captain-nginx`) |
+| `REC_NS_CONTAINER` | | Container whose namespace REC enters (your reverse proxy, e.g. `captain-nginx` on CapRover, or your compose proxy service name) |
 | `REC_PORTS` | `80,8080` | Comma-separated HTTP ports REC always sniffs |
 | `REC_LEARNED_PORT_CAP` | `64` | Cap on runtime-learned ports (`0` to disable learning) |
 | `REC_REASSEMBLY_MAX_BODY` | `2048` | Max bytes to reassemble per HTTP response |
@@ -480,8 +496,10 @@ To add a normalizer:
 
 Observer is licensed under [AGPL-3.0](LICENSE).
 
-- **Self-hosting Observer is free, forever.** The AGPL license guarantees this. Run it on as many servers as you want, in production, indefinitely, no fees.
-- **The hosted dashboard at `app.vaultguardian.io`** is an optional commercial offering for operators who'd rather not query the API directly. The Observer binary itself remains AGPL regardless of which dashboard you use.
+Observer is free forever. Self-host it, AGPL-3.0, no fees, no limits. The optional hosted dashboard for fleet-wide visibility is $29/mo after a 1-month free trial.
+
+- **Self-hosting Observer is free, forever.** The AGPL license guarantees this. Run it on as many servers as you want, in production, indefinitely.
+- **The hosted dashboard at `app.vaultguardian.io`** is the optional commercial offering for operators who'd rather not query the API directly. The Observer binary itself remains AGPL regardless of which dashboard you use.
 - **AGPL means modifications you publish must be source-available under AGPL.** The goal is simple: self-hosters can run and modify Observer freely, while public hosted versions must keep their source available under the AGPL. This leaves normal self-hosters and commercial users entirely unaffected; it just prevents large cloud providers from rewrapping Observer as a closed-source managed service.
 
 If you're unsure whether your use case falls within the license, open an issue and ask.
