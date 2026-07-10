@@ -193,3 +193,147 @@ func containsEvent(fs []Finding, eventID string) bool {
 	}
 	return false
 }
+
+// =============================================================================
+// P1 follow-up: the timeout path must skip findings whose evidence state
+// machine reports evidence is available. Only genuinely evidence-less rows
+// (explicit not_available_* or legacy empty/NULL) stay eligible.
+// =============================================================================
+
+// insertPendingWithEvidence writes a fresh pending malicious finding carrying
+// the given evidence_status, timestamped in the past.
+func insertPendingWithEvidence(t *testing.T, s *Store, eventID, evidenceStatus string) {
+	t.Helper()
+	err := s.RecordFinding(context.Background(), &Finding{
+		EventID:        eventID,
+		Timestamp:      time.Now().Add(-time.Hour),
+		SourceType:     "nginx",
+		SourceName:     "docker:test",
+		Verdict:        "alert",
+		HTTPMethod:     "GET",
+		HTTPPath:       "/api/.env",
+		HTTPStatus:     200,
+		EvidenceStatus: evidenceStatus,
+	})
+	if err != nil {
+		t.Fatalf("record finding %s: %v", eventID, err)
+	}
+}
+
+// TestQueryUnresolvedMaliciousSkipsAvailableEvidence: findings whose evidence
+// is available (high or low confidence) are never returned by the timeout
+// query; evidence-less findings (empty or explicit not_available_*) are.
+func TestQueryUnresolvedMaliciousSkipsAvailableEvidence(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	insertPendingWithEvidence(t, s, "evt_high", "available_high_confidence")
+	insertPendingWithEvidence(t, s, "evt_low", "available_low_confidence")
+	insertPendingWithEvidence(t, s, "evt_nomatch", "not_available_no_match")
+	insertPending(t, s, "evt_empty") // empty evidence_status
+
+	got, err := s.QueryUnresolvedMalicious(ctx, time.Minute, 50)
+	if err != nil {
+		t.Fatalf("query unresolved: %v", err)
+	}
+
+	if containsEvent(got, "evt_high") {
+		t.Fatalf("evt_high (available_high_confidence) must be excluded from timeout query")
+	}
+	if containsEvent(got, "evt_low") {
+		t.Fatalf("evt_low (available_low_confidence) must be excluded from timeout query")
+	}
+	if !containsEvent(got, "evt_nomatch") {
+		t.Fatalf("evt_nomatch (not_available_no_match) is evidence-less and must remain eligible")
+	}
+	if !containsEvent(got, "evt_empty") {
+		t.Fatalf("evt_empty (no evidence_status) is evidence-less and must remain eligible")
+	}
+}
+
+// resolutionCols reads the four resolution columns directly (GetFindingByEventID
+// only surfaces resolution_status).
+func resolutionCols(t *testing.T, s *Store, eventID string) (status, method, prevVerdict, resolvedAt string) {
+	t.Helper()
+	err := s.DB().QueryRow(`SELECT
+		COALESCE(resolution_status,''), COALESCE(resolution_method,''),
+		COALESCE(previous_verdict,''), COALESCE(resolved_at,'')
+		FROM findings WHERE event_id = ? ORDER BY id DESC LIMIT 1`, eventID).
+		Scan(&status, &method, &prevVerdict, &resolvedAt)
+	if err != nil {
+		t.Fatalf("read resolution cols for %s: %v", eventID, err)
+	}
+	return
+}
+
+// insertFinalized writes a finding already stamped by a resolution writer, used
+// to seed the historical state the repair migration operates on.
+func insertFinalized(t *testing.T, s *Store, eventID, resolutionStatus, method, evidenceStatus string) {
+	t.Helper()
+	resolvedAt := time.Now().Add(-30 * time.Minute)
+	err := s.RecordFinding(context.Background(), &Finding{
+		EventID:          eventID,
+		Timestamp:        time.Now().Add(-time.Hour),
+		SourceType:       "nginx",
+		SourceName:       "docker:test",
+		Verdict:          "alert",
+		HTTPMethod:       "GET",
+		HTTPPath:         "/api/.env",
+		HTTPStatus:       200,
+		EvidenceStatus:   evidenceStatus,
+		ResolutionStatus: resolutionStatus,
+		ResolutionMethod: method,
+		ResolvedAt:       &resolvedAt,
+		PreviousVerdict:  "alert",
+	})
+	if err != nil {
+		t.Fatalf("record finalized finding %s: %v", eventID, err)
+	}
+}
+
+// TestMigration14RepairsMislabeledFindings: the repair migration resets only
+// timeout-stamped evidence_unavailable rows whose evidence is available; it
+// leaves evidence-less timeout rows and human decisions untouched.
+func TestMigration14RepairsMislabeledFindings(t *testing.T) {
+	s := newTestStore(t)
+
+	// (a) mislabeled: timeout + high-confidence evidence -> should be repaired.
+	insertFinalized(t, s, "evt_repair_high", "evidence_unavailable", "timeout", "available_high_confidence")
+	// (a2) mislabeled: timeout + low-confidence evidence -> should be repaired.
+	insertFinalized(t, s, "evt_repair_low", "evidence_unavailable", "timeout", "available_low_confidence")
+	// (b) genuine: timeout + no available evidence -> untouched.
+	insertFinalized(t, s, "evt_keep_nomatch", "evidence_unavailable", "timeout", "not_available_no_match")
+	// (c) human decision -> untouched.
+	insertFinalized(t, s, "evt_keep_human", "resolved", "human_override", "available_high_confidence")
+
+	// Re-run the migration by removing its schema_version row and calling
+	// migrate() again; this exercises the real migration SQL.
+	if _, err := s.DB().Exec(`DELETE FROM schema_version WHERE version = 14`); err != nil {
+		t.Fatalf("reset schema_version: %v", err)
+	}
+	if err := s.migrate(); err != nil {
+		t.Fatalf("re-run migrate: %v", err)
+	}
+
+	// (a) and (a2) reset to pending with cleared resolution metadata.
+	for _, id := range []string{"evt_repair_high", "evt_repair_low"} {
+		status, method, prev, resolvedAt := resolutionCols(t, s, id)
+		if status != "pending" {
+			t.Fatalf("%s resolution_status = %q; want pending", id, status)
+		}
+		if method != "" || prev != "" || resolvedAt != "" {
+			t.Fatalf("%s metadata not cleared: method=%q prev=%q resolvedAt=%q", id, method, prev, resolvedAt)
+		}
+	}
+
+	// (b) evidence-less timeout row untouched.
+	if status, _, _, _ := resolutionCols(t, s, "evt_keep_nomatch"); status != "evidence_unavailable" {
+		t.Fatalf("evt_keep_nomatch resolution_status = %q; want evidence_unavailable (untouched)", status)
+	}
+
+	// (c) human decision untouched.
+	status, method, _, _ := resolutionCols(t, s, "evt_keep_human")
+	if status != "resolved" || method != "human_override" {
+		t.Fatalf("evt_keep_human = (%q,%q); want (resolved,human_override) untouched", status, method)
+	}
+}

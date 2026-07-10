@@ -647,6 +647,16 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			severity, alert.EventID, alert.ScopeKey, alert.Key, alert.Reason,
 			alert.MatchedVia, alert.Hash, alert.EvidenceJournal, truncate(alert.Line, 200))
 
+		// Same T1 clamp invariant the reconciler warns on, checked earlier at
+		// dispatch: the T1 clamp caps LLM-matched HTTP verdicts at alert, so an
+		// LLM-matched malicious reaching unresolved dispatch means the clamp has
+		// a gap (or predates it). Fires regardless of evidence status, since an
+		// evidence-bearing finding now stays pending and never reaches the
+		// reconciler's copy of this warning. Log only, no behavior change.
+		if alert.MatchedVia == "llm" && alert.Verdict == "malicious" {
+			log.Printf("[dispatch] WARN: LLM-matched malicious reached unresolved dispatch (event=%s) - should be impossible after the T1 clamp; investigate", alert.EventID)
+		}
+
 		// Fix 4: Non-resolved findings get "pending" resolution status
 		db.SubmitFinding(&store.Finding{
 			EventID:              alert.EventID,

@@ -133,6 +133,14 @@ func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, sta
 // QueryUnresolvedMalicious returns malicious HTTP findings that have not
 // been resolved within the given age window. Used by the reconciler
 // goroutine to finalize stale findings as "evidence_unavailable".
+//
+// The timeout path applies ONLY to findings with no attached evidence.
+// A finding whose evidence state machine reports evidence is available
+// (available_high_confidence or available_low_confidence) is never selected
+// here: stamping it "evidence_unavailable" would be factually wrong and would
+// drop it out of the human review queue. Such findings stay pending
+// indefinitely until a human reviews them. Explicit not_available_* statuses
+// and legacy empty/NULL rows are genuinely evidence-less and remain eligible.
 func (s *Store) QueryUnresolvedMalicious(ctx context.Context, olderThan time.Duration, limit int) ([]Finding, error) {
 	if limit <= 0 {
 		limit = 100
@@ -148,6 +156,7 @@ func (s *Store) QueryUnresolvedMalicious(ctx context.Context, olderThan time.Dur
 		WHERE verdict IN ('malicious', 'alert')
 		  AND http_method != ''
 		  AND (resolution_status = 'pending' OR resolution_status = '' OR resolution_status IS NULL)
+		  AND COALESCE(evidence_status, '') NOT IN ('available_high_confidence', 'available_low_confidence')
 		  AND timestamp < ?
 		  AND downgraded = 0
 		ORDER BY timestamp ASC

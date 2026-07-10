@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vaultguardian/observer/internal/coordinator"
+	"github.com/vaultguardian/observer/internal/rec"
 	"github.com/vaultguardian/observer/internal/store"
 )
 
@@ -86,5 +87,74 @@ func TestDispatchCallbackPersistsBareSourceName(t *testing.T) {
 				t.Fatalf("reconstructed scope = %q, want %q (NOT docker:docker:captain-nginx)", got, "docker:captain-nginx")
 			}
 		})
+	}
+}
+
+// TestDispatchCallbackEvidenceBearingPendingStaysOutOfTimeout is the cross-layer
+// guard for the reconciler-mislabel fix: the third dispatch branch persists an
+// evidence-bearing suspicious/alert finding as pending, and the reconciler's
+// timeout query must never select it (which would wrongly stamp it
+// evidence_unavailable and drop it from the review queue). A control finding
+// with no evidence stays eligible.
+func TestDispatchCallbackEvidenceBearingPendingStaysOutOfTimeout(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Init(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	cb := makeDispatchCallback(nil, db)
+
+	// Evidence-bearing pending: reaches the third branch (BuildAlert non-nil,
+	// not escalated, not downgraded) with high-confidence evidence attached.
+	cb(coordinator.FinalAlert{
+		EventID:    "evt_evidence_pending",
+		ScopeKey:   "docker:captain-nginx",
+		SourceType: "docker",
+		SourceName: "captain-nginx",
+		Verdict:    "alert",
+		Severity:   "alert",
+		HTTPMethod: "GET",
+		HTTPPath:   "/api/.env",
+		StatusCode: 200,
+		Timestamp:  time.Now().Add(-time.Hour),
+		Evidence:   &rec.Evidence{Status: rec.EvidenceAvailableHighConfidence},
+		BuildAlert: func(evidence interface{}) interface{} { return nil },
+	})
+
+	// Control: evidence-less pending stays eligible for the timeout path.
+	cb(coordinator.FinalAlert{
+		EventID:    "evt_no_evidence_pending",
+		ScopeKey:   "docker:captain-nginx",
+		SourceType: "docker",
+		SourceName: "captain-nginx",
+		Verdict:    "alert",
+		Severity:   "alert",
+		HTTPMethod: "GET",
+		HTTPPath:   "/api/.env",
+		StatusCode: 200,
+		Timestamp:  time.Now().Add(-time.Hour),
+		BuildAlert: func(evidence interface{}) interface{} { return nil },
+	})
+
+	got, err := db.QueryUnresolvedMalicious(ctx, time.Minute, 50)
+	if err != nil {
+		t.Fatalf("QueryUnresolvedMalicious: %v", err)
+	}
+
+	for _, f := range got {
+		if f.EventID == "evt_evidence_pending" {
+			t.Fatalf("evidence-bearing pending finding must not be selected by the timeout query")
+		}
+	}
+	var sawControl bool
+	for _, f := range got {
+		if f.EventID == "evt_no_evidence_pending" {
+			sawControl = true
+		}
+	}
+	if !sawControl {
+		t.Fatalf("evidence-less pending finding should remain eligible for the timeout query")
 	}
 }

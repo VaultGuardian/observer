@@ -458,6 +458,30 @@ func (s *Store) migrate() error {
 			desc:    "cache lineage: origin_event_id on findings",
 			sql:     `ALTER TABLE findings ADD COLUMN origin_event_id TEXT DEFAULT '';`,
 		},
+		{
+			// Repair rows the evidence reconciler wrongly finalized as
+			// evidence_unavailable. Before the QueryUnresolvedMalicious evidence
+			// guard, the timeout path selected pending findings by verdict and
+			// age alone, so evidence-bearing findings (available_high_confidence
+			// or available_low_confidence) that a human did not review within
+			// the window were stamped evidence_unavailable and dropped from the
+			// review queue. This resets only those rows back to pending.
+			//
+			// Scoped strictly to resolution_method = 'timeout' so human
+			// decisions (human_override and friends) are never touched, and
+			// only to the two available_* evidence statuses so genuinely
+			// evidence-less rows keep their terminal state.
+			version: 14,
+			desc:    "repair evidence-bearing findings mislabeled evidence_unavailable by timeout",
+			sql: `UPDATE findings
+				SET resolution_status = 'pending',
+				    resolved_at = '',
+				    resolution_method = '',
+				    previous_verdict = ''
+				WHERE resolution_status = 'evidence_unavailable'
+				  AND resolution_method = 'timeout'
+				  AND evidence_status IN ('available_high_confidence', 'available_low_confidence');`,
+		},
 	}
 
 	for _, m := range migrations {
