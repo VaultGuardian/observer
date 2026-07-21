@@ -2,9 +2,12 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"regexp"
 	"strconv"
+
+	"github.com/vaultguardian/observer/internal/rec"
 )
 
 // =============================================================================
@@ -237,6 +240,34 @@ func statusCodeRejectsAttack(code int) bool {
 		return true
 	}
 	return false
+}
+
+// deterministicDisclosure is the shared tier-1 predicate for the disclosure
+// gate (P0 fix, Jul 2026), used by BOTH the evidence-check callback in main.go
+// and the cache-hit status shortcut in resultrouter.go — one helper so the two
+// gates cannot drift.
+//
+// True only for format identity: passwd, dotenv, or PEM private-key material,
+// which the REC detectors only ever emit at high confidence. Deliberately NOT
+// keyed on Disclosure.SensitiveRedactions — that counter increments for every
+// href/src/meta-content in HTML and every long string or email in JSON, so a
+// styled 404 page would count as "disclosing." Bodies with redaction counts
+// but no disclosing format go to the LLM instead (and Lane B already forbids
+// caching them benign).
+//
+// Nil-safe on both Evidence and Disclosure: the noOp collector returns a
+// non-nil Evidence with a nil Disclosure, and test stubs hand-build Evidence.
+func deterministicDisclosure(ev *rec.Evidence) (bool, string) {
+	if ev == nil || ev.Disclosure == nil {
+		return false, ""
+	}
+	switch ev.Disclosure.Format {
+	case rec.FormatPasswd, rec.FormatDotenv, rec.FormatPEM:
+		return true, fmt.Sprintf(
+			"Captured response body discloses sensitive data despite rejection status: %s (%d sensitive values redacted)",
+			ev.Disclosure.DisclosureSummary, ev.Disclosure.SensitiveRedactions)
+	}
+	return false, ""
 }
 
 // isBareIP returns true if the host string is an IP address rather than a

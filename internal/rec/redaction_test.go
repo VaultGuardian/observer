@@ -327,6 +327,74 @@ func TestClassifyAndRedact_SensitiveRedactionCounts(t *testing.T) {
 	}
 }
 
+func TestDetectFormat_PEMPrivateKeys(t *testing.T) {
+	armor := func(header string) string {
+		return "-----" + header + "-----\nMIIEpAIBAAKCAQEA7bq0\n-----END X-----\n"
+	}
+	positives := []struct {
+		name string
+		body string
+		ct   string
+	}{
+		{"rsa", armor("BEGIN RSA PRIVATE KEY"), ""},
+		{"ecdsa", armor("BEGIN ECDSA PRIVATE KEY"), ""},
+		{"ec", armor("BEGIN EC PRIVATE KEY"), ""},
+		{"dsa", armor("BEGIN DSA PRIVATE KEY"), ""},
+		{"openssh", armor("BEGIN OPENSSH PRIVATE KEY"), ""},
+		// ssh.com/Tectia armor uses four dashes and spaces; the contains-scan
+		// must not care.
+		{"ssh2_tectia", "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nMIIEpAIBAAKCAQEA7bq0\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\n", ""},
+		{"pkcs8", armor("BEGIN PRIVATE KEY"), ""},
+		{"encrypted_pkcs8", armor("BEGIN ENCRYPTED PRIVATE KEY"), ""},
+		{"pgp", armor("BEGIN PGP PRIVATE KEY BLOCK"), ""},
+		{"lowercase_armor", armor("begin rsa private key"), ""},
+		// Embedded mid-dump: the armor is not at offset zero, and the
+		// Content-Type would otherwise classify HTML — the PEM scan must
+		// pre-empt the Content-Type fast path or redactHTML would keep the
+		// key bytes as visible text.
+		{"embedded_in_html_error_dump", "<html><pre>stack trace:\n" + armor("BEGIN RSA PRIVATE KEY") + "</pre></html>", "text/html"},
+	}
+	for _, tc := range positives {
+		t.Run(tc.name, func(t *testing.T) {
+			format, conf := detectFormat([]byte(tc.body), tc.ct)
+			if format != FormatPEM {
+				t.Fatalf("detectFormat = %q, want %q", format, FormatPEM)
+			}
+			if conf != ConfidenceHigh {
+				t.Errorf("confidence = %q, want %q", conf, ConfidenceHigh)
+			}
+		})
+	}
+
+	// Public certificate armor must NOT classify as PEM private material.
+	t.Run("certificate_is_not_pem", func(t *testing.T) {
+		format, _ := detectFormat([]byte(armor("BEGIN CERTIFICATE")), "")
+		if format == FormatPEM {
+			t.Fatalf("BEGIN CERTIFICATE classified as FormatPEM — public certs must not count as key disclosure")
+		}
+	})
+}
+
+func TestClassifyAndRedact_PEMFailClosed(t *testing.T) {
+	body := []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7bq0\n-----END RSA PRIVATE KEY-----\n")
+	a := classifyAndRedact(body, "text/plain")
+	if a.Format != FormatPEM {
+		t.Fatalf("Format = %q, want %q", a.Format, FormatPEM)
+	}
+	if a.redactedPreview != "" {
+		t.Errorf("PEM body produced a preview: %q — key material must never be previewed", a.redactedPreview)
+	}
+	if a.RedactionConfidence != ConfidenceNone {
+		t.Errorf("RedactionConfidence = %q, want %q (dual gate must withhold the preview)", a.RedactionConfidence, ConfidenceNone)
+	}
+	if a.SensitiveRedactions < 1 {
+		t.Errorf("SensitiveRedactions = %d, want >= 1 (must block Lane A benign caching)", a.SensitiveRedactions)
+	}
+	if !strings.Contains(a.DisclosureSummary, "RSA") {
+		t.Errorf("DisclosureSummary %q does not name the key type", a.DisclosureSummary)
+	}
+}
+
 func TestClassifyAndRedact_FailClosedPathsCountZero(t *testing.T) {
 	// Empty body, binary body, unknown format — redaction never runs,
 	// SensitiveRedactions stays 0.

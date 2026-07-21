@@ -1,7 +1,11 @@
 // httpparse_test.go
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vaultguardian/observer/internal/rec"
+)
 
 // Shared sample lines used across the parse tests.
 const (
@@ -98,6 +102,50 @@ func TestExtractResponseBytes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := extractResponseBytes(tc.in); got != tc.want {
 				t.Errorf("extractResponseBytes(%q) = %d; want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeterministicDisclosure pins the shared tier-1 predicate used by both
+// the evidence callback and the status shortcut: format identity only —
+// redaction counts alone must never qualify, and every degenerate Evidence
+// shape (nil, noOp, missing disclosure) must be false.
+func TestDeterministicDisclosure(t *testing.T) {
+	disclosure := func(format rec.DetectedFormat, redactions int) *rec.Evidence {
+		return &rec.Evidence{
+			Disclosure: &rec.DisclosureAnalysis{
+				Format:              format,
+				SensitiveRedactions: redactions,
+				DisclosureSummary:   "TEST SUMMARY",
+			},
+		}
+	}
+	cases := []struct {
+		name string
+		ev   *rec.Evidence
+		want bool
+	}{
+		{"nil_evidence", nil, false},
+		{"nil_disclosure", &rec.Evidence{}, false},
+		{"noop_disabled_shape", &rec.Evidence{Status: rec.EvidenceNotAvailableCollectorDisabled}, false},
+		{"passwd", disclosure(rec.FormatPasswd, 1), true},
+		{"dotenv", disclosure(rec.FormatDotenv, 2), true},
+		{"pem_zero_preview", disclosure(rec.FormatPEM, 1), true},
+		{"formatless_with_redactions", disclosure("", 3), false},
+		{"html_with_redactions", disclosure(rec.FormatHTML, 5), false},
+		{"json_with_redactions", disclosure(rec.FormatJSON, 2), false},
+		{"binary_fail_closed", disclosure(rec.FormatBinary, 0), false},
+		{"unknown_fail_closed", disclosure(rec.FormatUnknown, 0), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := deterministicDisclosure(tc.ev)
+			if got != tc.want {
+				t.Errorf("deterministicDisclosure = %v, want %v", got, tc.want)
+			}
+			if tc.want && reason == "" {
+				t.Errorf("disclosing verdict carried no reason")
 			}
 		})
 	}

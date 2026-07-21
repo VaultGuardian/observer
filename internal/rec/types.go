@@ -47,6 +47,7 @@ const (
 	FormatPasswd  DetectedFormat = "passwd"
 	FormatHTML    DetectedFormat = "html"
 	FormatXML     DetectedFormat = "xml"
+	FormatPEM     DetectedFormat = "pem"
 	FormatBinary  DetectedFormat = "binary"
 	FormatUnknown DetectedFormat = "unknown"
 )

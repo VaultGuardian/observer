@@ -419,6 +419,64 @@ func TestEvidenceCallback_ClampedEventEscalates(t *testing.T) {
 	}
 }
 
+// TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd: router → coordinator
+// → evidence callback for a cache-hit repeat on a rejecting status whose REC
+// evidence shows a deterministic disclosure. The status shortcut must yield to
+// the coordinator, and the callback must escalate without an LLM call — the
+// two halves of the Jul 2026 P0 fix working together.
+func TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd(t *testing.T) {
+	ev := reclassEvidence(404, "DB_PASSWORD=[REDACTED]\nAPP_KEY=[REDACTED]", 2, 0, "")
+	ev.Disclosure.Format = rec.FormatDotenv
+	h := newCallbackHarness(t, ev, verdictGenericDowngrade, 0, nil)
+
+	recCh := make(chan coordinator.EvidenceDecision, 4)
+	recordingCheck := func(p *coordinator.PendingAlert) coordinator.EvidenceDecision {
+		d := h.cb(p)
+		recCh <- d
+		return d
+	}
+	coord := coordinator.New(
+		context.Background(),
+		coordinator.Config{},
+		func(coordinator.FinalAlert) {},
+		recordingCheck,
+		func(coordinator.VerifyRequest) *coordinator.VerifyResult { return nil },
+		coordinator.NewSelfSuppressor(),
+	)
+	router := &resultRouter{
+		cfg:              Config{},
+		collector:        &stubEvidenceCollector{ev: ev},
+		alertCoordinator: coord,
+	}
+
+	evt := http404AlertEvent()
+	result := analyzer.AnalysisResult{
+		Verdict: patternstore.VerdictMalicious,
+		Source:  "cache", // repeat: pattern-store hit, not a fresh LLM event
+		Reason:  "dotenv probe pattern",
+	}
+	router.routeAlert(evt, &result, watcher.LogLine{})
+
+	_, nPath, _, _ := parseNormalizedLine(evt.NormalizedLine)
+	key := fmt.Sprintf("example.com|GET|%s|404", canonicalPath(nPath))
+	coord.TryResolveVIP(key)
+
+	select {
+	case d := <-recCh:
+		if !d.Escalated {
+			t.Errorf("EvidenceDecision.Escalated = false (reason=%q), want true", d.Reason)
+		}
+		if d.NewSeverity != "malicious" {
+			t.Errorf("NewSeverity = %q, want \"malicious\"", d.NewSeverity)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("evidence check never ran — status shortcut not overridden, or key mismatch (key=%q)", key)
+	}
+	if got := h.stub.calls.Load(); got != 0 {
+		t.Errorf("LLM called %d times, want 0 (deterministic escalation)", got)
+	}
+}
+
 // TestEvidenceCallback_ClampLeakBackstop: even if a pending alert arrives
 // with the immutable original "malicious" as Classification while routing at
 // verdict "alert" (the clamp-leak shape), the callback normalizes it to the
@@ -436,13 +494,16 @@ func TestEvidenceCallback_ClampLeakBackstop(t *testing.T) {
 	}
 }
 
-// TestEvidenceCallback_SlowResponseGate: a wire-paired request duration at or
-// above the threshold withholds the Path-1 transport downgrade and routes the
-// event to the LLM with the latency in the prompt; everything else downgrades
-// exactly as before.
+// TestEvidenceCallback_SlowResponseGate: tier-3 transport downgrades only
+// happen with NO captured body preview (three-tier gate, Jul 2026). A
+// wire-paired request duration at or above the threshold withholds even the
+// no-body downgrade; a captured body always defers to Path 2 (LLM), which
+// sees the latency in the prompt when present.
 func TestEvidenceCallback_SlowResponseGate(t *testing.T) {
+	const notFoundBody = "<html>custom not found</html>"
 	cases := []struct {
 		name          string
+		body          string
 		dur           time.Duration
 		latencySource string
 		thresholdMs   int // 0 = leave default (3000)
@@ -450,15 +511,19 @@ func TestEvidenceCallback_SlowResponseGate(t *testing.T) {
 		wantLLMCalls  int64
 		wantPrompt    string
 	}{
-		{"slow_wire_pair_withheld", 5 * time.Second, "wire_pair", 0, false, 1, "Observed server processing time: 5000 ms"},
-		{"fast_wire_pair_downgrades", 50 * time.Millisecond, "wire_pair", 0, true, 0, ""},
-		{"absent_duration_downgrades", 0, "", 0, true, 0, ""},
-		{"gate_disabled_downgrades", 5 * time.Second, "wire_pair", -1, true, 0, ""},
-		{"non_wire_pair_downgrades", 5 * time.Second, "log_estimate", 0, true, 0, ""},
+		// Body present: tier 2 — never a transport downgrade, always LLM.
+		{"slow_wire_pair_body_reclassifies", notFoundBody, 5 * time.Second, "wire_pair", 0, false, 1, "Observed server processing time: 5000 ms"},
+		{"fast_wire_pair_body_reclassifies", notFoundBody, 50 * time.Millisecond, "wire_pair", 0, false, 1, ""},
+		// No body: tier 3 — pre-existing behavior preserved exactly.
+		{"slow_wire_pair_no_body_withheld_no_llm", "", 5 * time.Second, "wire_pair", 0, false, 0, ""},
+		{"fast_wire_pair_no_body_downgrades", "", 50 * time.Millisecond, "wire_pair", 0, true, 0, ""},
+		{"absent_duration_no_body_downgrades", "", 0, "", 0, true, 0, ""},
+		{"gate_disabled_no_body_downgrades", "", 5 * time.Second, "wire_pair", -1, true, 0, ""},
+		{"non_wire_pair_no_body_downgrades", "", 5 * time.Second, "log_estimate", 0, true, 0, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ev := reclassEvidence(404, "<html>custom not found</html>", 0, tc.dur, tc.latencySource)
+			ev := reclassEvidence(404, tc.body, 0, tc.dur, tc.latencySource)
 			var mut func(*Config)
 			if tc.thresholdMs != 0 {
 				mut = func(c *Config) { c.SlowResponseThresholdMs = 0 }
@@ -478,5 +543,103 @@ func TestEvidenceCallback_SlowResponseGate(t *testing.T) {
 				t.Errorf("LLM prompt missing %q", tc.wantPrompt)
 			}
 		})
+	}
+}
+
+// TestEvidenceCallback_DeterministicDisclosureEscalates: tier 1 of the
+// disclosure gate — passwd/dotenv/PEM format identity on a rejection status
+// escalates deterministically, zero LLM calls, zero audit rows. PEM exercises
+// the empty-preview arm (fail-closed format, 403 per the original finding);
+// passwd/dotenv exercise the preview-bearing arm that runs in Path 2 after
+// the ExpectedEndpoint check.
+func TestEvidenceCallback_DeterministicDisclosureEscalates(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		format     rec.DetectedFormat
+		redactions int
+	}{
+		{"passwd_404_with_preview", 404, "root:x:0:0:root:/root:/bin/bash", rec.FormatPasswd, 1},
+		{"dotenv_404_with_preview", 404, "DB_PASSWORD=[REDACTED]\nAPP_KEY=[REDACTED]", rec.FormatDotenv, 2},
+		{"pem_403_no_preview", 403, "", rec.FormatPEM, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := reclassEvidence(tc.status, tc.body, tc.redactions, 0, "")
+			ev.Disclosure.Format = tc.format
+			h := newCallbackHarness(t, ev, verdictGenericDowngrade, 0, nil)
+
+			d := h.cb(reclassSnapshot("evt_det", "malicious"))
+
+			if !d.Escalated {
+				t.Fatalf("Escalated = false (reason=%q), want true", d.Reason)
+			}
+			if d.NewSeverity != "malicious" {
+				t.Errorf("NewSeverity = %q, want \"malicious\"", d.NewSeverity)
+			}
+			if !strings.Contains(d.Reason, "discloses sensitive data") {
+				t.Errorf("reason %q does not carry the deterministic-disclosure wording", d.Reason)
+			}
+			if got := h.stub.calls.Load(); got != 0 {
+				t.Errorf("LLM called %d times, want 0 (deterministic escalation must not consult the LLM)", got)
+			}
+			if rows := h.decisionRows(t); len(rows) != 0 {
+				t.Errorf("llm_decisions rows = %d, want 0", len(rows))
+			}
+		})
+	}
+}
+
+// TestEvidenceCallback_RedactionCountAloneDoesNotEscalate pins the operator
+// decision that SensitiveRedactions stays OUT of tier 1: an HTML 404 body
+// with redaction counts but no disclosing format takes tier 2 (LLM judges),
+// with neither a transport downgrade nor a deterministic escalation.
+func TestEvidenceCallback_RedactionCountAloneDoesNotEscalate(t *testing.T) {
+	ev := reclassEvidence(404, `<html><a href="[REDACTED]">home</a></html>`, 3, 0, "")
+	ev.Disclosure.Format = rec.FormatHTML
+	h := newCallbackHarness(t, ev, verdictGenericDowngrade, 0, nil)
+
+	d := h.cb(reclassSnapshot("evt_count", "malicious"))
+
+	if strings.Contains(d.Reason, "Transport evidence confirms attack failed") {
+		t.Errorf("transport downgrade fired despite captured body: %q", d.Reason)
+	}
+	if strings.Contains(d.Reason, "discloses sensitive data") {
+		t.Errorf("deterministic escalation fired on redaction count alone: %q", d.Reason)
+	}
+	if got := h.stub.calls.Load(); got != 1 {
+		t.Errorf("LLM called %d times, want 1 (count-bearing body must be judged by the LLM)", got)
+	}
+}
+
+// TestEvidenceCallback_ExpectedEndpointBeatsDeterministicEscalation pins the
+// load-bearing ordering for the preview-bearing tier-1 arm: an
+// operator-confirmed shape downgrades BEFORE the deterministic disclosure
+// check can escalate — operator-explicit truth wins.
+func TestEvidenceCallback_ExpectedEndpointBeatsDeterministicEscalation(t *testing.T) {
+	body := "root:x:0:0:root:/root:/bin/bash"
+	ev := reclassEvidence(404, body, 1, 0, "")
+	ev.Disclosure.Format = rec.FormatPasswd
+	h := newCallbackHarness(t, ev, verdictEscalation, 0, nil)
+
+	h.tracker.SeedVerified(
+		[]coordinator.ExpectedEndpointFingerprint{{
+			Host: "example.com", Method: "GET", Path: "/x", Status: 404,
+			BodyPreviewHash: rec.HashBody([]byte(body)),
+		}},
+		[]string{"operator-approved honeypot passwd endpoint"},
+	)
+
+	d := h.cb(reclassSnapshot("evt_ee_det", "malicious"))
+
+	if !d.Downgraded {
+		t.Fatalf("Downgraded = false (escalated=%v reason=%q) — ExpectedEndpoint must pre-empt tier 1", d.Escalated, d.Reason)
+	}
+	if d.Escalated {
+		t.Errorf("Escalated = true, want false")
+	}
+	if got := h.stub.calls.Load(); got != 0 {
+		t.Errorf("LLM called %d times, want 0", got)
 	}
 }

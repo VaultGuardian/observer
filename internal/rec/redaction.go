@@ -29,6 +29,16 @@ func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) 
 		ct = strings.TrimSpace(ct[:idx])
 	}
 
+	// --- PEM private-key material (checked BEFORE the Content-Type paths) ---
+	// Keys are routinely embedded in error dumps served as text/html or
+	// text/plain. If the Content-Type fast path claimed such a body first,
+	// redactHTML would keep the armor block as "visible text" and leak key
+	// material into the preview. The armor header alone is conclusive, so
+	// this scan pre-empts every other classification.
+	if pemKeyType(body) != "" {
+		return FormatPEM, ConfidenceHigh
+	}
+
 	// --- Content-Type header (highest signal) ---
 	switch {
 	case ct == "application/json" || ct == "text/json":
@@ -97,6 +107,41 @@ func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) 
 	}
 
 	return FormatUnknown, ConfidenceNone
+}
+
+// pemPrivateKeyHeaders maps PEM armor headers to a short key-type label for
+// the disclosure summary. Only PRIVATE key armor counts — "BEGIN CERTIFICATE"
+// is public material and must NOT classify as FormatPEM. More specific
+// headers precede the generic "BEGIN PRIVATE KEY" so the label is accurate.
+var pemPrivateKeyHeaders = []struct {
+	header string // uppercase; matched case-insensitively
+	label  string
+}{
+	{"BEGIN RSA PRIVATE KEY", "RSA"},
+	{"BEGIN ECDSA PRIVATE KEY", "ECDSA"}, // nonstandard, but emitted by some libraries
+	{"BEGIN EC PRIVATE KEY", "EC"},
+	{"BEGIN DSA PRIVATE KEY", "DSA"},
+	{"BEGIN OPENSSH PRIVATE KEY", "OPENSSH"},
+	{"BEGIN SSH2 ENCRYPTED PRIVATE KEY", "SSH2"}, // ssh.com/Tectia export (also PuTTY export)
+	{"BEGIN ENCRYPTED PRIVATE KEY", "ENCRYPTED PKCS#8"},
+	{"BEGIN PGP PRIVATE KEY BLOCK", "PGP"},
+	{"BEGIN PRIVATE KEY", "PKCS#8"},
+}
+
+// pemKeyType scans the whole body preview (not just offset zero — keys are
+// often embedded mid-dump) for a private-key armor header, case-insensitively.
+// Returns the key-type label, or "" if none found.
+func pemKeyType(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	upper := strings.ToUpper(string(body))
+	for _, h := range pemPrivateKeyHeaders {
+		if strings.Contains(upper, h.header) {
+			return h.label
+		}
+	}
+	return ""
 }
 
 // looksLikePasswd checks if the content appears to be a Unix passwd/shadow file.
@@ -760,15 +805,25 @@ func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 	case FormatHTML:
 		analysis.redactedPreview, analysis.SensitiveRedactions = redactHTML(bodyPreview)
 		analysis.DisclosureSummary = "HTML CONTENT DETECTED"
+	case FormatPEM:
+		// Fail closed: never preview key material, not even redacted — the
+		// armor header alone is the disclosure. SensitiveRedactions is
+		// forced to at least 1 so count-based logic (the Lane A benign-cache
+		// gate) treats this body as disclosing; escalation itself keys off
+		// Format, not the count.
+		analysis.redactedPreview = ""
+		analysis.RedactionConfidence = ConfidenceNone
+		analysis.SensitiveRedactions = 1
+		analysis.DisclosureSummary = fmt.Sprintf("PEM PRIVATE KEY DETECTED (%s) - METADATA ONLY", pemKeyType(bodyPreview))
 	case FormatBinary:
 		analysis.redactedPreview = ""
 		analysis.RedactionConfidence = ConfidenceNone
-		analysis.DisclosureSummary = "BINARY CONTENT DETECTED — METADATA ONLY"
+		analysis.DisclosureSummary = "BINARY CONTENT DETECTED - METADATA ONLY"
 	default:
 		// FAIL-CLOSED: unknown format = no body preview.
 		analysis.redactedPreview = ""
 		analysis.RedactionConfidence = ConfidenceNone
-		analysis.DisclosureSummary = "UNKNOWN FORMAT — METADATA ONLY"
+		analysis.DisclosureSummary = "UNKNOWN FORMAT - METADATA ONLY"
 	}
 
 	return analysis

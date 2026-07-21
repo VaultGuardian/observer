@@ -764,25 +764,75 @@ func makeEvidenceCheckCallback(
 			}(),
 		})
 
-		// --- Path 1: Transport-only downgrade ---
+		// --- Path 1: Transport-only downgrade (three-tier disclosure gate) ---
+		//
+		// P0 fix (Jul 2026): a rejection status alone no longer downgrades
+		// when REC captured body evidence. Tiers, in order:
+		//
+		//	Tier 1 — deterministic disclosure (passwd/dotenv/PEM format
+		//	         identity) escalates. The empty-preview arm runs here;
+		//	         the preview-bearing arm runs in Path 2 AFTER the
+		//	         ExpectedEndpoint short-circuit (operator-explicit truth
+		//	         wins — the load-bearing ordering invariant). Escalating
+		//	         a withheld preview here cannot violate that invariant:
+		//	         the tracker's match key is the redacted-preview shape
+		//	         hash, which cannot exist for a withheld preview.
+		//	         Known FP profile (accepted Jul 2026): a rejection body
+		//	         that merely QUOTES a PEM armor header — e.g. a security
+		//	         appliance's 403 block page with remediation text — will
+		//	         escalate and email on every blocked attack. Because a
+		//	         fail-closed PEM body has no preview shape hash, the
+		//	         ExpectedEndpoint workflow can never suppress it; the
+		//	         only relief is a request-side allow pattern.
+		//	Tier 2 — any captured body preview defeats the status-only
+		//	         downgrade; fall through to Path 2 (body-aware).
+		//	Tier 3 — no preview, no disclosing format: the original
+		//	         status-downgrade behavior, slow-response gate included.
 		if evidence != nil && evidence.Transport != nil {
 			code := evidence.Transport.StatusCode
 			if transportDowngradeCodes[code] {
-				// Slow-response gate: a rejection-looking status that took
-				// anomalously long on the wire may itself be evidence
-				// (time-based blind injection — the Jun 11 2026 scanner
-				// incident class). Only real wire-paired durations close
-				// this gap; absent/unpaired durations downgrade exactly as
-				// before, deliberately — no regression for orphans.
-				if cfg.SlowResponseThresholdMs > 0 &&
+				if disclosing, why := deterministicDisclosure(evidence); disclosing && evidence.SafeBodyPreview == "" {
+					// Tier 1, empty-preview arm (PEM is fail-closed by
+					// design; passwd/dotenv previews can be withheld by the
+					// dual gate).
+					log.Printf("[reclassify] Deterministic disclosure escalation (no preview): key=%s status=%d format=%s",
+						snapshot.Key, code, evidence.Disclosure.Format)
+					return coordinator.EvidenceDecision{
+						Escalated:       true,
+						NewSeverity:     "malicious",
+						Reason:          why,
+						Evidence:        evidence,
+						EvidenceJournal: evidence.ForJournal(),
+						BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+					}
+				}
+				if evidence.SafeBodyPreview != "" {
+					// Tier 2 (and the preview-bearing tier-1 arm): defer to
+					// Path 2 — ExpectedEndpoint, then the deterministic
+					// format check, then cache/LLM.
+					log.Printf("[reclassify] Status downgrade deferred: captured body present, key=%s status=%d - routing to body-aware Path 2",
+						snapshot.Key, code)
+				} else if cfg.SlowResponseThresholdMs > 0 &&
 					evidence.Transport.RequestDuration > 0 &&
 					evidence.Transport.LatencySource == "wire_pair" &&
 					evidence.Transport.RequestDuration >= time.Duration(cfg.SlowResponseThresholdMs)*time.Millisecond {
+					// Slow-response gate: a rejection-looking status that took
+					// anomalously long on the wire may itself be evidence
+					// (time-based blind injection — the Jun 11 2026 scanner
+					// incident class). Only real wire-paired durations close
+					// this gap; absent/unpaired durations downgrade exactly as
+					// before, deliberately — no regression for orphans.
 					log.Printf("[reclassify] Transport downgrade withheld: status=%d duration=%s key=%s",
 						code, evidence.Transport.RequestDuration, snapshot.Key)
 					// Fall through to Path 2 (body-aware) — the LLM sees
 					// the latency via the reclassify prompt.
 				} else {
+					// Tier 3. Residual gap (accepted Jul 2026, documented not
+					// fixed): FormatBinary and FormatUnknown bodies are
+					// fail-closed with no preview and are indistinguishable
+					// here from "no body captured" — a 404 whose body is an
+					// unknown-format blob (e.g. a raw database file) still
+					// downgrades on status alone.
 					reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) - payload was rejected/ignored by the server", code)
 					log.Printf("[coordinator] Transport downgrade: key=%s status=%d candidates=%d",
 						snapshot.Key, code, evidence.CandidateCount)
@@ -890,6 +940,28 @@ func makeEvidenceCheckCallback(
 				return coordinator.EvidenceDecision{
 					Downgraded:      true,
 					Reason:          reason,
+					Evidence:        evidence,
+					EvidenceJournal: evidence.ForJournal(),
+					BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+				}
+			}
+		}
+
+		// Tier 1, preview-bearing arm (P0 fix, Jul 2026): deterministic
+		// disclosure formats on a rejection status escalate without the LLM.
+		// Ordering is load-bearing: AFTER the ExpectedEndpoint short-circuit
+		// (operator-explicit truth beats deterministic inference) and BEFORE
+		// the reclass cache (a stale cached downgrade must not pre-empt a
+		// deterministic disclosure). Gated on the rejection codes so
+		// non-rejecting statuses keep today's LLM path.
+		if transportDowngradeCodes[evidence.Transport.StatusCode] {
+			if disclosing, why := deterministicDisclosure(evidence); disclosing {
+				log.Printf("[reclassify] Deterministic disclosure escalation: key=%s status=%d format=%s",
+					snapshot.Key, evidence.Transport.StatusCode, evidence.Disclosure.Format)
+				return coordinator.EvidenceDecision{
+					Escalated:       true,
+					NewSeverity:     "malicious",
+					Reason:          why,
 					Evidence:        evidence,
 					EvidenceJournal: evidence.ForJournal(),
 					BodyPreviewHash: evidence.Transport.BodyPreviewHash,

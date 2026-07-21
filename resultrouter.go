@@ -136,6 +136,10 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 
 	isHTTP := method != ""
 
+	// Hoisted above the status shortcut (Jul 2026): the shortcut's REC lookup
+	// needs ExpectedBytes for orphan-response disambiguation.
+	respBytes := extractResponseBytes(evt.Line)
+
 	// --- Recon routing ---
 	if result.LLMClassification == "recon_failed" {
 		log.Printf("[RECON] EventID=%s Source=%s Classification=%s Reason=%s MatchedVia=%s Line=%s",
@@ -198,43 +202,48 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// happens here, so a slow time-based-blind 404 repeat is downgraded on
 	// status alone while a fresh LLM event with the same timing would be
 	// held for body-aware reclassification. Backlog: "extend slow-gate to
-	// status shortcut".
+	// status shortcut". (Partially superseded Jul 2026: a REC lookup DOES now
+	// happen below, but only the deterministic-disclosure check consumes it —
+	// the slow-gate itself still doesn't apply to this shortcut.)
+	//
+	// DISCLOSURE OVERRIDE (P0 fix, Jul 2026): before trusting the log-line
+	// status, ask REC whether it already captured a response body with a
+	// deterministically disclosing format (passwd/dotenv/PEM — the shared
+	// deterministicDisclosure predicate, same tier-1 gate as the evidence
+	// callback). If so, do NOT short-circuit: fall through to the full
+	// coordinator/evidence routing below, where the callback escalates.
+	// Caveats, deliberate:
+	//   - Best-effort: REC reassembly can lag ~2s behind the log line, so
+	//     this one-shot lookup can miss a body that lands moments later.
+	//     A miss means the status shortcut proceeds — exactly today's
+	//     behavior, never a hold.
+	//   - Repeats that fall through and hit a graveyard tombstone are
+	//     suppressed with NO finding row, where this shortcut writes one
+	//     recon finding per repeat — an accepted dashboard-visible change.
+	//   - The noOp collector returns Evidence with nil Disclosure, so the
+	//     predicate is false and disabled deployments are unaffected.
 	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
-		reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server - HTTP %d confirms failure", result.Source, statusCode)
-
-		log.Printf("[RECON:STATUS] EventID=%s Source=%s Status=%d Classification=%s PatternVia=%s Line=%s",
-			evt.ID, evt.ScopeKey(), statusCode, result.LLMClassification, result.Source,
-			truncate(evt.Line, 200))
-
-		r.db.SubmitFinding(&store.Finding{
-			EventID:              evt.ID,
-			Timestamp:            evt.Timestamp,
-			SourceType:           evt.SourceType,
-			SourceName:           evt.SourceName,
-			DestHost:             host,
-			HTTPMethod:           method,
-			HTTPPath:             rawPath,
-			HTTPStatus:           statusCode,
-			Verdict:              "recon",
-			Classification:       "recon_failed_status",
-			Confidence:           result.LLMConfidence,
-			Reason:               reason,
-			MatchedVia:           result.Source,
-			MatchedPatternScope:  result.PatternScope,
-			MatchedPatternBucket: result.PatternBucket,
-			MatchedPatternValue:  result.PatternValue,
-			OriginEventID:        result.OriginEventID,
-			RawLine:              evt.Line,
-			NormalizedLine:       evt.NormalizedLine,
-			NormalizedHash:       evt.Hash,
-			Notified:             false,
-			Downgraded:           true,
-			DowngradeReason:      reason,
-			ResolutionStatus:     "resolved",
-			ResolutionMethod:     "status_only",
-			PreviousVerdict:      string(result.Verdict),
+		ev := r.collector.Lookup(rec.LookupRequest{
+			EventID:         evt.ID,
+			Method:          method,
+			Path:            rawPath, // raw wire path — REC captures literal paths
+			Host:            host,
+			SourceContainer: evt.SourceName,
+			StatusCode:      statusCode,
+			Timestamp:       evt.Timestamp,
+			Window:          10 * time.Second, // mirrors the evidence callback's lookup window
+			ExpectedBytes:   respBytes,        // orphan-response disambiguation gate
 		})
-		return
+		if disclosing, why := deterministicDisclosure(ev); disclosing {
+			log.Printf("[RECON:STATUS] Shortcut overridden: EventID=%s Source=%s Status=%d - %s - routing to coordinator",
+				evt.ID, evt.ScopeKey(), statusCode, why)
+			// Fall through to the coordinator/evidence routing below. The
+			// shortcut's finding is intentionally NOT written — the
+			// coordinator dispatch writes the single finding for this event.
+		} else {
+			r.shortCircuitStatusRejection(evt, result, host, method, rawPath, statusCode)
+			return
+		}
 	}
 
 	// --- Edge-generated response routing (design consensus) ---
@@ -318,8 +327,6 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	if result.LLMClampedToAlert {
 		pendingClassification = "suspicious"
 	}
-
-	respBytes := extractResponseBytes(evt.Line)
 
 	// --- HTTP alerts: route through coordinator for evidence huddle ---
 	if isHTTP && r.collector.Enabled() {
@@ -492,5 +499,46 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		NormalizedLine:       evt.NormalizedLine,
 		NormalizedHash:       evt.Hash,
 		Notified:             notified,
+	})
+}
+
+// shortCircuitStatusRejection writes the resolved recon finding for a
+// cache-hit attack pattern whose log-line status proves rejection and whose
+// REC lookup showed no deterministic disclosure. Extracted from routeAlert's
+// status shortcut; behavior is unchanged from the pre-Jul-2026 inline body.
+func (r *resultRouter) shortCircuitStatusRejection(evt *event.Event, result *analyzer.AnalysisResult, host, method, rawPath string, statusCode int) {
+	reason := fmt.Sprintf("Known attack pattern (via:%s) rejected by server - HTTP %d confirms failure", result.Source, statusCode)
+
+	log.Printf("[RECON:STATUS] EventID=%s Source=%s Status=%d Classification=%s PatternVia=%s Line=%s",
+		evt.ID, evt.ScopeKey(), statusCode, result.LLMClassification, result.Source,
+		truncate(evt.Line, 200))
+
+	r.db.SubmitFinding(&store.Finding{
+		EventID:              evt.ID,
+		Timestamp:            evt.Timestamp,
+		SourceType:           evt.SourceType,
+		SourceName:           evt.SourceName,
+		DestHost:             host,
+		HTTPMethod:           method,
+		HTTPPath:             rawPath,
+		HTTPStatus:           statusCode,
+		Verdict:              "recon",
+		Classification:       "recon_failed_status",
+		Confidence:           result.LLMConfidence,
+		Reason:               reason,
+		MatchedVia:           result.Source,
+		MatchedPatternScope:  result.PatternScope,
+		MatchedPatternBucket: result.PatternBucket,
+		MatchedPatternValue:  result.PatternValue,
+		OriginEventID:        result.OriginEventID,
+		RawLine:              evt.Line,
+		NormalizedLine:       evt.NormalizedLine,
+		NormalizedHash:       evt.Hash,
+		Notified:             false,
+		Downgraded:           true,
+		DowngradeReason:      reason,
+		ResolutionStatus:     "resolved",
+		ResolutionMethod:     "status_only",
+		PreviousVerdict:      string(result.Verdict),
 	})
 }
