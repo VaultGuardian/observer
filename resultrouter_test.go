@@ -33,11 +33,11 @@ func (f *fakeCollector) Lookup(rec.LookupRequest) *rec.Evidence {
 	}
 	return &rec.Evidence{}
 }
-func (f *fakeCollector) Enabled() bool { return true }
-func (f *fakeCollector) Stats() rec.RECStats                    { return rec.RECStats{} }
-func (f *fakeCollector) Coverage() rec.RECCoverage              { return rec.RECCoverage{Mode: "disabled"} }
-func (f *fakeCollector) PrePin(string, rec.LookupRequest)       {}
-func (f *fakeCollector) SetVIPCallback(func(string))            {}
+func (f *fakeCollector) Enabled() bool                    { return true }
+func (f *fakeCollector) Stats() rec.RECStats              { return rec.RECStats{} }
+func (f *fakeCollector) Coverage() rec.RECCoverage        { return rec.RECCoverage{Mode: "disabled"} }
+func (f *fakeCollector) PrePin(string, rec.LookupRequest) {}
+func (f *fakeCollector) SetVIPCallback(func(string))      {}
 func (f *fakeCollector) PinVIP(eventID, _ string, _ rec.LookupRequest) {
 	f.pinned = append(f.pinned, eventID)
 }
