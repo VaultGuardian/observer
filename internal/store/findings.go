@@ -425,9 +425,9 @@ func (w *FindingsWriter) Run(ctx context.Context) {
 	flushTimer := time.NewTicker(200 * time.Millisecond)
 	defer flushTimer.Stop()
 
-	flush := func() {
+	flush := func(fctx context.Context) {
 		if len(batch) > 0 {
-			w.flushBatch(ctx, batch)
+			w.flushBatch(fctx, batch)
 			batch = batch[:0]
 		}
 	}
@@ -437,32 +437,43 @@ func (w *FindingsWriter) Run(ctx context.Context) {
 		case f := <-w.ch:
 			batch = append(batch, f)
 			if len(batch) >= 50 {
-				flush()
+				flush(ctx)
 			}
 
 		case <-flushTimer.C:
-			flush()
+			flush(ctx)
 
 		case <-w.stopCh:
 			// Shutdown: drain remaining findings from channel, then exit.
+			// The app context is typically already canceled here (SIGINT or
+			// SIGTERM), which would make BeginTx and the RecordFinding
+			// fallback fail and lose every buffered finding. Flush with a
+			// shielded context so the final write can complete, bounded by
+			// a timeout so shutdown cannot hang.
 			for {
 				select {
 				case f := <-w.ch:
 					batch = append(batch, f)
 				default:
-					flush()
+					drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					flush(drainCtx)
+					cancel()
 					return
 				}
 			}
 
 		case <-ctx.Done():
 			// Context cancelled: drain remaining findings from channel.
+			// Same shielding as the stopCh arm: ctx is dead by definition
+			// here, so the final flush needs a live, bounded context.
 			for {
 				select {
 				case f := <-w.ch:
 					batch = append(batch, f)
 				default:
-					flush()
+					drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					flush(drainCtx)
+					cancel()
 					return
 				}
 			}
