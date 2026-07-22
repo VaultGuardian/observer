@@ -99,8 +99,9 @@ type Server struct {
 	// getNotifierStats exposes notifier dispatcher counters to /api/stats
 	// without coupling the API server type to the notifier package.
 	// Returns the cumulative count of alerts dropped because a channel's
-	// queue was full, and the number of active notification channels.
-	getNotifierStats func() (dropped int64, channels int)
+	// queue was full, the cumulative count of alerts suppressed by the
+	// rate limiter, and the number of active notification channels.
+	getNotifierStats func() (dropped, rateLimited int64, channels int)
 }
 
 // NewServer creates the API server and loads (or generates) the auth token.
@@ -146,7 +147,7 @@ func NewServer(
 // to /api/stats. Called from main.go after the dispatcher is constructed.
 // Decoupled from the API server type so this package doesn't need to
 // import internal/notifier.
-func (s *Server) SetNotifierStatsCallback(notifierStats func() (dropped int64, channels int)) {
+func (s *Server) SetNotifierStatsCallback(notifierStats func() (dropped, rateLimited int64, channels int)) {
 	s.getNotifierStats = notifierStats
 }
 
@@ -453,10 +454,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	// Notifier dispatcher counters. Nil-safe.
 	if s.getNotifierStats != nil {
-		nDropped, nChannels := s.getNotifierStats()
+		nDropped, nRateLimited, nChannels := s.getNotifierStats()
 		result["notifier"] = map[string]interface{}{
-			"channels": nChannels,
-			"dropped":  nDropped,
+			"channels":     nChannels,
+			"dropped":      nDropped,
+			"rate_limited": nRateLimited,
 		}
 	}
 

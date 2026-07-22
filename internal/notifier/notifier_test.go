@@ -79,7 +79,7 @@ func TestRateLimit_TwoPhase(t *testing.T) {
 	}
 
 	// First check: nothing stored yet → not limited.
-	limited, key := d.rateLimitCheck("webhook", "alpha")
+	limited, key := d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if limited {
 		t.Fatal("first check should return not-limited (no prior entry)")
 	}
@@ -90,7 +90,7 @@ func TestRateLimit_TwoPhase(t *testing.T) {
 	// Simulate "enqueue failed" — caller does NOT commit. The bug being
 	// fixed is precisely that the old code committed here unconditionally.
 	// A second check must still return not-limited.
-	limited, _ = d.rateLimitCheck("webhook", "alpha")
+	limited, _ = d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if limited {
 		t.Fatal("second check should still be not-limited — no commit happened in between")
 	}
@@ -99,14 +99,14 @@ func TestRateLimit_TwoPhase(t *testing.T) {
 	d.commitRateLimit(key)
 
 	// Now within the interval, the next check must be limited.
-	limited, _ = d.rateLimitCheck("webhook", "alpha")
+	limited, _ = d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if !limited {
 		t.Fatal("third check should be limited — we just committed")
 	}
 
 	// After the interval elapses, the next check is not-limited again.
 	time.Sleep(220 * time.Millisecond)
-	limited, _ = d.rateLimitCheck("webhook", "alpha")
+	limited, _ = d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if limited {
 		t.Fatal("after interval, check should be not-limited")
 	}
@@ -122,11 +122,11 @@ func TestRateLimit_DistinctContainersIndependent(t *testing.T) {
 		limiters: make(map[string]*rateLimiter),
 	}
 
-	_, key := d.rateLimitCheck("webhook", "alpha")
+	_, key := d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	d.commitRateLimit(key)
 
 	// beta gets its own slot.
-	limited, _ := d.rateLimitCheck("webhook", "beta")
+	limited, _ := d.rateLimitCheck("webhook", "beta", SeveritySuspicious)
 	if limited {
 		t.Fatal("beta should be independent of alpha's rate limit")
 	}
@@ -138,7 +138,7 @@ func TestRateLimit_NoIntervalConfigured(t *testing.T) {
 		config:   &Config{}, // empty rate limits
 		limiters: make(map[string]*rateLimiter),
 	}
-	limited, key := d.rateLimitCheck("webhook", "alpha")
+	limited, key := d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if limited {
 		t.Fatal("no configured interval → never limited")
 	}
@@ -218,6 +218,98 @@ func TestStop_IsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	d.Stop(ctx)
+}
+
+// TestRateLimit_MaliciousBypassesPriorSuspicious verifies that a prior
+// suspicious alert on a container never suppresses a later malicious
+// alert on the same channel and container within the interval. The
+// malicious severity bypasses the limiter entirely.
+func TestRateLimit_MaliciousBypassesPriorSuspicious(t *testing.T) {
+	n := &stubNotifier{name: "webhook"}
+	d := newTestDispatcher(t, n, time.Minute)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		d.Stop(ctx)
+	}()
+
+	if got := d.Dispatch(context.Background(), Alert{
+		Severity:      SeveritySuspicious,
+		ContainerName: "alpha",
+		EventID:       "evt-suspicious",
+	}); got != 1 {
+		t.Fatalf("suspicious Dispatch returned %d, want 1", got)
+	}
+
+	if got := d.Dispatch(context.Background(), Alert{
+		Severity:      SeverityMalicious,
+		ContainerName: "alpha",
+		EventID:       "evt-malicious",
+	}); got != 1 {
+		t.Fatalf("malicious Dispatch within interval returned %d, want 1 (bypass)", got)
+	}
+}
+
+// TestRateLimit_MaliciousBypassIsUnconditional verifies two back-to-back
+// malicious alerts on the same container both dispatch: malicious never
+// consults or commits limiter state, so it cannot rate-limit itself.
+func TestRateLimit_MaliciousBypassIsUnconditional(t *testing.T) {
+	n := &stubNotifier{name: "webhook"}
+	d := newTestDispatcher(t, n, time.Minute)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		d.Stop(ctx)
+	}()
+
+	for i, id := range []string{"evt-mal-1", "evt-mal-2"} {
+		if got := d.Dispatch(context.Background(), Alert{
+			Severity:      SeverityMalicious,
+			ContainerName: "alpha",
+			EventID:       id,
+		}); got != 1 {
+			t.Fatalf("malicious Dispatch #%d returned %d, want 1", i+1, got)
+		}
+	}
+}
+
+// TestRateLimit_SameSeveritySuppressedAndCounted verifies the limiter
+// still applies within a severity, and that a suppression is visible:
+// the second suspicious alert within the interval is dropped and the
+// rateLimited counter increments (exposed via RateLimitedCount, which
+// the stats callback in main.go reads).
+func TestRateLimit_SameSeveritySuppressedAndCounted(t *testing.T) {
+	n := &stubNotifier{name: "webhook"}
+	d := newTestDispatcher(t, n, time.Minute)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		d.Stop(ctx)
+	}()
+
+	if got := d.RateLimitedCount(); got != 0 {
+		t.Fatalf("RateLimitedCount before any dispatch = %d, want 0", got)
+	}
+
+	if got := d.Dispatch(context.Background(), Alert{
+		Severity:      SeveritySuspicious,
+		ContainerName: "alpha",
+		EventID:       "evt-1",
+	}); got != 1 {
+		t.Fatalf("first suspicious Dispatch returned %d, want 1", got)
+	}
+
+	if got := d.Dispatch(context.Background(), Alert{
+		Severity:      SeveritySuspicious,
+		ContainerName: "alpha",
+		EventID:       "evt-2",
+	}); got != 0 {
+		t.Fatalf("second suspicious Dispatch within interval returned %d, want 0 (suppressed)", got)
+	}
+
+	if got := d.RateLimitedCount(); got != 1 {
+		t.Fatalf("RateLimitedCount after suppression = %d, want 1", got)
+	}
 }
 
 // Sanity that stubNotifier.returnErr field is at least addressable —

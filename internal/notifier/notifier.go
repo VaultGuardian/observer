@@ -72,8 +72,10 @@ type Dispatcher struct {
 	channels []Notifier
 	config   *Config
 
-	// Rate-limiter state. Keyed "channelName:containerName" — high
-	// cardinality, so a sweeper goroutine evicts idle entries.
+	// Rate-limiter state. Keyed "channelName:containerName:severity" -
+	// high cardinality, so a sweeper goroutine evicts idle entries.
+	// Severity is part of the key so a lower-severity alert never starts
+	// an interval that would suppress a later higher-severity one.
 	limiters map[string]*rateLimiter
 	mu       sync.Mutex
 
@@ -86,6 +88,10 @@ type Dispatcher struct {
 	wg       sync.WaitGroup
 
 	dropped atomic.Int64
+
+	// rateLimited counts alerts suppressed by the rate limiter, so stats
+	// show drops instead of silently hiding them from the operator.
+	rateLimited atomic.Int64
 }
 
 // NewDispatcher creates a dispatcher from the given config. It auto-detects
@@ -176,10 +182,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) int {
 			continue
 		}
 
-		// Phase 1: pure check. Doesn't mutate the limiter — that happens
+		// Phase 1: pure check. Doesn't mutate the limiter - that happens
 		// only if the enqueue below succeeds.
-		limited, rlKey := d.rateLimitCheck(ch.Name(), alert.ContainerName)
+		limited, rlKey := d.rateLimitCheck(ch.Name(), alert.ContainerName, alert.Severity)
 		if limited {
+			d.rateLimited.Add(1)
 			continue
 		}
 
@@ -289,6 +296,12 @@ func (d *Dispatcher) DroppedCount() int64 {
 	return d.dropped.Load()
 }
 
+// RateLimitedCount returns the cumulative number of alerts suppressed by
+// the per-channel rate limiter since startup.
+func (d *Dispatcher) RateLimitedCount() int64 {
+	return d.rateLimited.Load()
+}
+
 // PrintStatus logs which channels are active on startup.
 func (d *Dispatcher) PrintStatus() {
 	type channelInfo struct {
@@ -338,12 +351,22 @@ type rateLimiter struct {
 // invoking commitRateLimit(key) iff the alert was successfully accepted
 // downstream and limited == false. When interval is 0 (no limit
 // configured for this channel), returns (false, "").
-func (d *Dispatcher) rateLimitCheck(channelName, containerName string) (bool, string) {
+//
+// Malicious severity bypasses the limiter unconditionally: a confirmed
+// breach notification must never be blocked by any prior alert, so no
+// limiter state is read or written for it (empty key, no commit).
+//
+// Severity is part of the key for all other severities, so different
+// severities on the same channel and container never share an interval.
+func (d *Dispatcher) rateLimitCheck(channelName, containerName string, severity Severity) (bool, string) {
+	if severity == SeverityMalicious {
+		return false, ""
+	}
 	interval := d.config.RateLimits.IntervalFor(channelName)
 	if interval == 0 {
 		return false, ""
 	}
-	key := channelName + ":" + containerName
+	key := channelName + ":" + containerName + ":" + string(severity)
 
 	d.mu.Lock()
 	defer d.mu.Unlock()

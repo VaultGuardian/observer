@@ -350,8 +350,8 @@ func main() {
 		// line. Same nil guard as the correction callbacks above: when
 		// api.NewServer failed we logged "continuing without dashboard"
 		// and apiServer is nil here.
-		apiServer.SetNotifierStatsCallback(func() (dropped int64, channels int) {
-			return dispatch.DroppedCount(), dispatch.ChannelCount()
+		apiServer.SetNotifierStatsCallback(func() (dropped, rateLimited int64, channels int) {
+			return dispatch.DroppedCount(), dispatch.RateLimitedCount(), dispatch.ChannelCount()
 		})
 	}
 
