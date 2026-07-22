@@ -122,7 +122,7 @@ func TestDiffReconcile(t *testing.T) {
 }
 
 // =============================================================================
-// reconcileOnce — fakes
+// reconcileOnce - fakes
 // =============================================================================
 
 // fakeDocker is an injectable Docker world for reconcileOnce tests: a set of
@@ -285,7 +285,7 @@ func TestReconcile_RepairWithSiblingReplica(t *testing.T) {
 	}
 	// B untouched: same instance, same key, still running.
 	if b1 != b0 {
-		t.Fatal("sibling replica B was replaced — should be untouched")
+		t.Fatal("sibling replica B was replaced - should be untouched")
 	}
 	if !b1.running.Load() || b1.pid != 500 {
 		t.Fatalf("sibling replica B disturbed: running=%v pid=%d", b1.running.Load(), b1.pid)
@@ -658,7 +658,7 @@ func TestTriggerCoalesces(t *testing.T) {
 // rescan ticker, events listener, vipCleanupLoop) exactly as Start() does in
 // auto-detect mode, fires triggers concurrently, then asserts Close() cancels
 // and JOINS every goroutine. The deterministic leak check is that mgrWG.Wait()
-// returns — a leaked/blocked goroutine makes Close() hang and the test fails on
+// returns - a leaked/blocked goroutine makes Close() hang and the test fails on
 // the timeout. Run under -race for the concurrent-trigger path.
 func TestClose_StopsAllGoroutines(t *testing.T) {
 	const id = "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111"
@@ -702,14 +702,14 @@ func TestClose_StopsAllGoroutines(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close() did not return — manager goroutine leak")
+		t.Fatal("Close() did not return - manager goroutine leak")
 	}
 }
 
 // TestLegacyMode_NoManager: with REC_NS_CONTAINER set, Start() must NOT create
 // the runtime reconciliation manager (no events listener, ticker, or reconcile
 // loop). The capture open may fail in the test env (no CAP_NET_RAW / no Docker);
-// that is irrelevant — the assertion is that the manager fields stay nil.
+// that is irrelevant - the assertion is that the manager fields stay nil.
 func TestLegacyMode_NoManager(t *testing.T) {
 	lc := bareCollector()
 	lc.config.Enabled = true

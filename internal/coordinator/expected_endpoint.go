@@ -11,13 +11,13 @@ import (
 )
 
 // =============================================================================
-// Expected Endpoint Tracker — Path-Scoped Operator Confirmations
+// Expected Endpoint Tracker - Path-Scoped Operator Confirmations
 // =============================================================================
 //
 // In-memory hot-path lookup for Option 4 corrections ("this endpoint is
 // supposed to return sensitive-looking data"). The tracker lives in this
 // package for type-locality with the coordinator's other building blocks,
-// but the coordinator itself does NOT invoke Check() — the check runs inside
+// but the coordinator itself does NOT invoke Check() - the check runs inside
 // the evidence callback (main.go: makeEvidenceCheckCallback) so it can
 // short-circuit reclass cache + LLM lookups using the redacted shape hash.
 //
@@ -46,16 +46,16 @@ import (
 //
 // Architectural distinction from CatchAll:
 //
-//   catchall_verified_v2  — emergent, statistical, path-agnostic
+//   catchall_verified_v2  - emergent, statistical, path-agnostic
 //                           Threshold of 5 distinct paths sharing the same
 //                           body hash before verification runs. Catches
 //                           generic 404/error templates served across many
 //                           paths.
 //
-//   expected_endpoints    — explicit, deterministic, path-scoped
+//   expected_endpoints    - explicit, deterministic, path-scoped
 //                           Single operator click = single rule. Path and
 //                           status are part of the key. No threshold, no LLM
-//                           verification — the human IS the verification.
+//                           verification - the human IS the verification.
 //
 // =============================================================================
 // Concurrency
@@ -72,17 +72,17 @@ const (
 	// DefaultExpectedEndpointCap mirrors CatchAll's maxFingerprints. With the
 	// key now scoped to (host, method, path, status, shapeHash), the number
 	// of legit sensitive endpoints per deployment is small (login, password
-	// reset, OAuth token, API key creation — call it 5-20 per app × maybe
+	// reset, OAuth token, API key creation - call it 5-20 per app × maybe
 	// 3-5 shapes each). 500 is generous headroom that also caps damage if a
 	// future bug accidentally inserts duplicates.
 	//
 	// Note: keying on the REDACTED shape hash (not raw transport hash) means
-	// rotating tokens don't burn through cap — same redacted shape hashes
+	// rotating tokens don't burn through cap - same redacted shape hashes
 	// to the same value regardless of token value.
 	DefaultExpectedEndpointCap = 500
 )
 
-// ExpectedEndpointFingerprint is the full key — every field is part of the
+// ExpectedEndpointFingerprint is the full key - every field is part of the
 // match. Status is included to prevent collisions between e.g. a 200 expected
 // token response and a 401 error with similar body shape. (P1, locked
 // in May 11 2026.)
@@ -183,7 +183,7 @@ func newExpectedEndpointFingerprint(host, method string, status int, path, bodyP
 // CRITICAL: bodyPreviewHash MUST be the REDACTED response-shape hash
 // (rec.HashBody(SafeBodyPreview)), NOT the raw transport hash. Calling this
 // with the raw transport hash will silently never match for auth endpoints
-// with rotating tokens — defeating the whole point of the feature. The
+// with rotating tokens - defeating the whole point of the feature. The
 // caller (evidence callback) computes the redacted hash; the correction
 // handler reads it from decision.CacheKey.
 //
@@ -200,7 +200,7 @@ func (t *ExpectedEndpointTracker) Check(host, method string, status int, path, b
 
 	// Read the entry pointer AND copy entry.Reason under RLock. After the
 	// unlock we still hold the pointer (Go's GC keeps it alive), but we
-	// never touch entry.Reason again — only the local copy.
+	// never touch entry.Reason again - only the local copy.
 	t.mu.RLock()
 	entry, ok := t.entries[fp]
 	var entryReason string
@@ -233,7 +233,7 @@ func (t *ExpectedEndpointTracker) Check(host, method string, status int, path, b
 //
 // v1.x note (deferred): if cap is reached during a live operator click, the
 // API handler will return success because this function has no return value.
-// flagged in review as a future "UX lie" — when cap is reached the seed
+// flagged in review as a future "UX lie" - when cap is reached the seed
 // silently fails. Acceptable at v1.0 because cap=500 is plenty of headroom
 // for normal deployments; v1.1 should make SeedVerified return inserted/dropped
 // counts so the API can surface a warning to the operator.
@@ -252,7 +252,7 @@ func (t *ExpectedEndpointTracker) SeedVerified(fps []ExpectedEndpointFingerprint
 		fp := newExpectedEndpointFingerprint(raw.Host, raw.Method, raw.Status, raw.Path, raw.BodyPreviewHash)
 
 		// Update in-place if it already exists (operator re-clicked / startup
-		// re-seed) — refreshes Reason and AddedAt, preserves Suppressed.
+		// re-seed) - refreshes Reason and AddedAt, preserves Suppressed.
 		if existing, ok := t.entries[fp]; ok {
 			existing.AddedAt = now
 			if i < len(reasons) && reasons[i] != "" {

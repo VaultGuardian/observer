@@ -67,7 +67,7 @@ func TestMemoryPressureEvictsOldestFirst(t *testing.T) {
 	// Each entry is 100 (body) + 256 (overhead) = 356 bytes. An 800-byte
 	// ceiling holds two entries; the third forces an oldest-first eviction.
 	rb := NewRingBuffer(BufferConfig{
-		MaxEntries:    100, // large, so capacity never binds — only bytes do
+		MaxEntries:    100, // large, so capacity never binds - only bytes do
 		MaxTotalBytes: 800,
 		MaxAge:        time.Hour,
 		MaxBodyBytes:  2048,

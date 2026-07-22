@@ -27,7 +27,7 @@ type APNsNotifier struct {
 	httpClient *http.Client
 	privateKey *ecdsa.PrivateKey
 
-	// JWT token cache — APNs tokens are valid for 1 hour,
+	// JWT token cache - APNs tokens are valid for 1 hour,
 	// we refresh at 50 minutes to avoid edge-case rejections.
 	tokenMu   sync.RWMutex
 	cachedJWT string
@@ -134,7 +134,7 @@ func (a *APNsNotifier) Send(ctx context.Context, alert Alert) error {
 
 	if resp.StatusCode != http.StatusOK {
 		// v0.52: Read body BEFORE discard. Prior to this fix, io.Copy drained
-		// the body first, so ReadAll returned empty — error diagnostics lost.
+		// the body first, so ReadAll returned empty - error diagnostics lost.
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("APNs returned %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -176,7 +176,7 @@ func (a *APNsNotifier) getToken() (string, error) {
 }
 
 // signJWT creates an ES256-signed JWT for APNs authentication.
-// Minimal implementation — no external JWT library needed.
+// Minimal implementation - no external JWT library needed.
 func (a *APNsNotifier) signJWT(now time.Time) (string, error) {
 	header := base64URLEncode([]byte(fmt.Sprintf(
 		`{"alg":"ES256","kid":"%s"}`, a.config.KeyID)))

@@ -20,7 +20,7 @@ import (
 // Architecture decision (2026-03-24):
 //   - Journald for ops, SQLite for findings
 //   - WAL mode for concurrent reads + single writer
-//   - Pure Go driver (modernc.org/sqlite) — no CGO, single binary preserved
+//   - Pure Go driver (modernc.org/sqlite) - no CGO, single binary preserved
 //   - Package-level convenience via global, struct-backed internally
 type Store struct {
 	db          *sql.DB
@@ -33,7 +33,7 @@ type Store struct {
 func Init(dataDir string) (*Store, error) {
 	dbPath := filepath.Join(dataDir, "observer.db")
 
-	// Ensure data directory exists. 0700 (owner-only) — Observer's data
+	// Ensure data directory exists. 0700 (owner-only) - Observer's data
 	// includes raw logs, evidence body previews, LLM decisions, and learned
 	// patterns. Treat as sensitive security telemetry, not world-readable.
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -85,7 +85,7 @@ func (s *Store) Close() error {
 }
 
 // DB returns the underlying *sql.DB for advanced queries.
-// Use sparingly — prefer the typed methods.
+// Use sparingly - prefer the typed methods.
 func (s *Store) DB() *sql.DB {
 	return s.db
 }
@@ -399,29 +399,29 @@ func (s *Store) migrate() error {
 			//
 			// Existing rows get response_bytes=0 by default. The runtime
 			// fallback skips byte-compatible matching when the stored value
-			// is <=0 (conservative — re-verifies before suppressing).
+			// is <=0 (conservative - re-verifies before suppressing).
 			version: 11,
 			desc:    "Section 3 / Landmine A: response_bytes on catchall_verified_v2 for byte-similarity check",
 			sql:     `ALTER TABLE catchall_verified_v2 ADD COLUMN response_bytes INTEGER DEFAULT 0;`,
 		},
 		{
-			// v1.0 pre-launch — Correction Dialog Redesign, Card 4
+			// v1.0 pre-launch - Correction Dialog Redesign, Card 4
 			// ("Expected sensitive response"). Path-scoped operator
 			// confirmations that an endpoint's response is supposed to look
 			// sensitive (login/token/reset/OAuth). Cannot reuse the CatchAll
 			// subsystem because CatchAll requires multiple paths sharing the
-			// same body hash before verification fires — a single login
+			// same body hash before verification fires - a single login
 			// endpoint would never reach the threshold.
 			//
 			// Architectural distinction:
-			//   catchall_verified_v2  — emergent, statistical, path-agnostic
-			//   expected_endpoints    — explicit, deterministic, path-scoped
+			//   catchall_verified_v2  - emergent, statistical, path-agnostic
+			//   expected_endpoints    - explicit, deterministic, path-scoped
 			//
 			// Key: (host, http_method, http_path, http_status, body_preview_hash)
 			//
 			// body_preview_hash is the REDACTED response-shape hash
 			// (rec.HashBody(SafeBodyPreview), surfaced as decision.CacheKey).
-			// NEVER the raw transport hash — that would break the feature for
+			// NEVER the raw transport hash - that would break the feature for
 			// auth/token endpoints with rotating values. (P0 catch +
 			// design lock-in, May 11 2026.)
 			//
@@ -499,7 +499,7 @@ func (s *Store) migrate() error {
 
 // applyMigration runs one migration and records its version atomically.
 // Multi-statement migrations (e.g. several ALTERs in one .sql block) used to
-// land partially and leave the schema_version row unwritten — on next boot
+// land partially and leave the schema_version row unwritten - on next boot
 // the runner re-tried the migration and hit "duplicate column" on whichever
 // ALTER landed first. Wrapping the whole step in a transaction means either
 // every statement and the version row commit together, or nothing does.

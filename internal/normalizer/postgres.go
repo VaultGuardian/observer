@@ -59,7 +59,7 @@ func (p *PostgresNormalizer) Normalize(line string) string {
 	// Strip PID
 	line = rePgPid.ReplaceAllString(line, "")
 
-	// Strip session context (user@db) — comes before log level
+	// Strip session context (user@db) - comes before log level
 	// Only strip if followed by a log level keyword
 	if idx := strings.Index(line, " LOG:"); idx > 0 && idx < 50 {
 		possibleSession := line[:idx]

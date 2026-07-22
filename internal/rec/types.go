@@ -8,7 +8,7 @@ import (
 )
 
 // =============================================================================
-// Evidence Status — The "Why Did It Fail" State Machine
+// Evidence Status - The "Why Did It Fail" State Machine
 // =============================================================================
 
 type EvidenceStatus string
@@ -53,7 +53,7 @@ const (
 )
 
 // =============================================================================
-// Transport Evidence — Layer 1
+// Transport Evidence - Layer 1
 // =============================================================================
 
 type TransportEvidence struct {
@@ -69,7 +69,7 @@ type TransportEvidence struct {
 }
 
 // =============================================================================
-// Disclosure Analysis — Layer 2
+// Disclosure Analysis - Layer 2
 // =============================================================================
 
 type DisclosureAnalysis struct {
@@ -93,7 +93,7 @@ func (d *DisclosureAnalysis) RedactedPreview() string {
 }
 
 // =============================================================================
-// Evidence — The Complete REC Result
+// Evidence - The Complete REC Result
 // =============================================================================
 
 type Evidence struct {
@@ -196,7 +196,7 @@ type RECStats struct {
 	FlowEvictions     int64 // flows evicted due to MaxFlowStates cap (total)
 	FlowEvictionsLive int64 // subset where the evicted flow had pending request/response state
 
-	// Dashboard backward compat — populated from above in Stats()
+	// Dashboard backward compat - populated from above in Stats()
 	HTTPRequests  int64 // = InlineRequests
 	HTTPResponses int64 // = ReassemblyResponses
 	PairMisses    int64 // = OrphanResponses
@@ -205,7 +205,7 @@ type RECStats struct {
 	VIPMatches int64
 
 	// Port registry telemetry (v0.47.1).
-	// Useful for debugging "why isn't REC seeing this port?" — operator
+	// Useful for debugging "why isn't REC seeing this port?" - operator
 	// can confirm the port made it into the configured set, or watch
 	// the learn counter rise as new HTTP-shaped traffic discovers ports
 	// at runtime.
@@ -221,7 +221,7 @@ type RECStats struct {
 // Reassembly Config (response-only as of v0.42.7)
 // =============================================================================
 //
-// Bounded by design — REC must never become a DoS target. All limits below
+// Bounded by design - REC must never become a DoS target. All limits below
 // have safe defaults; an attacker cannot force unbounded memory by opening
 // many partial connections, sending slowloris-style dribble, or sending
 // massive bodies. Streams age out, total memory is capped, per-connection
@@ -267,7 +267,7 @@ func DefaultReassemblyConfig() ReassemblyConfig {
 }
 
 // =============================================================================
-// Flow Config — bidirectional pairing queue bounds (v0.42.7)
+// Flow Config - bidirectional pairing queue bounds (v0.42.7)
 // =============================================================================
 //
 // Every queue that an attacker can influence needs hard caps. An attacker
@@ -291,7 +291,7 @@ type FlowConfig struct {
 
 	// ResponseOrphanTimeout is how long an unmatched response sits in the
 	// queue before being inserted as an orphan into the ring buffer and
-	// counted as a miss. 2s is generous — the inline parser succeeds in
+	// counted as a miss. 2s is generous - the inline parser succeeds in
 	// microseconds; if the request hasn't arrived by then, it was split,
 	// missed, or mid-stream capture.
 	ResponseOrphanTimeout time.Duration

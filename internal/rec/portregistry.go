@@ -5,7 +5,7 @@
 // Background:
 //   v0.47-rc2 and earlier hardcoded the HTTP-aware port set to {80, 8080}.
 //   Any backend listening on a different port (e.g. CapRover's captain-captain
-//   on 3000) was invisible to REC — packets dropped, no evidence captured,
+//   on 3000) was invisible to REC - packets dropped, no evidence captured,
 //   findings parked at SUSPICIOUS forever waiting for a body that never came.
 //
 // Three sources feed this registry, in priority order:
@@ -23,7 +23,7 @@
 // Bounding:
 //   Learned ports are capped (default 64) to prevent unbounded growth from
 //   pathological traffic patterns. Once full, new learns are silently
-//   refused — the configured/learned set is sticky for the process lifetime.
+//   refused - the configured/learned set is sticky for the process lifetime.
 //   This is safe: REC is namespace-scoped, so the universe of legitimate
 //   ports is small and finite.
 
@@ -105,7 +105,7 @@ func (pr *portRegistry) has(port int) bool {
 // learned-port cap has not been hit. Returns true if the port was newly
 // added (caller can use this signal to log once per port).
 //
-// Bounded — once the learned cap is hit, additional learns are refused.
+// Bounded - once the learned cap is hit, additional learns are refused.
 // Configured ports are not counted against the cap; only learned ones are.
 func (pr *portRegistry) learn(port int) bool {
 	pr.learnedAttempts.Add(1)
@@ -125,7 +125,7 @@ func (pr *portRegistry) learn(port int) bool {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	// Re-check under the lock — another goroutine may have learned it.
+	// Re-check under the lock - another goroutine may have learned it.
 	if cur := pr.snapshot.Load(); cur != nil && (*cur)[port] {
 		return false
 	}

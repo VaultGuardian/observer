@@ -43,7 +43,7 @@ func (f *fakeCollector) PinVIP(eventID, _ string, _ rec.LookupRequest) {
 }
 
 // newTestRouter builds a resultRouter wired to a fake collector and a real
-// (but inert) coordinator. db/dispatch are nil — the HTTP alert path under test
+// (but inert) coordinator. db/dispatch are nil - the HTTP alert path under test
 // does not touch them.
 func newTestRouter(t *testing.T) (*resultRouter, *fakeCollector) {
 	t.Helper()
@@ -64,7 +64,7 @@ func newTestRouter(t *testing.T) (*resultRouter, *fakeCollector) {
 }
 
 // httpAlertEvent returns an event whose lines parse to a real HTTP identity on
-// a domain vhost with status 200 — so routeAlert reaches the PinVIP block
+// a domain vhost with status 200 - so routeAlert reaches the PinVIP block
 // rather than any recon/edge short-circuit.
 func httpAlertEvent() *event.Event {
 	return &event.Event{
@@ -123,7 +123,7 @@ func http404AlertEvent() *event.Event {
 }
 
 // dotenvDisclosureEvidence is REC evidence whose Disclosure carries a
-// deterministically disclosing format — the tier-1 predicate must be true.
+// deterministically disclosing format - the tier-1 predicate must be true.
 func dotenvDisclosureEvidence() *rec.Evidence {
 	return &rec.Evidence{
 		Status:                rec.EvidenceAvailableHighConfidence,
@@ -145,7 +145,7 @@ func dotenvDisclosureEvidence() *rec.Evidence {
 
 // TestRouteAlertStatusShortcutOverriddenByDisclosure: a cache-hit attack on a
 // 404 whose REC lookup shows a deterministically disclosing body must NOT be
-// short-circuited to recon — it falls through to the coordinator (PinVIP +
+// short-circuited to recon - it falls through to the coordinator (PinVIP +
 // investigation), and writes no shortcut finding (r.db is nil here: a write
 // attempt would panic the test).
 func TestRouteAlertStatusShortcutOverriddenByDisclosure(t *testing.T) {
@@ -172,8 +172,8 @@ func TestRouteAlertStatusShortcutOverriddenByDisclosure(t *testing.T) {
 }
 
 // TestRouteAlertStatusShortcutUnchangedWithoutDisclosure: without a
-// disclosing body — plain empty evidence, or the disabled-collector shape the
-// noOp collector returns — the shortcut behaves exactly as before: recon
+// disclosing body - plain empty evidence, or the disabled-collector shape the
+// noOp collector returns - the shortcut behaves exactly as before: recon
 // finding, no coordinator, no PinVIP.
 func TestRouteAlertStatusShortcutUnchangedWithoutDisclosure(t *testing.T) {
 	cases := []struct {

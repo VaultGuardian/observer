@@ -9,13 +9,13 @@ import (
 
 // Shared sample lines used across the parse tests.
 const (
-	// Format 1 — hostname-prefixed (CapRover nginx normalizer).
+	// Format 1 - hostname-prefixed (CapRover nginx normalizer).
 	lineHosted = "api.admin.kovicloud.com GET /?q=UNION+SELECT HTTP/2.0 200"
-	// Format 2 — quoted request line (generic normalizer / raw access log).
+	// Format 2 - quoted request line (generic normalizer / raw access log).
 	lineQuoted = `1.2.3.4 - - [10/Oct/2025:13:55:36 +0000] "GET /?q=UNION+SELECT HTTP/1.0" 200 83`
-	// Format 3 — bare (no hostname, no quotes).
+	// Format 3 - bare (no hostname, no quotes).
 	lineBare = "GET /?q=UNION+SELECT+1,2,3 HTTP/1.0 200"
-	// Format 4 — Express/morgan (CapRover captain-captain).
+	// Format 4 - Express/morgan (CapRover captain-captain).
 	lineMorgan      = "GET /api/keys 200 0.563 ms - 83"
 	lineMorganInt   = "POST /api/login 201 0 ms - 5"
 	lineMorganDash  = "GET /healthz 200 1.2 ms - -"
@@ -54,7 +54,7 @@ func TestParseNormalizedLine(t *testing.T) {
 }
 
 func TestParseRawHTTPLine(t *testing.T) {
-	// parseRawHTTPLine does NOT handle Format 1 (hosted) — that shape only
+	// parseRawHTTPLine does NOT handle Format 1 (hosted) - that shape only
 	// exists post-nginx-normalization. It covers quoted, bare, and morgan.
 	cases := []struct {
 		name               string
@@ -108,7 +108,7 @@ func TestExtractResponseBytes(t *testing.T) {
 }
 
 // TestDeterministicDisclosure pins the shared tier-1 predicate used by both
-// the evidence callback and the status shortcut: format identity only —
+// the evidence callback and the status shortcut: format identity only -
 // redaction counts alone must never qualify, and every degenerate Evidence
 // shape (nil, noOp, missing disclosure) must be false.
 func TestDeterministicDisclosure(t *testing.T) {

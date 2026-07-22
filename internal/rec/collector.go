@@ -17,7 +17,7 @@ import (
 //
 // The main pipeline interacts with REC exclusively through this interface.
 // If REC can't start (missing CAP_NET_RAW, not opted in), the pipeline gets
-// a NoOp implementation. Observer keeps running — REC is enrichment-only.
+// a NoOp implementation. Observer keeps running - REC is enrichment-only.
 //
 // PHASE 1 CONSTRAINT: REC is read-only enrichment.
 // It NEVER influences classification or alert routing.
@@ -29,7 +29,7 @@ type EvidenceCollector interface {
 	Start(ctx context.Context) error
 
 	// Lookup correlates a request with a captured response.
-	// Returns Evidence with an explicit status — never nil.
+	// Returns Evidence with an explicit status - never nil.
 	Lookup(req LookupRequest) *Evidence
 
 	// Enabled returns true if the collector is actively capturing.
@@ -84,7 +84,7 @@ type CollectorConfig struct {
 	Interface string
 
 	// Ports to capture plaintext HTTP traffic on.
-	// Framing: "plaintext HTTP visible after TLS termination" — not "port 80."
+	// Framing: "plaintext HTTP visible after TLS termination" - not "port 80."
 	Ports []int
 
 	// Ring buffer configuration
@@ -120,7 +120,7 @@ type CollectorConfig struct {
 	// LearnedPortCap bounds runtime port learning by the sniffer.
 	//
 	// When a TCP segment arrives on a port not in Ports, the sniffer
-	// peeks at the payload — if it looks like an HTTP/1.x request line
+	// peeks at the payload - if it looks like an HTTP/1.x request line
 	// or response status line, the port is learned and used for
 	// subsequent traffic. This catches backends on non-default ports
 	// (e.g. CapRover's captain-captain on 3000) without operator config.
@@ -140,7 +140,7 @@ type CollectorConfig struct {
 	// (un-normalized) container name. Session 2 uses it ONLY to annotate the
 	// dry-run discovery inventory (mark matching containers excluded); it
 	// changes no capture behavior. Session 3 inherits it for real exclusion.
-	// Matching normalizes both sides (base name, lowercased) — see normalizeName.
+	// Matching normalizes both sides (base name, lowercased) - see normalizeName.
 	ExcludeContainers map[string]bool
 
 	// MaxNamespaces caps how many discovered public-facing containers auto-detect
@@ -148,7 +148,7 @@ type CollectorConfig struct {
 	// and logged as security blind spots.
 	MaxNamespaces int
 
-	// RescanInterval is the period of the Session 7 auto-detect rescan ticker —
+	// RescanInterval is the period of the Session 7 auto-detect rescan ticker -
 	// the backstop that re-runs discovery and reconciles the monitored namespace
 	// set if a Docker /events notification is missed. 0 → DefaultRescanInterval.
 	// Auto-detect mode only; legacy NSContainer mode never starts the ticker.
@@ -181,7 +181,7 @@ func DefaultCollectorConfig() CollectorConfig {
 }
 
 // =============================================================================
-// NewCollector — Factory with Graceful Degradation
+// NewCollector - Factory with Graceful Degradation
 // =============================================================================
 
 func NewCollector(cfg CollectorConfig) EvidenceCollector {
@@ -193,7 +193,7 @@ func NewCollector(cfg CollectorConfig) EvidenceCollector {
 	if !hasCapNetRaw() {
 		log.Println("[rec] WARNING: REC enabled but missing CAP_NET_RAW capability. " +
 			"Add AmbientCapabilities=CAP_NET_RAW to observer.service or run with cap_add:[NET_RAW]. " +
-			"REC is disabled — log classification continues normally.")
+			"REC is disabled - log classification continues normally.")
 		return &noOpCollector{reason: EvidenceNotAvailableCollectorDisabled}
 	}
 
@@ -207,7 +207,7 @@ func NewCollector(cfg CollectorConfig) EvidenceCollector {
 }
 
 // =============================================================================
-// NoOp Collector — Returned when REC can't run
+// NoOp Collector - Returned when REC can't run
 // =============================================================================
 
 type noOpCollector struct {
@@ -247,7 +247,7 @@ func (n *noOpCollector) Lookup(req LookupRequest) *Evidence {
 
 const (
 	vipMaxEntries = 200               // max pending VIP pins
-	vipTTL        = 120 * time.Second // 120s > coordinator's 5s window — catches late evidence
+	vipTTL        = 120 * time.Second // 120s > coordinator's 5s window - catches late evidence
 )
 
 // vipPin holds the criteria for a pending VIP match.
@@ -273,7 +273,7 @@ type vipPin struct {
 //     - Static file responses
 //     - Edge-generated error pages
 //   These never traverse the backend network. Phase 1 returns
-//   EvidenceNotAvailableNoMatch for these — it cannot distinguish them
+//   EvidenceNotAvailableNoMatch for these - it cannot distinguish them
 //   from genuinely missing evidence. Phase 2+ could detect edge-generated
 //   responses by checking nginx upstream_response_time == "-".
 
@@ -289,7 +289,7 @@ type liveCollector struct {
 	capMu    sync.Mutex
 
 	// running is RETAINED only as a manual/white-box gate: an existing test sets
-	// it directly, and Enabled() ORs it in. Production never sets it — namespace
+	// it directly, and Enabled() ORs it in. Production never sets it - namespace
 	// liveness is tracked per-instance (namespaceCapture.running), and Enabled()
 	// reports "at least one namespace active". This deliberately replaces the old
 	// global "last read loop alive" semantics that were the root of the
@@ -321,7 +321,7 @@ type liveCollector struct {
 	// Session 4: retained discovery classification for the coverage-status
 	// model. Auto-detect mode writes lastInventory + droppedByCap at startup and
 	// on every reconcile (the classify+cap step); Coverage() reads them. Guarded
-	// by coverageMu, which is NEVER held simultaneously with capMu — Coverage()
+	// by coverageMu, which is NEVER held simultaneously with capMu - Coverage()
 	// snapshots captures under capMu, releases it, then reads the inventory under
 	// coverageMu. Legacy NSContainer mode never populates these (no discovery).
 	coverageMu    sync.Mutex
@@ -336,10 +336,10 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 		swarm := detectSwarm(lc.config.DockerSocket)
 		if swarm.Active {
 			vxlanPort = swarm.DataPathPort
-			log.Printf("[rec] Docker Swarm detected — VXLAN decapsulation active on UDP port %d", vxlanPort)
+			log.Printf("[rec] Docker Swarm detected - VXLAN decapsulation active on UDP port %d", vxlanPort)
 		} else {
 			vxlanPort = DefaultVXLANPort
-			log.Printf("[rec] Docker Swarm not detected — VXLAN decapsulation still active (always-on, no-op when absent)")
+			log.Printf("[rec] Docker Swarm not detected - VXLAN decapsulation still active (always-on, no-op when absent)")
 		}
 	} else {
 		log.Printf("[rec] VXLAN port explicitly configured: %d", vxlanPort)
@@ -349,7 +349,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 
 	// --- Auto-detect mode (REC_NS_CONTAINER empty): discover public-facing
 	// containers and open a namespace socket per container. This is the Session 3
-	// fix — REC now sees the backend/overlay traffic that a single host capture
+	// fix - REC now sees the backend/overlay traffic that a single host capture
 	// misses (e.g. captain-captain's port-3000-in-host-mode bypass). ---
 	if lc.config.NSContainer == "" {
 		deps := autoDetectDeps{
@@ -370,14 +370,14 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 		lc.vxlanPort = vxlanPort
 
 		if err := lc.startAutoDetect(ctx, iface, vxlanPort, deps); err != nil {
-			// Total failure (zero captures) — REC disabled, no manager. Preserves
+			// Total failure (zero captures) - REC disabled, no manager. Preserves
 			// today's error path.
 			return err
 		}
 
 		// Auto-detect established ≥1 capture. Launch the runtime reconciliation
 		// manager (Session 7): Docker /events listener + periodic rescan ticker,
-		// both feeding one serialized reconcile loop, plus vipCleanupLoop — all
+		// both feeding one serialized reconcile loop, plus vipCleanupLoop - all
 		// owned by mgrCtx/mgrWG so Close() stops them without leaking. mgrCtx is a
 		// child of the Start() parent ctx, so parent cancel still propagates.
 		mgrCtx, cancel := context.WithCancel(ctx)
@@ -394,7 +394,7 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	// --- Legacy single-namespace mode (REC_NS_CONTAINER set) ---
 	// Byte-for-byte identical to Sessions 1–2: one capture pinned to the
 	// configured namespace, host fallback on failure, same logs.
-	log.Printf("[rec] Auto-discovery disabled — REC_NS_CONTAINER pinned to %q (legacy single-namespace mode)", lc.config.NSContainer)
+	log.Printf("[rec] Auto-discovery disabled - REC_NS_CONTAINER pinned to %q (legacy single-namespace mode)", lc.config.NSContainer)
 
 	nc := lc.buildNamespaceCapture(lc.config.NSContainer, "", lc.config.Ports, nil, iface, vxlanPort)
 
@@ -405,16 +405,16 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 		// stays inside Docker's network namespaces and never touches the host.
 		info, findErr := findContainerPID(lc.config.DockerSocket, lc.config.NSContainer)
 		if findErr != nil {
-			log.Printf("[rec] Namespace capture requested for %q but container not found: %v — falling back to host capture",
+			log.Printf("[rec] Namespace capture requested for %q but container not found: %v - falling back to host capture",
 				lc.config.NSContainer, findErr)
 			return nc.sniffer.openSocket() // fall back to host capture
 		}
-		log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
+		log.Printf("[rec] Found container %s (PID %d) - opening socket in its network namespace",
 			info.Name, info.PID)
 		lc.setCaptureIdentity(nc, info.ID, info.PID)
 		fd, nsErr := openSocketInNamespace(info.PID)
 		if nsErr != nil {
-			log.Printf("[rec] Namespace socket failed: %v — falling back to host capture", nsErr)
+			log.Printf("[rec] Namespace socket failed: %v - falling back to host capture", nsErr)
 			return nc.sniffer.openSocket()
 		}
 		captureMode = fmt.Sprintf("namespace:%s(pid=%d)", info.Name, info.PID)
@@ -422,13 +422,13 @@ func (lc *liveCollector) Start(ctx context.Context) error {
 	}
 
 	if err := lc.startCapture(ctx, nc, open); err != nil {
-		// One pinned namespace that fails = zero captures started — preserve
+		// One pinned namespace that fails = zero captures started - preserve
 		// today's behavior: report the error so the pipeline runs without REC.
 		return fmt.Errorf("REC capture failed to start: %w", err)
 	}
 
 	// Fix 1: Launch VIP cleanup goroutine (expire stale pins). Collector-level,
-	// bound to the parent ctx — NOT stopped by Close() (see Close()).
+	// bound to the parent ctx - NOT stopped by Close() (see Close()).
 	go lc.vipCleanupLoop(ctx)
 	lc.logStarted(captureMode, iface, vxlanPort)
 	return nil
@@ -456,9 +456,9 @@ type autoDetectDeps struct {
 func (lc *liveCollector) startAutoDetect(ctx context.Context, iface string, vxlanPort uint16, deps autoDetectDeps) error {
 	containers, err := deps.fetch()
 	if err != nil {
-		// Fallback 1 (benign): Docker daemon unreachable — host capture is the
+		// Fallback 1 (benign): Docker daemon unreachable - host capture is the
 		// pre-Session-3 behavior, so this is a no-regression backstop.
-		log.Printf("[rec] Auto-detect: Docker query failed: %v — falling back to single host capture", err)
+		log.Printf("[rec] Auto-detect: Docker query failed: %v - falling back to single host capture", err)
 		return lc.startHost(ctx, iface, vxlanPort, deps.hostOpen)
 	}
 
@@ -473,28 +473,28 @@ func (lc *liveCollector) startAutoDetect(ctx context.Context, iface string, vxla
 	lc.retainCoverage(inv, dropped)
 
 	if len(inv.Public) == 0 {
-		// Fallback 2 (benign): nothing public to monitor — host capture backstop.
-		log.Printf("[rec] Auto-detect: no public-facing containers discovered — falling back to single host capture")
+		// Fallback 2 (benign): nothing public to monitor - host capture backstop.
+		log.Printf("[rec] Auto-detect: no public-facing containers discovered - falling back to single host capture")
 		return lc.startHost(ctx, iface, vxlanPort, deps.hostOpen)
 	}
 
 	started, attempted := lc.startDiscoveredCaptures(ctx, capped, iface, vxlanPort, deps.openerFor)
 	if started == 0 {
 		// Fallback 3 (NOT benign): every namespace socket failed to open. This
-		// indicates a broken namespace mechanism, not absent work — call it out
+		// indicates a broken namespace mechanism, not absent work - call it out
 		// distinctly from the two fallbacks above.
-		log.Printf("[rec] WARNING: all %d discovered namespace capture(s) FAILED to open — falling back to HOST capture. "+
+		log.Printf("[rec] WARNING: all %d discovered namespace capture(s) FAILED to open - falling back to HOST capture. "+
 			"Host capture does NOT see the overlay/backend traffic that in-namespace capture provides, so REC is running "+
 			"DEGRADED/BLIND. Namespace permissions/setns likely need fixing (CAP_NET_RAW / CAP_SYS_ADMIN, /proc access).",
 			attempted)
 		// Session 4 breadcrumb: the coverage-status model must represent this
-		// all-NS-failed state as degraded/blind, NOT active-covered — the host
+		// all-NS-failed state as degraded/blind, NOT active-covered - the host
 		// fallback here is a safety net, not real namespace coverage.
 		return lc.startHost(ctx, iface, vxlanPort, deps.hostOpen)
 	}
 
 	// vipCleanupLoop is launched once by Start() (bound to mgrCtx), not here, so
-	// Close() can stop it — see Start()'s auto-detect manager launch.
+	// Close() can stop it - see Start()'s auto-detect manager launch.
 	lc.logStarted(fmt.Sprintf("%d namespaces active", started), iface, vxlanPort)
 	return nil
 }
@@ -522,7 +522,7 @@ func (lc *liveCollector) applyNamespaceCap(public []publicContainer) (kept, drop
 	if len(public) > max {
 		dropped = append(dropped, public[max:]...)
 		for _, pc := range dropped {
-			log.Printf("[rec] WARNING: REC_MAX_NAMESPACES=%d reached — NOT monitoring public container %q (%s) — SECURITY BLIND SPOT",
+			log.Printf("[rec] WARNING: REC_MAX_NAMESPACES=%d reached - NOT monitoring public container %q (%s) - SECURITY BLIND SPOT",
 				max, pc.Name, formatPublishes(pc.Ports))
 		}
 		public = public[:max]
@@ -548,7 +548,7 @@ func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []p
 		snifferPorts := unionPorts(lc.config.Ports, privatePorts(pc.Ports))
 		nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, privatePorts(pc.Ports), iface, vxlanPort)
 		if err := lc.startCapture(ctx, nc, openerFor(pc, nc)); err != nil {
-			log.Printf("[rec] Namespace capture for %q failed: %v — continuing with others", pc.Name, err)
+			log.Printf("[rec] Namespace capture for %q failed: %v - continuing with others", pc.Name, err)
 			continue
 		}
 		started++
@@ -560,7 +560,7 @@ func (lc *liveCollector) startDiscoveredCaptures(ctx context.Context, public []p
 // "host", empty container ID). It is the shared open path used by both the
 // startup host fallback (startHost) and the Session 7 runtime host-invariant
 // reopen. Returns the started instance, or an error if the socket fails to open.
-// It emits NO startup log and launches NO collector-level goroutine — callers
+// It emits NO startup log and launches NO collector-level goroutine - callers
 // decide logging (startup tell vs. quiet runtime line).
 func (lc *liveCollector) openHostCapture(ctx context.Context, iface string, vxlanPort uint16, hostOpen func(nc *namespaceCapture) (int, error)) (*namespaceCapture, error) {
 	nc := lc.buildNamespaceCapture("host", "", lc.config.Ports, nil, iface, vxlanPort)
@@ -585,7 +585,7 @@ func (lc *liveCollector) startHost(ctx context.Context, iface string, vxlanPort 
 
 // dockerNamespaceOpener returns the production opener for one discovered
 // container: resolve its PID precisely by container ID, then open an AF_PACKET
-// socket inside its network namespace. No per-instance host fallback — a failure
+// socket inside its network namespace. No per-instance host fallback - a failure
 // is reported so startCapture records it and siblings continue.
 func (lc *liveCollector) dockerNamespaceOpener(pc publicContainer, nc *namespaceCapture) func() (int, error) {
 	return func() (int, error) {
@@ -593,7 +593,7 @@ func (lc *liveCollector) dockerNamespaceOpener(pc publicContainer, nc *namespace
 		if err != nil {
 			return -1, fmt.Errorf("resolving PID for %s: %w", pc.Name, err)
 		}
-		log.Printf("[rec] Found container %s (PID %d) — opening socket in its network namespace",
+		log.Printf("[rec] Found container %s (PID %d) - opening socket in its network namespace",
 			info.Name, info.PID)
 		lc.setCaptureIdentity(nc, info.ID, info.PID)
 		fd, nsErr := openSocketInNamespace(info.PID)
@@ -611,11 +611,11 @@ func (lc *liveCollector) dockerNamespaceOpener(pc publicContainer, nc *namespace
 //
 // privPorts is the container-side (private) port metadata recorded on the
 // instance; it is set BEFORE the capMu publish so Coverage() can read nc.ports
-// race-free under capMu (host/legacy callers pass nil — no discovered ports).
+// race-free under capMu (host/legacy callers pass nil - no discovered ports).
 func (lc *liveCollector) buildNamespaceCapture(name, id string, snifferPorts, privPorts []int, iface string, vxlanPort uint16) *namespaceCapture {
 	s := newSniffer(lc.buffer, iface, snifferPorts, lc.config.LearnedPortCap, lc.config.Buffer.MaxBodyBytes, vxlanPort, lc.config.Verbose, lc.config.Reassembly, lc.config.Flow)
 	// Wire this instance's sniffer into the SHARED VIP handler. Every parsed
-	// response fires this callback regardless of which namespace captured it —
+	// response fires this callback regardless of which namespace captured it -
 	// the VIP pins/evidence maps are owned by the collector, so all instances
 	// resolve against one store.
 	s.onCapture = lc.handleCapturedResponse
@@ -655,7 +655,7 @@ func (lc *liveCollector) logStarted(captureDesc, iface string, vxlanPort uint16)
 	if ifaceDesc == "" {
 		ifaceDesc = "(all interfaces)"
 	}
-	log.Printf("[rec] Response Evidence Capture started — capture=%s interface=%s ports=%v learnedPortCap=%d vxlanPort=%d "+
+	log.Printf("[rec] Response Evidence Capture started - capture=%s interface=%s ports=%v learnedPortCap=%d vxlanPort=%d "+
 		"buffer=[maxEntries=%d maxBytes=%d maxAge=%s maxBody=%d]",
 		captureDesc,
 		ifaceDesc,
@@ -685,7 +685,7 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 
 	// --- Fix 1: Check VIP evidence first ---
 	// VIP evidence is protected from eviction. If there's a match,
-	// use it — the coordinator already knows this is high-priority.
+	// use it - the coordinator already knows this is high-priority.
 	candidates := lc.lookupVIPEvidence(req)
 
 	// --- Standard ring buffer lookup ---
@@ -754,7 +754,7 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		CapturedAt:      best.Timestamp,
 		ResponseLatency: absDuration(best.Timestamp.Sub(req.Timestamp)),
 	}
-	// True wire-pair duration — only when the response was paired with its
+	// True wire-pair duration - only when the response was paired with its
 	// request on the wire (orphans have zero RequestTimestamp). Negative or
 	// zero deltas (clock weirdness, same-instant) are treated as absent.
 	if !best.RequestTimestamp.IsZero() {
@@ -790,7 +790,7 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 	}
 }
 
-// Enabled reports whether REC is actively capturing — defined as "at least one
+// Enabled reports whether REC is actively capturing - defined as "at least one
 // namespace is active", not "the last read loop is alive". This is the crux of
 // the multi-namespace refactor: one dead/failed instance must not disable the
 // collector while siblings keep capturing.
@@ -801,7 +801,7 @@ func (lc *liveCollector) Enabled() bool {
 		return true
 	}
 	// NOTE: this takes capMu. Lookup is hot (fires ~14x/event during bursts),
-	// but at realistic N this is one mutex + a tiny map walk — negligible. If
+	// but at realistic N this is one mutex + a tiny map walk - negligible. If
 	// lock contention ever shows up under load, replace with a lockless
 	// activeCount atomic bumped by startCapture / Close.
 	lc.capMu.Lock()
@@ -865,7 +865,7 @@ func (lc *liveCollector) Stats() RECStats {
 
 		// Port registry telemetry (v0.47.1). Summed across instances; at N=1
 		// this equals the single registry. (A per-namespace breakdown is a later
-		// session — aggregate-only here.)
+		// session - aggregate-only here.)
 		if s.ports != nil {
 			ps := s.ports.stats()
 			stats.PortConfiguredCount += ps.ConfiguredCount
@@ -991,7 +991,7 @@ func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
 		return
 	}
 
-	// Step 2: Response not in buffer yet — register pin for future match
+	// Step 2: Response not in buffer yet - register pin for future match
 	// No correlationKey at this stage (coordinator key hasn't been built yet).
 	// The coordinator will find the evidence via lookupVIPEvidence during
 	// its normal Lookup call.
@@ -1009,7 +1009,7 @@ func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
 // enforceVIPCapLocked evicts the oldest VIP entry (pin or evidence) when
 // the combined count reaches the cap. Must be called with vipMu held.
 //
-// With PrePin, VIP is no longer "malicious-only" — all LLM-path events
+// With PrePin, VIP is no longer "malicious-only" - all LLM-path events
 // can get temporary VIP slots. The cap prevents unbounded memory growth
 // from benign events that get pre-pinned but classified as suppress/allow.
 func (lc *liveCollector) enforceVIPCapLocked() {
@@ -1098,8 +1098,8 @@ func normalizeLookupRequest(req LookupRequest) LookupRequest {
 // to the literal bytes the server observed on the wire, so a log-derived path
 // compares equal to REC's wire capture.
 //
-// nginx (escape=default) rewrites bytes it considers unsafe — control bytes
-// (<0x20), high bytes (>0x7E), '"' (0x22) and '\' (0x5C) — as the 4-char
+// nginx (escape=default) rewrites bytes it considers unsafe - control bytes
+// (<0x20), high bytes (>0x7E), '"' (0x22) and '\' (0x5C) - as the 4-char
 // sequence \xHH (a backslash, a literal 'x', then two hex digits). Everything
 // else is written verbatim. This reverses exactly that transform:
 //   - Fast path: returns s unchanged when it contains no `\x` (the common
@@ -1160,14 +1160,14 @@ func unhexNibble(b byte) byte {
 
 // matchesVIP checks if a captured response matches VIP pin criteria.
 // Uses the same hard filters as ring buffer Lookup:
-//   - Method + Path (if response has request info — orphans skip this)
+//   - Method + Path (if response has request info - orphans skip this)
 //   - StatusCode (hard filter)
 //   - Host (hard filter if both sides have it)
 //   - Time window
 func matchesVIP(resp CapturedResponse, req LookupRequest) bool {
 	window := req.Window
 	if window == 0 {
-		window = 5 * time.Second // wider window for VIP — evidence may arrive late
+		window = 5 * time.Second // wider window for VIP - evidence may arrive late
 	}
 
 	// Time window
@@ -1209,7 +1209,7 @@ func matchesVIP(resp CapturedResponse, req LookupRequest) bool {
 // an exact map lookup, gated by matchesVIP, consumed on success. This prevents
 // a different investigation that happens to share method+path+status from
 // consuming evidence PrePin promoted for THIS event. The method+path scan is
-// NOT used as a fallback in this path — that fallback is the cross-consumption
+// NOT used as a fallback in this path - that fallback is the cross-consumption
 // bug. Callers that cannot supply an EventID fall back to the legacy scan.
 func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse {
 	lc.vipMu.Lock()
@@ -1222,7 +1222,7 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 			return nil
 		}
 		if !matchesVIP(resp, req) {
-			// Entry exists but doesn't match the request shape — a correlation
+			// Entry exists but doesn't match the request shape - a correlation
 			// bug worth investigating. Keep the entry (do NOT delete): it's the
 			// best evidence for diagnosing the mismatch.
 			log.Printf("[rec:vip] Exact VIP evidence mismatch for %s: req method=%s path=%s status=%d host=%s; resp method=%s path=%s status=%d host=%s",
@@ -1238,7 +1238,7 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 
 	// --- Legacy path (EventID absent): method+path scan, unchanged ---
 	// Consume the first matched VIP evidence after use. Only one entry is
-	// deleted per lookup — if multiple VIP evidences match (different events
+	// deleted per lookup - if multiple VIP evidences match (different events
 	// with similar request shapes), the remaining ones stay available for
 	// their own event's lookup.
 	var candidates []CapturedResponse
@@ -1354,7 +1354,7 @@ func FormatEvidence(e *Evidence) string {
 		if e.CorrelationConfidence != ConfidenceHigh {
 			out += "  Body Preview: withheld (low correlation confidence)\n"
 		} else if e.Disclosure != nil && e.Disclosure.RedactionConfidence != ConfidenceHigh {
-			out += fmt.Sprintf("  Body Preview: withheld (%s format — redaction not confident)\n", e.Disclosure.Format)
+			out += fmt.Sprintf("  Body Preview: withheld (%s format - redaction not confident)\n", e.Disclosure.Format)
 		} else {
 			out += "  Body Preview: not available\n"
 		}

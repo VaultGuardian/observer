@@ -27,7 +27,7 @@ type FCMNotifier struct {
 	privateKey  *rsa.PrivateKey
 	clientEmail string
 
-	// OAuth2 token cache — access tokens are typically valid for 1 hour
+	// OAuth2 token cache - access tokens are typically valid for 1 hour
 	tokenMu     sync.RWMutex
 	accessToken string
 	tokenExp    time.Time

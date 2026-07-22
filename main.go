@@ -162,7 +162,7 @@ func main() {
 	// When the analyzer hits a pattern-store miss (event entering LLM path),
 	// it calls this to promote any matching ring buffer evidence to VIP
 	// before LLM queue delay can cause eviction. Parses HTTP identity the
-	// same way routeAlert() does — raw path for REC, normalized host.
+	// same way routeAlert() does - raw path for REC, normalized host.
 	a.SetPrePinFunc(func(evt *event.Event) {
 		if !collector.Enabled() {
 			return
@@ -267,7 +267,7 @@ func main() {
 	// Built BEFORE the coordinator and evidence callback because both need
 	// access (evidence callback for the hot-path Check, API server for
 	// SeedVerified + Stats via the correction handler). The tracker lives
-	// in main.go's lifecycle, not inside the coordinator — the coordinator
+	// in main.go's lifecycle, not inside the coordinator - the coordinator
 	// itself never invokes Check(); the check runs inside the evidence
 	// callback after redaction so it can short-circuit reclass cache + LLM
 	// using the redacted shape hash. (Design lock-in, May 11 2026.)
@@ -302,7 +302,7 @@ func main() {
 	//
 	// Section 3 / Landmine A: seedCatchAll now takes responseBytes from the
 	// finding. Human-confirmed entries with responseBytes=0 will be skipped
-	// by the byte-aware fallback (conservative — they'll still match exact
+	// by the byte-aware fallback (conservative - they'll still match exact
 	// body-hash via Check(), just not the byte-similarity Phase 3 path).
 	//
 	// v1.0 Card 4: seedExpectedEndpoint wires the new path-scoped tracker.
@@ -449,7 +449,7 @@ func main() {
 	// → close DB (stops async writer, then closes SQLite).
 	log.Println("[observer] Shutting down...")
 
-	// 1. Stop API server — no new requests accepted, in-flight get 5s to finish.
+	// 1. Stop API server - no new requests accepted, in-flight get 5s to finish.
 	if apiServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := apiServer.Shutdown(shutdownCtx); err != nil {
@@ -458,7 +458,7 @@ func main() {
 		shutdownCancel()
 	}
 
-	// 2. Stop notifier dispatcher — drain queued alerts up to 3s, then drop.
+	// 2. Stop notifier dispatcher - drain queued alerts up to 3s, then drop.
 	if dispatch != nil {
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		dispatch.Stop(drainCtx)
@@ -470,7 +470,7 @@ func main() {
 		log.Printf("[observer] Failed final persist: %v", err)
 	}
 
-	// 4. Close DB — stops async findings writer (drains queue), then closes SQLite.
+	// 4. Close DB - stops async findings writer (drains queue), then closes SQLite.
 	if err := db.Close(); err != nil {
 		log.Printf("[observer] DB close error: %v", err)
 	}
@@ -492,7 +492,7 @@ func main() {
 //
 // Section 3 follow-up: coordinator findings used to
 // drop these fields, leaving the correction endpoint to fall back to the
-// LLMDecision table — which doesn't exist for every finding, especially
+// LLMDecision table - which doesn't exist for every finding, especially
 // catch-all auto-downgrades that never invoke the LLM.
 func evidenceFields(e interface{}) (status string, code int, contentType string, bodyHash string, mode string) {
 	ev, ok := e.(*rec.Evidence)
@@ -511,7 +511,7 @@ func evidenceFields(e interface{}) (status string, code int, contentType string,
 
 func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordinator.DispatchFunc {
 	return func(alert coordinator.FinalAlert) {
-		// Extract evidence fields once per dispatch — used by all three
+		// Extract evidence fields once per dispatch - used by all three
 		// finding-write branches below.
 		evStatus, evCode, evCT, evHash, evMode := evidenceFields(alert.Evidence)
 
@@ -582,7 +582,7 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 
 			// Compute notified by trying to dispatch. The notified flag in
 			// the finding must reflect whether anything actually entered a
-			// notifier queue — queue-full drops or no-channels-configured
+			// notifier queue - queue-full drops or no-channels-configured
 			// both count as "not notified."
 			notified := false
 			if alert.BuildAlert != nil {
@@ -696,11 +696,11 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 //
 // Two downgrade paths (design consensus, 2026-03-25):
 //
-//	Path 1 — Transport-only downgrade (403/404/405/410)
-//	Path 2 — Body-aware re-classification (200, 3xx, 5xx)
+//	Path 1 - Transport-only downgrade (403/404/405/410)
+//	Path 2 - Body-aware re-classification (200, 3xx, 5xx)
 //
 // =============================================================================
-// PATH SOURCE — design consensus P0 fix (2026-05)
+// PATH SOURCE - design consensus P0 fix (2026-05)
 // =============================================================================
 // We intentionally do NOT re-parse pending.NormalizedLine here. That field
 // can contain <NUM>-substituted paths from the generic/Docker normalizer, and
@@ -769,24 +769,24 @@ func makeEvidenceCheckCallback(
 		// P0 fix (Jul 2026): a rejection status alone no longer downgrades
 		// when REC captured body evidence. Tiers, in order:
 		//
-		//	Tier 1 — deterministic disclosure (passwd/dotenv/PEM format
+		//	Tier 1 - deterministic disclosure (passwd/dotenv/PEM format
 		//	         identity) escalates. The empty-preview arm runs here;
 		//	         the preview-bearing arm runs in Path 2 AFTER the
 		//	         ExpectedEndpoint short-circuit (operator-explicit truth
-		//	         wins — the load-bearing ordering invariant). Escalating
+		//	         wins - the load-bearing ordering invariant). Escalating
 		//	         a withheld preview here cannot violate that invariant:
 		//	         the tracker's match key is the redacted-preview shape
 		//	         hash, which cannot exist for a withheld preview.
 		//	         Known FP profile (accepted Jul 2026): a rejection body
-		//	         that merely QUOTES a PEM armor header — e.g. a security
-		//	         appliance's 403 block page with remediation text — will
+		//	         that merely QUOTES a PEM armor header - e.g. a security
+		//	         appliance's 403 block page with remediation text - will
 		//	         escalate and email on every blocked attack. Because a
 		//	         fail-closed PEM body has no preview shape hash, the
 		//	         ExpectedEndpoint workflow can never suppress it; the
 		//	         only relief is a request-side allow pattern.
-		//	Tier 2 — any captured body preview defeats the status-only
+		//	Tier 2 - any captured body preview defeats the status-only
 		//	         downgrade; fall through to Path 2 (body-aware).
-		//	Tier 3 — no preview, no disclosing format: the original
+		//	Tier 3 - no preview, no disclosing format: the original
 		//	         status-downgrade behavior, slow-response gate included.
 		if evidence != nil && evidence.Transport != nil {
 			code := evidence.Transport.StatusCode
@@ -808,7 +808,7 @@ func makeEvidenceCheckCallback(
 				}
 				if evidence.SafeBodyPreview != "" {
 					// Tier 2 (and the preview-bearing tier-1 arm): defer to
-					// Path 2 — ExpectedEndpoint, then the deterministic
+					// Path 2 - ExpectedEndpoint, then the deterministic
 					// format check, then cache/LLM.
 					log.Printf("[reclassify] Status downgrade deferred: captured body present, key=%s status=%d - routing to body-aware Path 2",
 						snapshot.Key, code)
@@ -818,19 +818,19 @@ func makeEvidenceCheckCallback(
 					evidence.Transport.RequestDuration >= time.Duration(cfg.SlowResponseThresholdMs)*time.Millisecond {
 					// Slow-response gate: a rejection-looking status that took
 					// anomalously long on the wire may itself be evidence
-					// (time-based blind injection — the Jun 11 2026 scanner
+					// (time-based blind injection - the Jun 11 2026 scanner
 					// incident class). Only real wire-paired durations close
 					// this gap; absent/unpaired durations downgrade exactly as
-					// before, deliberately — no regression for orphans.
+					// before, deliberately - no regression for orphans.
 					log.Printf("[reclassify] Transport downgrade withheld: status=%d duration=%s key=%s",
 						code, evidence.Transport.RequestDuration, snapshot.Key)
-					// Fall through to Path 2 (body-aware) — the LLM sees
+					// Fall through to Path 2 (body-aware) - the LLM sees
 					// the latency via the reclassify prompt.
 				} else {
 					// Tier 3. Residual gap (accepted Jul 2026, documented not
 					// fixed): FormatBinary and FormatUnknown bodies are
 					// fail-closed with no preview and are indistinguishable
-					// here from "no body captured" — a 404 whose body is an
+					// here from "no body captured" - a 404 whose body is an
 					// unknown-format blob (e.g. a raw database file) still
 					// downgrades on status alone.
 					reason := fmt.Sprintf("Transport evidence confirms attack failed (HTTP %d) - payload was rejected/ignored by the server", code)
@@ -901,7 +901,7 @@ func makeEvidenceCheckCallback(
 			// verdict "alert", but a sender may still carry the model's
 			// immutable original "malicious" as Classification. Feeding that
 			// to ReclassifyWithEvidence as originalClassification makes
-			// isEscalation("malicious","malicious") false — an
+			// isEscalation("malicious","malicious") false - an
 			// evidence-confirmed breach on a clamped event could never
 			// escalate or notify. Normalize to the applied state.
 			classification = "suspicious"
@@ -917,7 +917,7 @@ func makeEvidenceCheckCallback(
 		// silently fails for the exact case it was built for. (P0
 		// catch + design lock-in, May 11 2026.)
 		//
-		// bodyHash here is the REDACTED response-shape hash — same value
+		// bodyHash here is the REDACTED response-shape hash - same value
 		// used as the reclass cache key below, stable across token rotations
 		// because redaction replaces secret values with markers before
 		// hashing. The correction handler stores decision.CacheKey (which
@@ -926,7 +926,7 @@ func makeEvidenceCheckCallback(
 		// Status source consistency: use the
 		// status captured AT THE EVIDENCE LAYER (same layer that produced
 		// the shape hash) so the key is internally consistent. snapshot.StatusCode
-		// is the fallback if evidence didn't carry a code (defensive — by
+		// is the fallback if evidence didn't carry a code (defensive - by
 		// this point in the function evidence.Transport is non-nil, but the
 		// fallback keeps us safe under refactor).
 		statusForKey := evidence.Transport.StatusCode
@@ -992,13 +992,13 @@ func makeEvidenceCheckCallback(
 		// Concurrent events with the same redacted body shape coalesce into
 		// one LLM flight, keyed on bodyHash. The leader is identified by its
 		// own snapshot.EventID on the shared result (the analyzer's
-		// LeaderEventID convention — never singleflight's shared bool).
+		// LeaderEventID convention - never singleflight's shared bool).
 		// ORDERING (load-bearing, see ExpectedEndpoint header comment): the
 		// ExpectedEndpoint check and cache.get above stay OUTSIDE and BEFORE
-		// this group — operator-explicit truth never waits on, or shares, an
+		// this group - operator-explicit truth never waits on, or shares, an
 		// LLM flight, and a cache hit never enters one. ctx is the single
 		// app context shared by every caller, so a leader cancellation is a
-		// follower cancellation — no divergence.
+		// follower cancellation - no divergence.
 		//
 		// Followers inherit the leader's verdict wholesale, including a
 		// Downgraded computed against the LEADER's originalClassification.
@@ -1011,7 +1011,7 @@ func makeEvidenceCheckCallback(
 			}
 			// defer (not inline): a panic in ReclassifyWithEvidence must not
 			// leak the scheduler slot. The slot is therefore held through the
-			// Lane-A put and the audit write (bounded by its 5s timeout) —
+			// Lane-A put and the audit write (bounded by its 5s timeout) -
 			// same pattern as the analyzer's runClassifyFlight.
 			defer release()
 			reclass, err := llmClient.ReclassifyWithEvidence(
@@ -1032,7 +1032,7 @@ func makeEvidenceCheckCallback(
 
 			// One audit row per flight: real token counts belong to the real
 			// call, so only the leader records a decision. Runs BEFORE the
-			// Lane-A cache.put — see the gate below.
+			// Lane-A cache.put - see the gate below.
 			auditCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			auditErr := db.RecordLLMDecision(auditCtx, &store.LLMDecision{
 				EventID:          snapshot.EventID,
@@ -1066,10 +1066,10 @@ func makeEvidenceCheckCallback(
 			}
 
 			// Two-lane durable caching (intended behavior change, Jun 2026).
-			// Lane A — durable entry ONLY for downgrades with POSITIVE proof
+			// Lane A - durable entry ONLY for downgrades with POSITIVE proof
 			// of boilerplate: the LLM attests generic_response AND redaction
 			// stripped zero sensitive values from the body.
-			// Lane B — everything else (escalations, non-generic downgrades,
+			// Lane B - everything else (escalations, non-generic downgrades,
 			// any body where the redactors stripped sensitive values) gets
 			// NO durable entry: concurrent identical bodies still coalesce
 			// via this flight group; sequential recurrences get a fresh LLM
@@ -1077,18 +1077,18 @@ func makeEvidenceCheckCallback(
 			// body is boilerplate; replaying an escalation would cost one
 			// extra LLM call and buys a fresh look at every sensitive body.
 			// Cache key (redacted shape hash) and the hit path are unchanged
-			// — Lane B entries simply never exist.
+			// - Lane B entries simply never exist.
 			//
 			// Gated on the audit write succeeding: a durable benign verdict
 			// must always have a llm_decisions row behind it, because the
 			// operator correction path invalidates this cache via the
-			// decision's CacheKey — an orphaned cache entry is
+			// decision's CacheKey - an orphaned cache entry is
 			// uncorrectable. Skipping the put on audit failure is
 			// self-healing: the next identical body re-runs the LLM and
 			// re-attempts the audit.
 			//
 			// Known gap (accepted Jun 2026): stripped <script>/<style> blocks
-			// do NOT count toward SensitiveRedactions — deliberate, since
+			// do NOT count toward SensitiveRedactions - deliberate, since
 			// counting them would empty Lane A for HTML. A shape whose only
 			// sensitive content lived inside those opaque blocks can
 			// therefore be durably cached as benign. This is the same
@@ -1162,7 +1162,7 @@ func makeVerifyCallback(
 	// on both transports, and Accept-Encoding: identity on every request.
 	// REC hashes wire-byte response previews; Go's default http.Client requests
 	// gzip and silently decompresses, so the verifier would hash decompressed
-	// bytes while REC hashed compressed bytes — body hashes would never match
+	// bytes while REC hashed compressed bytes - body hashes would never match
 	// for any response that nginx gzipped (catch-all verification fails
 	// silently). Belt-and-suspenders: header + transport flag.
 	httpClient := &http.Client{
@@ -1258,7 +1258,7 @@ func makeVerifyCallback(
 
 			// v0.52: Fail closed on read errors. A broken connection or
 			// mid-stream error can produce a partial body whose prefix hash
-			// accidentally matches REC's preview — leading to false verification.
+			// accidentally matches REC's preview - leading to false verification.
 			if readErr != nil {
 				log.Printf("[verify] Body read error: %v - skipping (fail closed)", readErr)
 				continue
@@ -1266,7 +1266,7 @@ func makeVerifyCallback(
 
 			fullBodyLen := int64(len(fullBody))
 
-			// Truncate to maxHash for fingerprint match — REC's sniffer hashes
+			// Truncate to maxHash for fingerprint match - REC's sniffer hashes
 			// the first maxHash bytes; we must compare hashes over the same range.
 			body := fullBody
 			if int64(len(body)) > maxHash {
@@ -1300,7 +1300,7 @@ func makeVerifyCallback(
 				s.scheme, resp.StatusCode, bodyLen, responseBytes, bodyHash)
 
 			// Redact the body using existing REC pipeline (over the maxHash slice
-			// — that matches what REC redacts and what we hashed).
+			// - that matches what REC redacts and what we hashed).
 			disclosure := rec.ClassifyAndRedact(body, contentType)
 			safePreview := disclosure.RedactedPreview()
 
@@ -1337,7 +1337,7 @@ func makeVerifyCallback(
 				"Catch-all verification probe",
 				fmt.Sprintf("%s %s → %d", verifyMethod, path, resp.StatusCode),
 				resp.StatusCode, contentType, bodyLen, safePreview,
-				// Live probe — no wire-paired transport timing on this path.
+				// Live probe - no wire-paired transport timing on this path.
 				0, "",
 			)
 
@@ -1426,7 +1426,7 @@ func persistVerifiedCatchAll(db *store.Store, ctx context.Context, fp coordinato
 
 // seedCatchAllsFromDB loads previously verified catch-all fingerprints.
 // Section 3 / Landmine A: also seeds ResponseBytes for the byte-aware fallback.
-// Pre-migration rows have response_bytes=0 — those entries will be skipped by
+// Pre-migration rows have response_bytes=0 - those entries will be skipped by
 // CheckFallbackByBytes until they're re-verified with a real measurement.
 func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 	rules, err := db.LoadVerifiedCatchAlls(context.Background())
@@ -1458,12 +1458,12 @@ func seedCatchAllsFromDB(db *store.Store, coord *coordinator.Coordinator) {
 // seedExpectedEndpointsFromDB loads previously confirmed expected-endpoint
 // rules (Card 4 / "Expected sensitive response") into the in-memory tracker.
 // Takes the tracker directly rather than going through the coordinator
-// because the coordinator doesn't own the tracker — both the evidence
+// because the coordinator doesn't own the tracker - both the evidence
 // callback and the API server reference it independently.
 //
 // Boot graceful degradation (design decision, May 11 2026): log loudly
 // and continue on error. Missing seeds mean prior Card 4 corrections don't
-// apply until the operator re-clicks — annoying but not security-degrading
+// apply until the operator re-clicks - annoying but not security-degrading
 // (CatchAll re-arm + Tier-2 LLM escalation still work).
 func seedExpectedEndpointsFromDB(db *store.Store, tracker *coordinator.ExpectedEndpointTracker) {
 	rules, err := db.LoadExpectedEndpoints(context.Background())
@@ -1609,7 +1609,7 @@ func makeLogHandler(
 			Metadata:    metadata,
 		}
 
-		// Policy engine — deterministic pre-LLM layer
+		// Policy engine - deterministic pre-LLM layer
 		if pr := policyEngine.Evaluate(evt); pr.Matched {
 			routePolicyOutcome(evt, pr, dispatch, db)
 			return
@@ -1637,7 +1637,7 @@ func makeLogHandler(
 // =============================================================================
 //
 // Background goroutine that finalizes stale malicious HTTP findings as
-// "evidence_unavailable" after a bounded window. Never auto-downgrades —
+// "evidence_unavailable" after a bounded window. Never auto-downgrades -
 // just stamps the terminal state so the dashboard can distinguish
 // "confirmed malicious, outcome unknown" from "evidence attempted but missed."
 //
@@ -1668,7 +1668,7 @@ func runReconciler(ctx context.Context, db *store.Store) {
 
 			finalized := 0
 			for _, f := range findings {
-				// Observability only — the reconciler never auto-downgrades.
+				// Observability only - the reconciler never auto-downgrades.
 				// The T1 clamp caps LLM-matched HTTP verdicts at alert, so an
 				// LLM-matched malicious reaching the timeout path means the
 				// clamp has a gap (or predates it).
@@ -1762,7 +1762,7 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 					policyMatches, policyEscalations, policyAllows, policyAlerts)
 			}
 
-			// Notifier — log only when channels are configured. Dropped
+			// Notifier - log only when channels are configured. Dropped
 			// counter is the cumulative number of alerts shed because a
 			// channel's queue was full (sustained overload protection).
 			if dispatch != nil && dispatch.ChannelCount() > 0 {

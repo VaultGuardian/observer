@@ -12,8 +12,8 @@ func suppressPrefix(val string) LearnedPattern {
 	}
 }
 
-// Learning the same prefix repeatedly — as happens when a line is reclassified
-// before its pattern propagates under retry-queue backlog — must not
+// Learning the same prefix repeatedly - as happens when a line is reclassified
+// before its pattern propagates under retry-queue backlog - must not
 // accumulate duplicate slice-tier entries. This is the regression that
 // produced the 24× fwupd / 21× "Reached target" duplicates in
 // patternstore.json.
@@ -33,7 +33,7 @@ func TestLearnDedupsSlicePrefix(t *testing.T) {
 	}
 }
 
-// Distinct values in the same tier are still appended — dedup keys on value,
+// Distinct values in the same tier are still appended - dedup keys on value,
 // not on tier membership.
 func TestLearnKeepsDistinctPrefixes(t *testing.T) {
 	s, err := NewStore(t.TempDir())

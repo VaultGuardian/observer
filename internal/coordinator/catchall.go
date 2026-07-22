@@ -10,7 +10,7 @@ import (
 )
 
 // =============================================================================
-// Catch-All Tracker — Structural Inference + One-Time Verification Gate
+// Catch-All Tracker - Structural Inference + One-Time Verification Gate
 // =============================================================================
 //
 // Fix 2 (v1.0 hardening): Fingerprint key changed from ResponseBytes to
@@ -24,12 +24,12 @@ import (
 // design rule: "Body hash, not body size. Non-negotiable."
 //
 // =============================================================================
-// Section 3 fix — Landmine A (v1.0 hardening, hardening catch):
+// Section 3 fix - Landmine A (v1.0 hardening, hardening catch):
 // =============================================================================
 // CheckFallbackByBytes is the Phase 3 fallback used when REC misses entirely
 // and we have only a response byte count from the access log. It previously
 // suppressed ANY (host, method, status) match under 10KB regardless of the
-// verified entry's actual response size — i.e. a verified 50-byte health
+// verified entry's actual response size - i.e. a verified 50-byte health
 // check would suppress a 9KB JSON response that REC missed.
 //
 // We now store the verified body's full byte count on the entry at
@@ -239,7 +239,7 @@ func (t *CatchAllTracker) Check(host, method string, statusCode int, bodyPreview
 // Safety: only matches against VERIFIED entries. If any entry for this
 // (host, method, status) was REJECTED, the fallback refuses to suppress.
 //
-// Section 3 fix (Landmine A — hardening catch):
+// Section 3 fix (Landmine A - hardening catch):
 //
 //	Previous behavior allowed ANY (host, method, status) verified entry to
 //	suppress ANY response under 10KB on that tuple, regardless of size.
@@ -309,12 +309,12 @@ func (t *CatchAllTracker) CheckFallbackByBytes(host, method string, statusCode i
 
 // bytesCompatible returns true when an access-log responseBytes is plausibly
 // the same response as a verified entry of size verifiedBytes. Tolerance is
-// ±max(15%, 256 bytes) — generous enough to absorb HTTP header variation
+// ±max(15%, 256 bytes) - generous enough to absorb HTTP header variation
 // (chunked encoding overhead, gzip differences, extra response headers) but
 // tight enough to reject responses that are clearly different content.
 //
 // When verifiedBytes <= 0 (legacy entries seeded before this field existed),
-// returns false — we conservatively refuse to suppress until we've actually
+// returns false - we conservatively refuse to suppress until we've actually
 // re-verified and recorded the size.
 func bytesCompatible(actualBytes, verifiedBytes int64) bool {
 	if verifiedBytes <= 0 {
@@ -381,7 +381,7 @@ func (t *CatchAllTracker) runVerification(fp CatchAllFingerprint, samplePath str
 // rows from before the schema migration arrive with responseBytes=0; entries
 // seeded that way will be skipped by the Phase 3 fallback (bytesCompatible
 // returns false for verifiedBytes<=0) until they're re-verified and persisted
-// with a real byte count. Conservative by design — better to email noisy than
+// with a real byte count. Conservative by design - better to email noisy than
 // suppress real traffic.
 func (t *CatchAllTracker) SeedVerified(fps []CatchAllFingerprint, reasons []string, responseBytesList []int64) {
 	t.mu.Lock()
@@ -486,7 +486,7 @@ func (t *CatchAllTracker) Stats() (total, candidates, pending, verified, rejecte
 //
 // v0.52: Verified entries are no longer immortal. Eviction prefers non-verified
 // entries first. If only verified entries remain, evicts the oldest one past TTL.
-// If ALL entries are verified and within TTL, evicts the oldest anyway — the hard
+// If ALL entries are verified and within TTL, evicts the oldest anyway - the hard
 // cap is non-negotiable (prevents unbounded growth from SeedVerified + Check).
 func (t *CatchAllTracker) evictOldest() {
 	var bestFP CatchAllFingerprint

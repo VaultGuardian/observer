@@ -25,8 +25,8 @@ import (
 // container is removed.
 //
 // This file makes the monitored set track live Docker state continuously, so
-// coverage self-heals without an Observer restart. Two triggers — a Docker
-// /events listener and a periodic rescan ticker — both feed ONE serialized,
+// coverage self-heals without an Observer restart. Two triggers - a Docker
+// /events listener and a periodic rescan ticker - both feed ONE serialized,
 // idempotent reconcile that opens/closes/repairs per-namespace captures through
 // the exact Session 2 discovery + Session 3 open path. Auto-detect mode only;
 // legacy NSContainer mode starts none of this machinery.
@@ -51,7 +51,7 @@ const (
 
 // desiredCapture is one container discovery says SHOULD be monitored, post
 // cap+exclude. id is shortID(pc.ID). pid is the freshly-resolved host PID, or 0
-// when unknown (pidFor failed) — 0 never triggers a repair, it is retried next
+// when unknown (pidFor failed) - 0 never triggers a repair, it is retried next
 // cycle.
 type desiredCapture struct {
 	id   string
@@ -65,7 +65,7 @@ type desiredCapture struct {
 // publicContainer for open/repair.
 type reconcileAction struct {
 	kind    actionKind
-	id      string // shortID — the identity key
+	id      string // shortID - the identity key
 	name    string
 	mapKey  string
 	nc      *namespaceCapture
@@ -91,7 +91,7 @@ func diffReconcile(desired map[string]desiredCapture, actual map[string]*namespa
 	actualByShort := make(map[string]actualEntry, len(actual))
 	for k, nc := range actual {
 		if nc.containerID == "" {
-			continue // host instance — never a diff candidate
+			continue // host instance - never a diff candidate
 		}
 		actualByShort[shortID(nc.containerID)] = actualEntry{mapKey: k, nc: nc}
 	}
@@ -143,8 +143,8 @@ func diffReconcile(desired map[string]desiredCapture, actual map[string]*namespa
 func (lc *liveCollector) reconcileOnce(ctx context.Context) {
 	containers, err := lc.deps.fetch()
 	if err != nil {
-		// Transient daemon hiccup — keep current captures; next tick retries.
-		log.Printf("[rec] Reconcile: Docker query failed: %v — keeping current captures", err)
+		// Transient daemon hiccup - keep current captures; next tick retries.
+		log.Printf("[rec] Reconcile: Docker query failed: %v - keeping current captures", err)
 		return
 	}
 
@@ -192,7 +192,7 @@ func (lc *liveCollector) applyOpen(ctx context.Context, a reconcileAction) {
 	if err := lc.startCapture(ctx, nc, lc.deps.openerFor(pc, nc)); err != nil {
 		// lastError already set on nc by startCapture; entry stays in the map
 		// (matches startup behavior). Siblings unaffected.
-		log.Printf("[rec] Reconcile: namespace capture for %q failed: %v — continuing", pc.Name, err)
+		log.Printf("[rec] Reconcile: namespace capture for %q failed: %v - continuing", pc.Name, err)
 		return
 	}
 	log.Printf("[rec] Reconcile: now monitoring container %q (%s)", pc.Name, shortID(pc.ID))
@@ -210,7 +210,7 @@ func (lc *liveCollector) applyClose(a reconcileAction) {
 // name#shortID collision suffix does not create a duplicate entry; then reopen
 // in the new namespace via the same open path.
 func (lc *liveCollector) applyRepair(ctx context.Context, a reconcileAction) {
-	log.Printf("[rec] Reconcile: container %s PID changed %d→%d — reopening namespace socket",
+	log.Printf("[rec] Reconcile: container %s PID changed %d→%d - reopening namespace socket",
 		a.id, a.oldPID, a.newPID)
 	lc.teardownInstance(a.nc, a.mapKey)
 
@@ -218,7 +218,7 @@ func (lc *liveCollector) applyRepair(ctx context.Context, a reconcileAction) {
 	snifferPorts := unionPorts(lc.config.Ports, privatePorts(pc.Ports))
 	nc := lc.buildNamespaceCapture(pc.Name, pc.ID, snifferPorts, privatePorts(pc.Ports), lc.config.Interface, lc.vxlanPort)
 	if err := lc.startCapture(ctx, nc, lc.deps.openerFor(pc, nc)); err != nil {
-		log.Printf("[rec] Reconcile: reopen for %q failed: %v — continuing", pc.Name, err)
+		log.Printf("[rec] Reconcile: reopen for %q failed: %v - continuing", pc.Name, err)
 	}
 }
 
@@ -239,7 +239,7 @@ func (lc *liveCollector) teardownInstance(nc *namespaceCapture, mapKey string) {
 
 // enforceHostInvariant maintains: the host fallback capture is active IFF there
 // are zero live namespace instances. This runs AFTER the diff actions, so any
-// just-opened namespace capture is already confirmed running — closing the host
+// just-opened namespace capture is already confirmed running - closing the host
 // here leaves no coverage gap, and avoids double-capture into the shared buffer.
 // When the last namespace instance is closed, the host fallback is reopened.
 func (lc *liveCollector) enforceHostInvariant(ctx context.Context) {
@@ -256,9 +256,9 @@ func (lc *liveCollector) enforceHostInvariant(ctx context.Context) {
 	switch {
 	case liveNS > 0 && host != nil && host.running.Load():
 		lc.teardownInstance(host, "host")
-		log.Printf("[rec] Reconcile: namespace coverage active — retiring host fallback capture")
+		log.Printf("[rec] Reconcile: namespace coverage active - retiring host fallback capture")
 	case liveNS == 0 && (host == nil || !host.running.Load()):
-		log.Printf("[rec] Reconcile: no namespace captures remain — reopening host fallback capture")
+		log.Printf("[rec] Reconcile: no namespace captures remain - reopening host fallback capture")
 		if _, err := lc.openHostCapture(ctx, lc.config.Interface, lc.vxlanPort, lc.deps.hostOpen); err != nil {
 			log.Printf("[rec] Reconcile: host fallback reopen failed: %v", err)
 		}
@@ -292,7 +292,7 @@ func (lc *liveCollector) trigger() {
 	}
 }
 
-// rescanTicker periodically triggers a reconcile — the backstop that guarantees
+// rescanTicker periodically triggers a reconcile - the backstop that guarantees
 // coverage self-heals even if a Docker event was dropped or the event stream is
 // mid-reconnect.
 func (lc *liveCollector) rescanTicker(ctx context.Context) {
@@ -318,12 +318,12 @@ const eventsURL = `http://localhost/events?filters={"type":["container"],"event"
 
 // eventsListener streams Docker container events and triggers a reconcile on
 // each one, reconnecting with bounded backoff if the stream errors or closes. A
-// dropped stream NEVER kills the collector — the rescan ticker holds coverage
+// dropped stream NEVER kills the collector - the rescan ticker holds coverage
 // during the gap.
 func (lc *liveCollector) eventsListener(ctx context.Context) {
 	const maxBackoff = 30 * time.Second
 	// A healthy /events connection can stay quiet for minutes, so "zero events"
-	// alone must not look unhealthy — a long-lived stream that simply had nothing
+	// alone must not look unhealthy - a long-lived stream that simply had nothing
 	// to report counts as healthy too.
 	const healthyStreamThreshold = 1 * time.Minute
 	backoff := time.Second
@@ -339,7 +339,7 @@ func (lc *liveCollector) eventsListener(ctx context.Context) {
 		}
 		healthy := gotEvent || lived >= healthyStreamThreshold
 		backoff = backoffAfterStream(backoff, maxBackoff, healthy)
-		log.Printf("[rec] Reconcile: Docker event stream ended (%v) — reconnecting in %s; periodic rescan holds coverage meanwhile", err, backoff)
+		log.Printf("[rec] Reconcile: Docker event stream ended (%v) - reconnecting in %s; periodic rescan holds coverage meanwhile", err, backoff)
 		select {
 		case <-ctx.Done():
 			return

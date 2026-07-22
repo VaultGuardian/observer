@@ -278,7 +278,7 @@ func TestCoverageConcurrentWithReconcile(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Writer 1: simulated reconcile — open/close map entries under capMu and
+	// Writer 1: simulated reconcile - open/close map entries under capMu and
 	// rewrite the retained inventory.
 	wg.Add(1)
 	go func() {
@@ -301,7 +301,7 @@ func TestCoverageConcurrentWithReconcile(t *testing.T) {
 		}
 	}()
 
-	// Writer 2: real open path failure — buildNamespaceCapture publishes, the
+	// Writer 2: real open path failure - buildNamespaceCapture publishes, the
 	// opener sets identity (capMu), startCapture records lastError (capMu).
 	wg.Add(1)
 	go func() {

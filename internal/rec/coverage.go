@@ -5,22 +5,22 @@ import "time"
 // RECCoverage is a structured, queryable snapshot of what REC is covering right
 // now, composed from live capture state + the discovery classification REC
 // already computes. It answers "is this source actually covered, and if not,
-// why?" — active namespace captures, containers skipped (with reason), excluded
+// why?" - active namespace captures, containers skipped (with reason), excluded
 // (REC_EXCLUDE_CONTAINERS), dropped by the REC_MAX_NAMESPACES cap (blind spots),
 // and degraded host-fallback state. It is PURE OBSERVABILITY: composing it
 // changes no capture/pairing/buffer/reconcile decision. This is the contract the
 // coordinator/CLI/dashboard render later (Session 6); keep field names stable.
 type RECCoverage struct {
 	// Mode is the capture topology:
-	//   "auto-detect"   — per-container namespace captures (≥1 namespace live)
-	//   "host-fallback" — auto-detect mode degraded to the single host capture
-	//   "legacy"        — REC_NS_CONTAINER pinned to one namespace
-	//   "disabled"      — collector is a no-op
+	//   "auto-detect"   - per-container namespace captures (≥1 namespace live)
+	//   "host-fallback" - auto-detect mode degraded to the single host capture
+	//   "legacy"        - REC_NS_CONTAINER pinned to one namespace
+	//   "disabled"      - collector is a no-op
 	Mode string `json:"mode"`
 
 	// HostFallbackActive reports the host-fallback invariant: in auto-detect mode
 	// the "host" capture is active IFF zero namespace instances are live. Coverage
-	// only reports this — it never changes it.
+	// only reports this - it never changes it.
 	HostFallbackActive bool `json:"host_fallback_active"`
 
 	// MaxNamespaces is the effective REC_MAX_NAMESPACES cap (resolved default).
@@ -66,7 +66,7 @@ type CoverageExcluded struct {
 }
 
 // CoverageDropped is a public container NOT monitored because the
-// REC_MAX_NAMESPACES cap was reached — a security blind spot.
+// REC_MAX_NAMESPACES cap was reached - a security blind spot.
 type CoverageDropped struct {
 	Name string `json:"name"`
 }
@@ -130,7 +130,7 @@ func (lc *liveCollector) Coverage() RECCoverage {
 	cov.Active = active
 
 	if legacy {
-		// Legacy single-namespace mode never runs discovery/reconcile — no inventory
+		// Legacy single-namespace mode never runs discovery/reconcile - no inventory
 		// to report. Otherwise byte-for-byte unchanged.
 		cov.Mode = "legacy"
 		return cov

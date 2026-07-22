@@ -168,7 +168,7 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 		size := binary.BigEndian.Uint32(header[4:8])
 
 		// v0.52: Cap frame size to prevent OOM from malicious/noisy containers.
-		// Docker's multiplexed log protocol includes a 32-bit size field — a
+		// Docker's multiplexed log protocol includes a 32-bit size field - a
 		// crafted frame could request up to 4GB. Normal log lines are well
 		// under 1MB; anything larger is either malicious or a binary dump.
 		// Kill the stream rather than draining attacker-controlled length.
@@ -192,7 +192,7 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 		// Parse Docker timestamp from log line.
 		// Docker API with timestamps=true prepends RFC3339Nano:
 		//   "2026-04-06T16:46:30.916575123Z actual log content"
-		// Parse it for accurate event timing. Keep full line intact —
+		// Parse it for accurate event timing. Keep full line intact -
 		// the normalizer already strips the timestamp prefix downstream.
 		emittedAt := time.Now() // fallback if parsing fails
 		if len(line) > 30 && line[4] == '-' && line[7] == '-' && line[10] == 'T' {

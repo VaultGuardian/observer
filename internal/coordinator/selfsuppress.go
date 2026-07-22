@@ -9,7 +9,7 @@ import (
 )
 
 // =============================================================================
-// Self-Suppression — Prevent Observer from alerting on its own verify requests
+// Self-Suppression - Prevent Observer from alerting on its own verify requests
 // =============================================================================
 //
 // PROBLEM:
@@ -55,7 +55,7 @@ func NewSelfSuppressor() *SelfSuppressor {
 func (s *SelfSuppressor) GenerateToken() (userAgent string, token string) {
 	b := make([]byte, tokenLength)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback — still random enough to avoid collision
+		// Fallback - still random enough to avoid collision
 		b = []byte(time.Now().String())
 	}
 	token = tokenPrefix + hex.EncodeToString(b)
@@ -102,7 +102,7 @@ func (s *SelfSuppressor) IsSelfVerify(rawLine string) bool {
 			continue
 		}
 		if strings.Contains(rawLine, token) {
-			// Found it — consume the token (one-shot)
+			// Found it - consume the token (one-shot)
 			delete(s.pending, token)
 			return true
 		}

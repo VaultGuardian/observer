@@ -37,7 +37,7 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 		v := result.LLMVerdict
 		// Classification/Action are the model's immutable originals; when the
 		// T1 clamp fired, PatternBucket records where the hash actually
-		// landed (alert) and FinalVerdict carries the applied verdict — the
+		// landed (alert) and FinalVerdict carries the applied verdict - the
 		// divergence from Action ("malicious") is intentional and queryable.
 		patternBucket := v.Action
 		if result.LLMClampedToAlert {
@@ -89,7 +89,7 @@ func (r *resultRouter) Route(evt *event.Event, result *analyzer.AnalysisResult, 
 // routeAlert handles malicious/alert verdicts.
 //
 // =============================================================================
-// PATH HANDLING — design consensus P0 fix (2026-05)
+// PATH HANDLING - design consensus P0 fix (2026-05)
 // =============================================================================
 // We compute TWO HTTP identities here:
 //
@@ -173,7 +173,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		return
 	}
 
-	// --- Cache-hit status-aware routing (Option C — design consensus) ---
+	// --- Cache-hit status-aware routing (Option C - design consensus) ---
 	//
 	// WHY: The pattern store caches T1 verdicts ("this is an attack") but NOT
 	// T2 outcomes ("the attack failed"). Cache-hit events go to the coordinator,
@@ -183,12 +183,12 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	//
 	// FIX: For cache-hit attack patterns where the HTTP status code in the log
 	// line already proves the attack was rejected, short-circuit as recon.
-	// No coordinator, no REC, no email. The pattern store is untouched — the
+	// No coordinator, no REC, no email. The pattern store is untouched - the
 	// pattern still means "this request shape is malicious." The event outcome
 	// means "this specific attempt failed."
 	//
 	// SCOPE:
-	//   - Cache hits only (result.Source != "llm") — fresh LLM events always
+	//   - Cache hits only (result.Source != "llm") - fresh LLM events always
 	//     go through the full coordinator/evidence pipeline.
 	//   - HTTP events with status 403/404/405/410 only.
 	//   - 200/3xx/5xx/unknown still route to coordinator for REC/T2.
@@ -198,35 +198,35 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// SAFETY: 400 excluded from first cut. Ship conservative, add after logs.
 	//
 	// NOTE (Jun 2026): this shortcut bypasses the slow-response gate
-	// (SLOW_RESPONSE_THRESHOLD_MS) for pattern-tier repeats — no REC lookup
+	// (SLOW_RESPONSE_THRESHOLD_MS) for pattern-tier repeats - no REC lookup
 	// happens here, so a slow time-based-blind 404 repeat is downgraded on
 	// status alone while a fresh LLM event with the same timing would be
 	// held for body-aware reclassification. Backlog: "extend slow-gate to
 	// status shortcut". (Partially superseded Jul 2026: a REC lookup DOES now
-	// happen below, but only the deterministic-disclosure check consumes it —
+	// happen below, but only the deterministic-disclosure check consumes it -
 	// the slow-gate itself still doesn't apply to this shortcut.)
 	//
 	// DISCLOSURE OVERRIDE (P0 fix, Jul 2026): before trusting the log-line
 	// status, ask REC whether it already captured a response body with a
-	// deterministically disclosing format (passwd/dotenv/PEM — the shared
+	// deterministically disclosing format (passwd/dotenv/PEM - the shared
 	// deterministicDisclosure predicate, same tier-1 gate as the evidence
 	// callback). If so, do NOT short-circuit: fall through to the full
 	// coordinator/evidence routing below, where the callback escalates.
 	// Caveats, deliberate:
 	//   - Best-effort: REC reassembly can lag ~2s behind the log line, so
 	//     this one-shot lookup can miss a body that lands moments later.
-	//     A miss means the status shortcut proceeds — exactly today's
+	//     A miss means the status shortcut proceeds - exactly today's
 	//     behavior, never a hold.
 	//   - Repeats that fall through and hit a graveyard tombstone are
 	//     suppressed with NO finding row, where this shortcut writes one
-	//     recon finding per repeat — an accepted dashboard-visible change.
+	//     recon finding per repeat - an accepted dashboard-visible change.
 	//   - The noOp collector returns Evidence with nil Disclosure, so the
 	//     predicate is false and disabled deployments are unaffected.
 	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
 		ev := r.collector.Lookup(rec.LookupRequest{
 			EventID:         evt.ID,
 			Method:          method,
-			Path:            rawPath, // raw wire path — REC captures literal paths
+			Path:            rawPath, // raw wire path - REC captures literal paths
 			Host:            host,
 			SourceContainer: evt.SourceName,
 			StatusCode:      statusCode,
@@ -238,7 +238,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			log.Printf("[RECON:STATUS] Shortcut overridden: EventID=%s Source=%s Status=%d - %s - routing to coordinator",
 				evt.ID, evt.ScopeKey(), statusCode, why)
 			// Fall through to the coordinator/evidence routing below. The
-			// shortcut's finding is intentionally NOT written — the
+			// shortcut's finding is intentionally NOT written - the
 			// coordinator dispatch writes the single finding for this event.
 		} else {
 			r.shortCircuitStatusRejection(evt, result, host, method, rawPath, statusCode)
@@ -251,7 +251,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// WHY: When a scanner probes the bare IP (e.g., GET /?phpinfo=-1 on
 	// 144.126.131.55), the web server answers with its default page (welcome
 	// page, error page, etc.) without proxying to any backend container.
-	// REC watches backend traffic — this response never crosses that path.
+	// REC watches backend traffic - this response never crosses that path.
 	// The coordinator opens an investigation, REC finds nothing, coordinator
 	// times out, dashboard shows MALICIOUS/SUSPICIOUS "awaiting evidence"
 	// forever. The evidence will never arrive.
@@ -259,7 +259,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// FIX: If the host is a bare IP address (not a domain/vhost), the
 	// request hit the default server block. The 200 is the default page,
 	// not a successful exploit reaching an application backend. Short-circuit
-	// as recon — no coordinator, no REC, no email.
+	// as recon - no coordinator, no REC, no email.
 	//
 	// SCOPE:
 	//   - Bare IP hosts only (isBareIP). Real vhosts always go to coordinator.
@@ -319,7 +319,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	// coordinator pending alert / direct-dispatch finding; the model's
 	// immutable original stays in the llm_decisions audit row. Without this,
 	// a T1-clamped original "malicious" leaks into the evidence callback's
-	// escalation math — ReclassifyWithEvidence receives it as
+	// escalation math - ReclassifyWithEvidence receives it as
 	// originalClassification and isEscalation("malicious","malicious") is
 	// false, so an evidence-confirmed breach on a clamped event could never
 	// escalate or notify.
@@ -333,7 +333,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		// Section 3 / Finding 2 fix: include host in the correlation key.
 		// Two services on the same nginx hitting the same path/status
 		// must NOT join the same investigation huddle. extractPath() in
-		// the coordinator is gone — the coordinator reads pending.HTTPPath
+		// the coordinator is gone - the coordinator reads pending.HTTPPath
 		// directly, so the key format is purely an opaque identity token.
 		// Hostless logs use a stable placeholder so they still correlate.
 		hostKey := host
@@ -347,13 +347,13 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		// CANNOT be evicted by traffic floods. When a matching response
 		// arrives, the VIP callback fires immediately.
 		//
-		// VerdictAlert is included so suspicious cache-hits — which skip the
-		// LLM PrePin path entirely — still get protected evidence. Without
+		// VerdictAlert is included so suspicious cache-hits - which skip the
+		// LLM PrePin path entirely - still get protected evidence. Without
 		// this they got no VIP pin and their response could be evicted under
 		// load before the coordinator's evidence check ran. Malicious behavior
 		// is unchanged; the existing VIP cap (enforceVIPCapLocked) bounds growth.
 		//
-		// REC LookupRequest.Path uses the RAW path (not normalized) — REC
+		// REC LookupRequest.Path uses the RAW path (not normalized) - REC
 		// captures the literal wire path, exact-match comparison.
 		if result.Verdict == patternstore.VerdictMalicious || result.Verdict == patternstore.VerdictAlert {
 			r.collector.PinVIP(evt.ID, correlationKey, rec.LookupRequest{
@@ -429,7 +429,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			// lookups always get the wire path, not the <NUM>-substituted one.
 			HTTPPath: rawPath,
 			// Fix 2: BodyPreviewHash for catch-all matching.
-			// Intentionally empty at routing time — evidence callback in
+			// Intentionally empty at routing time - evidence callback in
 			// tryEvidenceCheck() populates this when REC captures a response
 			// (Phase 2 re-arm). If REC misses entirely, Phase 3 fallback in
 			// investigationLoop() uses ResponseBytes instead.
@@ -470,12 +470,12 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			Confidence:     result.LLMConfidence,
 			Timestamp:      evt.Timestamp,
 		}
-		// Notified reflects actual enqueue success — a queue-full drop or
+		// Notified reflects actual enqueue success - a queue-full drop or
 		// no-channels-configured both count as "not notified."
 		notified = r.dispatch.Dispatch(context.Background(), alert) > 0
 	}
 
-	// Fix 3: Use async writer for non-HTTP alerts (non-droppable — blocks if full)
+	// Fix 3: Use async writer for non-HTTP alerts (non-droppable - blocks if full)
 	r.db.SubmitFinding(&store.Finding{
 		EventID:              evt.ID,
 		Timestamp:            evt.Timestamp,

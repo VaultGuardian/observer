@@ -116,7 +116,7 @@ func TestDecapVXLAN_NoIFlag(t *testing.T) {
 }
 
 func TestDecapVXLAN_TCPPacket(t *testing.T) {
-	// Build a normal TCP packet (not UDP) — should return errNotVXLAN
+	// Build a normal TCP packet (not UDP) - should return errNotVXLAN
 	pkt := make([]byte, 14+20+20)                  // Eth + IPv4 + TCP
 	binary.BigEndian.PutUint16(pkt[12:14], 0x0800) // EtherType = IPv4
 	pkt[14] = 0x45                                 // IPv4, IHL=5
@@ -263,6 +263,6 @@ func TestProcessFrame_DepthGuard(t *testing.T) {
 		t.Fatal("maxDecapDepth should be at least 1")
 	}
 	if maxDecapDepth > 5 {
-		t.Error("maxDecapDepth seems unreasonably high — 2-3 is expected")
+		t.Error("maxDecapDepth seems unreasonably high - 2-3 is expected")
 	}
 }

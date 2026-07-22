@@ -67,7 +67,7 @@ func TestTrustedResolutionOverridesEvidenceUnavailable(t *testing.T) {
 		t.Fatalf("after timeout, resolution_status = %q; want evidence_unavailable", got)
 	}
 
-	// A trusted downgrade arrives afterwards — it must override.
+	// A trusted downgrade arrives afterwards - it must override.
 	if err := s.UpdateFindingResolution(ctx, id, "resolved", "rec_evidence", "downgraded"); err != nil {
 		t.Fatalf("trusted override: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestTimeoutCannotClobberResolved(t *testing.T) {
 	}
 }
 
-// TestTimeoutStampsPending_NoRegression: the unchanged common path — timeout
+// TestTimeoutStampsPending_NoRegression: the unchanged common path - timeout
 // still moves a pending row to evidence_unavailable, and that row then leaves
 // the QueryUnresolvedMalicious set.
 func TestTimeoutStampsPending_NoRegression(t *testing.T) {

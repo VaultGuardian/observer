@@ -28,7 +28,7 @@ func NewSMSNotifier(cfg SMSConfig) *SMSNotifier {
 func (s *SMSNotifier) Name() string { return "sms" }
 
 func (s *SMSNotifier) Send(ctx context.Context, alert Alert) error {
-	// Build the SMS body — keep it short, SMS has a 1600 char limit
+	// Build the SMS body - keep it short, SMS has a 1600 char limit
 	// and you pay per segment (160 chars each)
 	body := fmt.Sprintf("[VG] %s\n%s: %s\n%s",
 		strings.ToUpper(string(alert.Severity)),

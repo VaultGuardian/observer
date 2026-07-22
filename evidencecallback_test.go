@@ -1,4 +1,4 @@
-// evidencecallback_test.go — Session B behavior tests for the T2 reclassify
+// evidencecallback_test.go - Session B behavior tests for the T2 reclassify
 // router in makeEvidenceCheckCallback: singleflight coalescing, the two-lane
 // durable cache, the ExpectedEndpoint ordering pin, and the slow-response
 // transport-downgrade gate.
@@ -225,7 +225,7 @@ func TestEvidenceCallback_CoalescesConcurrentSameBody(t *testing.T) {
 	followers := 0
 	for i, d := range decisions {
 		if !d.Downgraded {
-			t.Errorf("decision[%d] not downgraded — verdict not shared", i)
+			t.Errorf("decision[%d] not downgraded - verdict not shared", i)
 		}
 		note := "coalesced with " + leaderID
 		isFollower := eventIDs[i] != leaderID
@@ -248,7 +248,7 @@ func TestEvidenceCallback_CoalescesConcurrentSameBody(t *testing.T) {
 
 // TestEvidenceCallback_LaneA_DurableCache: a downgrade with positive
 // boilerplate proof (generic_response=true, zero sensitive redactions) is
-// durably cached — the second sequential identical body never reaches the LLM.
+// durably cached - the second sequential identical body never reaches the LLM.
 func TestEvidenceCallback_LaneA_DurableCache(t *testing.T) {
 	ev := reclassEvidence(200, "<html>welcome page</html>", 0, 0, "")
 	h := newCallbackHarness(t, ev, verdictGenericDowngrade, 0, nil)
@@ -268,7 +268,7 @@ func TestEvidenceCallback_LaneA_DurableCache(t *testing.T) {
 }
 
 // TestEvidenceCallback_LaneB_EscalationNotCached: escalations are no longer
-// durably replayed — a second sequential identical body gets a fresh LLM call.
+// durably replayed - a second sequential identical body gets a fresh LLM call.
 func TestEvidenceCallback_LaneB_EscalationNotCached(t *testing.T) {
 	ev := reclassEvidence(200, `{"AWS_KEY":"[REDACTED]"}`, 1, 0, "")
 	h := newCallbackHarness(t, ev, verdictEscalation, 0, nil)
@@ -288,8 +288,8 @@ func TestEvidenceCallback_LaneB_EscalationNotCached(t *testing.T) {
 }
 
 // TestEvidenceCallback_LaneB_NotCachedWithoutProof: downgrades without
-// positive boilerplate proof — sensitive redactions present, or the model
-// declined to assert generic_response — are not durably cached.
+// positive boilerplate proof - sensitive redactions present, or the model
+// declined to assert generic_response - are not durably cached.
 func TestEvidenceCallback_LaneB_NotCachedWithoutProof(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -316,7 +316,7 @@ func TestEvidenceCallback_LaneB_NotCachedWithoutProof(t *testing.T) {
 
 // TestEvidenceCallback_ExpectedEndpointShortCircuit pins the load-bearing
 // ordering: an operator-confirmed shape match short-circuits AFTER redaction
-// but BEFORE the reclass cache, the singleflight group, and the LLM — zero
+// but BEFORE the reclass cache, the singleflight group, and the LLM - zero
 // LLM calls, zero scheduler acquires, zero cache entries, zero audit rows.
 func TestEvidenceCallback_ExpectedEndpointShortCircuit(t *testing.T) {
 	body := `{"token":"[REDACTED]"}`
@@ -355,8 +355,8 @@ func TestEvidenceCallback_ExpectedEndpointShortCircuit(t *testing.T) {
 
 // TestEvidenceCallback_ClampedEventEscalates: end-to-end router → coordinator
 // → evidence callback for a T1-clamped event. routeAlert must carry the
-// APPLIED classification ("suspicious") on the pending alert — not the
-// immutable original "malicious" — otherwise ReclassifyWithEvidence receives
+// APPLIED classification ("suspicious") on the pending alert - not the
+// immutable original "malicious" - otherwise ReclassifyWithEvidence receives
 // originalClassification="malicious" and isEscalation("malicious",
 // "malicious") is false: an evidence-confirmed breach on a clamped event
 // could never escalate or notify.
@@ -412,17 +412,17 @@ func TestEvidenceCallback_ClampedEventEscalates(t *testing.T) {
 			t.Errorf("pending alert Classification = %q, want \"suspicious\" (applied state; original belongs to the audit row)", rec.snap.Classification)
 		}
 		if !rec.decision.Escalated {
-			t.Errorf("EvidenceDecision.Escalated = false, want true — clamped event cannot escalate on evidence")
+			t.Errorf("EvidenceDecision.Escalated = false, want true - clamped event cannot escalate on evidence")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("evidence check never ran — TryResolveVIP key mismatch? key=%q", key)
+		t.Fatalf("evidence check never ran - TryResolveVIP key mismatch? key=%q", key)
 	}
 }
 
 // TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd: router → coordinator
 // → evidence callback for a cache-hit repeat on a rejecting status whose REC
 // evidence shows a deterministic disclosure. The status shortcut must yield to
-// the coordinator, and the callback must escalate without an LLM call — the
+// the coordinator, and the callback must escalate without an LLM call - the
 // two halves of the Jul 2026 P0 fix working together.
 func TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd(t *testing.T) {
 	ev := reclassEvidence(404, "DB_PASSWORD=[REDACTED]\nAPP_KEY=[REDACTED]", 2, 0, "")
@@ -470,7 +470,7 @@ func TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd(t *testing.T) {
 			t.Errorf("NewSeverity = %q, want \"malicious\"", d.NewSeverity)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("evidence check never ran — status shortcut not overridden, or key mismatch (key=%q)", key)
+		t.Fatalf("evidence check never ran - status shortcut not overridden, or key mismatch (key=%q)", key)
 	}
 	if got := h.stub.calls.Load(); got != 0 {
 		t.Errorf("LLM called %d times, want 0 (deterministic escalation)", got)
@@ -511,10 +511,10 @@ func TestEvidenceCallback_SlowResponseGate(t *testing.T) {
 		wantLLMCalls  int64
 		wantPrompt    string
 	}{
-		// Body present: tier 2 — never a transport downgrade, always LLM.
+		// Body present: tier 2 - never a transport downgrade, always LLM.
 		{"slow_wire_pair_body_reclassifies", notFoundBody, 5 * time.Second, "wire_pair", 0, false, 1, "Observed server processing time: 5000 ms"},
 		{"fast_wire_pair_body_reclassifies", notFoundBody, 50 * time.Millisecond, "wire_pair", 0, false, 1, ""},
-		// No body: tier 3 — pre-existing behavior preserved exactly.
+		// No body: tier 3 - pre-existing behavior preserved exactly.
 		{"slow_wire_pair_no_body_withheld_no_llm", "", 5 * time.Second, "wire_pair", 0, false, 0, ""},
 		{"fast_wire_pair_no_body_downgrades", "", 50 * time.Millisecond, "wire_pair", 0, true, 0, ""},
 		{"absent_duration_no_body_downgrades", "", 0, "", 0, true, 0, ""},
@@ -547,7 +547,7 @@ func TestEvidenceCallback_SlowResponseGate(t *testing.T) {
 }
 
 // TestEvidenceCallback_DeterministicDisclosureEscalates: tier 1 of the
-// disclosure gate — passwd/dotenv/PEM format identity on a rejection status
+// disclosure gate - passwd/dotenv/PEM format identity on a rejection status
 // escalates deterministically, zero LLM calls, zero audit rows. PEM exercises
 // the empty-preview arm (fail-closed format, 403 per the original finding);
 // passwd/dotenv exercise the preview-bearing arm that runs in Path 2 after
@@ -616,7 +616,7 @@ func TestEvidenceCallback_RedactionCountAloneDoesNotEscalate(t *testing.T) {
 // TestEvidenceCallback_ExpectedEndpointBeatsDeterministicEscalation pins the
 // load-bearing ordering for the preview-bearing tier-1 arm: an
 // operator-confirmed shape downgrades BEFORE the deterministic disclosure
-// check can escalate — operator-explicit truth wins.
+// check can escalate - operator-explicit truth wins.
 func TestEvidenceCallback_ExpectedEndpointBeatsDeterministicEscalation(t *testing.T) {
 	body := "root:x:0:0:root:/root:/bin/bash"
 	ev := reclassEvidence(404, body, 1, 0, "")
@@ -634,7 +634,7 @@ func TestEvidenceCallback_ExpectedEndpointBeatsDeterministicEscalation(t *testin
 	d := h.cb(reclassSnapshot("evt_ee_det", "malicious"))
 
 	if !d.Downgraded {
-		t.Fatalf("Downgraded = false (escalated=%v reason=%q) — ExpectedEndpoint must pre-empt tier 1", d.Escalated, d.Reason)
+		t.Fatalf("Downgraded = false (escalated=%v reason=%q) - ExpectedEndpoint must pre-empt tier 1", d.Escalated, d.Reason)
 	}
 	if d.Escalated {
 		t.Errorf("Escalated = true, want false")

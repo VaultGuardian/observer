@@ -1,4 +1,4 @@
-// dispatchcallback_test.go — regression coverage for the coordinator
+// dispatchcallback_test.go - regression coverage for the coordinator
 // human-correction scope double-prefix bug. The dispatch callback must persist
 // the BARE source name in store.Finding.SourceName so the correction API's
 // reconstruction (SourceType + ":" + SourceName) yields the canonical scope

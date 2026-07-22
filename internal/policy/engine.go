@@ -43,7 +43,7 @@ type Rule struct {
 	// MatchKernelUnits, when non-empty, requires the kernel-attached
 	// _SYSTEMD_UNIT of a journald event (carried in evt.Metadata["unit"])
 	// to normalize to one of these values. Use this for high-confidence
-	// rules where the attacker could otherwise spoof SYSLOG_IDENTIFIER —
+	// rules where the attacker could otherwise spoof SYSLOG_IDENTIFIER -
 	// e.g. a container writing SYSLOG_IDENTIFIER="sshd" to journald.
 	//
 	// Normalization strips ".service"/".scope" and any "@instance" suffix:
@@ -84,7 +84,7 @@ func New(db *store.Store) *Engine {
 }
 
 // Evaluate checks an event against all policy rules.
-// Returns Result{Matched: false} if no rule fires — the event should
+// Returns Result{Matched: false} if no rule fires - the event should
 // continue to the normal LLM pipeline.
 //
 // Called from makeLogHandler after event creation, before a.Analyze().
@@ -262,13 +262,13 @@ func defaultRules() []Rule {
 
 		// ----- Failed Sudo (someone inside, trying to escalate) -----
 		// Matches: "user NOT in sudoers" or "3 incorrect password attempts"
-		// Alert only, not escalate — noisy but indicates compromise.
+		// Alert only, not escalate - noisy but indicates compromise.
 		//
 		// Residual spoof risk: this rule matches against the spoofable
 		// SYSLOG_IDENTIFIER "sudo" rather than a kernel-attached unit.
 		// Tightening with MatchKernelUnits is impractical because sudo
 		// inherits its cgroup from the parent session (e.g. ssh@N.service,
-		// user@1000.service, session-N.scope) — there is no canonical
+		// user@1000.service, session-N.scope) - there is no canonical
 		// "sudo.service" unit to match on. A container writing fake sudo
 		// lines to journald can therefore trip this rule. Mitigation:
 		// it's "alert", not "escalate", and the trusted_ips allowlist
@@ -289,7 +289,7 @@ func defaultRules() []Rule {
 
 		// ----- PAM Session (redundant after SSH policy) -----
 		// pam_unix logs "session opened/closed" after every SSH login.
-		// The ssh_login rule already handles the authentication event —
+		// The ssh_login rule already handles the authentication event -
 		// whether escalated (unknown IP) or allowed (trusted IP).
 		// Without this rule, PAM lines fall through to the LLM and get
 		// classified as "suspicious" independently, creating duplicate alerts.
@@ -311,7 +311,7 @@ func defaultRules() []Rule {
 
 // unitMatches reports whether the unit (e.g. "ssh.service" from
 // evt.Metadata["unit"]) normalizes to any of the allowed unit names.
-// Empty unit returns false — rules with MatchKernelUnits set are journald-
+// Empty unit returns false - rules with MatchKernelUnits set are journald-
 // scoped and an event with no unit can't satisfy them.
 func unitMatches(unit string, allowed []string) bool {
 	if unit == "" {

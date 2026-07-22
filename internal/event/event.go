@@ -16,7 +16,7 @@ const (
 )
 
 // Event is the canonical unit of work in Observer.
-// Every collector — Docker, journald, file tail, audit — produces Events.
+// Every collector - Docker, journald, file tail, audit - produces Events.
 // The analyzer pipeline does not care where the event came from;
 // it cares about SourceType + SourceName for pattern scoping,
 // and Line for classification.
@@ -60,7 +60,7 @@ type Event struct {
 
 	// Metadata holds source-specific extras that don't warrant top-level fields yet.
 	// Examples: "container_id", "image", "pid", "uid", "unit_instance"
-	// This is the extensibility escape hatch — add structure later when you need it.
+	// This is the extensibility escape hatch - add structure later when you need it.
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 

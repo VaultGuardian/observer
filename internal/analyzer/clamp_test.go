@@ -50,7 +50,7 @@ func newClampTestAnalyzer(t *testing.T, serverURL string) (*Analyzer, *patternst
 // with HTTP identity is applied as alert (outcome claims require response
 // evidence), while the recorded verdict keeps the model's original action,
 // the clamp counter increments, and the learned hash lands in the ALERT
-// bucket — not malicious — so future identical lines route as alert too.
+// bucket - not malicious - so future identical lines route as alert too.
 func TestT1Clamp_HTTPMaliciousCappedToAlert(t *testing.T) {
 	server, llmCalls := newMaliciousLLMStub(t)
 	a, patterns := newClampTestAnalyzer(t, server.URL)
@@ -91,12 +91,12 @@ func TestT1Clamp_HTTPMaliciousCappedToAlert(t *testing.T) {
 		t.Fatalf("hash was not learned at all")
 	}
 	if m.Verdict != patternstore.VerdictAlert {
-		t.Errorf("learned bucket = %q, want %q — pattern tier would resurrect malicious-without-evidence", m.Verdict, patternstore.VerdictAlert)
+		t.Errorf("learned bucket = %q, want %q - pattern tier would resurrect malicious-without-evidence", m.Verdict, patternstore.VerdictAlert)
 	}
 }
 
 // TestT1Clamp_NonHTTPMaliciousUnchanged: events without HTTP identity are
-// untouched — malicious stays malicious and learns into the malicious bucket.
+// untouched - malicious stays malicious and learns into the malicious bucket.
 func TestT1Clamp_NonHTTPMaliciousUnchanged(t *testing.T) {
 	server, llmCalls := newMaliciousLLMStub(t)
 	a, patterns := newClampTestAnalyzer(t, server.URL)
@@ -134,7 +134,7 @@ func TestT1Clamp_NonHTTPMaliciousUnchanged(t *testing.T) {
 // TestT1Clamp_MorganHTTPMaliciousCappedToAlert: Format 4 (Express/morgan)
 // lines are HTTP to the clamp, same as Formats 1-3. Before reHTTPMorgan was
 // added, this literal captain-captain line was HTTP to the router (httpparse
-// reMorganHTTP) but invisible to parseHTTPIdentity — an LLM-malicious morgan
+// reMorganHTTP) but invisible to parseHTTPIdentity - an LLM-malicious morgan
 // line learned into the malicious bucket and routed at malicious severity
 // with no evidence.
 func TestT1Clamp_MorganHTTPMaliciousCappedToAlert(t *testing.T) {
@@ -171,7 +171,7 @@ func TestT1Clamp_MorganHTTPMaliciousCappedToAlert(t *testing.T) {
 }
 
 // TestMorganFailedProbe_CleanPathSuppressed: with Format 4 in
-// parseHTTPIdentity, isFailedProbe now sees morgan lines too — a clean-path
+// parseHTTPIdentity, isFailedProbe now sees morgan lines too - a clean-path
 // morgan 404 is deterministically suppressed without burning an LLM call
 // (accepted side effect of parser parity, Jun 2026).
 func TestMorganFailedProbe_CleanPathSuppressed(t *testing.T) {
@@ -199,7 +199,7 @@ func TestMorganFailedProbe_CleanPathSuppressed(t *testing.T) {
 
 // TestMorganFailedProbe_AttackShapedReachesLLM: the literal review line
 // "GET /api/users?id=1%27%20OR%20SLEEP(5)-- 404 5001.0 ms - 0" is NOT
-// deterministically suppressed and proceeds to the LLM tier — but NOT via an
+// deterministically suppressed and proceeds to the LLM tier - but NOT via an
 // attack-indicator escape (the v0.47 policy override removed those:
 // isFailedProbe is pure status-based). The mechanism is normalization: the
 // generic normalizer collapses the 4-digit duration ("5001.0 ms" →
@@ -208,7 +208,7 @@ func TestMorganFailedProbe_CleanPathSuppressed(t *testing.T) {
 // the clamp sees HTTP identity and caps the LLM's malicious to alert.
 //
 // The subtest pins the policy boundary: the same attack-shaped probe with a
-// 3-digit duration survives normalization intact and IS suppressed — failed
+// 3-digit duration survives normalization intact and IS suppressed - failed
 // = suppress, regardless of payload (v0.47, reconfirmed Jun 2026).
 func TestMorganFailedProbe_AttackShapedReachesLLM(t *testing.T) {
 	server, llmCalls := newMaliciousLLMStub(t)
@@ -259,7 +259,7 @@ func TestMorganFailedProbe_AttackShapedReachesLLM(t *testing.T) {
 }
 
 // TestT1Clamp_PatternTierMaliciousUnchanged: deterministic-tier verdicts are
-// untouched — a pre-learned malicious hash still fires as malicious for an
+// untouched - a pre-learned malicious hash still fires as malicious for an
 // HTTP event, with no LLM call and no clamp.
 func TestT1Clamp_PatternTierMaliciousUnchanged(t *testing.T) {
 	server, llmCalls := newMaliciousLLMStub(t)

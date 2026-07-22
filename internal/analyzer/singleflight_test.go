@@ -17,7 +17,7 @@ import (
 )
 
 // countingScheduler is a test LLMScheduler that records how many times a slot
-// was requested. Capacity is generous so the leader always succeeds — the point
+// was requested. Capacity is generous so the leader always succeeds - the point
 // of the test is that only the leader ever asks for a slot.
 type countingScheduler struct {
 	sem           chan struct{}

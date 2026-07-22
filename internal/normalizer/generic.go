@@ -13,7 +13,7 @@ type GenericNormalizer struct{}
 
 func (g *GenericNormalizer) Family() string { return "generic" }
 
-// Pre-compiled regexes — compiled once at init, zero cost per call.
+// Pre-compiled regexes - compiled once at init, zero cost per call.
 var (
 	// ISO 8601: 2026-03-17T21:42:30.123456789Z or with offset
 	reISO8601 = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\.\d]*[Z\+\-][\d:]*`)
@@ -43,7 +43,7 @@ var (
 	reDuration = regexp.MustCompile(`\b\d+[\.\d]*(?:ns|µs|us|μs|ms|s|m|h)\b`)
 
 	// ANSI escape codes: color, bold, reset, etc. (e.g. \x1b[0m, \x1b[32m, \x1b[1;31m)
-	// Zero security signal — purely presentation. Destabilizes hashes and breaks
+	// Zero security signal - purely presentation. Destabilizes hashes and breaks
 	// JSON parsing when the LLM echoes them back in its response.
 	reANSI = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
@@ -56,7 +56,7 @@ func (g *GenericNormalizer) Normalize(line string) string {
 
 	// Docker framing already stripped by NormalizeEvent().
 
-	// Strip ANSI escape codes first — they're presentation noise that
+	// Strip ANSI escape codes first - they're presentation noise that
 	// destabilizes hashes and can break JSON parsing downstream.
 	line = reANSI.ReplaceAllString(line, "")
 

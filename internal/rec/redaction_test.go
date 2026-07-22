@@ -211,7 +211,7 @@ func TestRedactHTMLAttributes_EdgeCases(t *testing.T) {
 		},
 		{
 			name: "malformed: unclosed quote on benign attr leaves partial",
-			// Non-secret attrs keep the partial bytes — over-redacting
+			// Non-secret attrs keep the partial bytes - over-redacting
 			// benign structure costs LLM signal without security benefit.
 			tag:  `<div class="container`,
 			want: `<div class="container`,
@@ -272,7 +272,7 @@ func TestAttrNameLooksSecret(t *testing.T) {
 // SensitiveRedactions counting (Session A plumbing)
 // =============================================================================
 //
-// The count is a side-channel over EXISTING redaction behavior — the golden
+// The count is a side-channel over EXISTING redaction behavior - the golden
 // preview assertions pin the redacted output strings byte-for-byte so the
 // counter can never drift the redaction itself.
 
@@ -283,7 +283,7 @@ func TestClassifyAndRedact_SensitiveRedactionCounts(t *testing.T) {
 		contentType string
 		wantFormat  DetectedFormat
 		wantCount   int
-		wantPreview string // golden — exact pre-existing redaction output
+		wantPreview string // golden - exact pre-existing redaction output
 	}{
 		{
 			name:        "json with secret-bearing key",
@@ -349,7 +349,7 @@ func TestDetectFormat_PEMPrivateKeys(t *testing.T) {
 		{"pgp", armor("BEGIN PGP PRIVATE KEY BLOCK"), ""},
 		{"lowercase_armor", armor("begin rsa private key"), ""},
 		// Embedded mid-dump: the armor is not at offset zero, and the
-		// Content-Type would otherwise classify HTML — the PEM scan must
+		// Content-Type would otherwise classify HTML - the PEM scan must
 		// pre-empt the Content-Type fast path or redactHTML would keep the
 		// key bytes as visible text.
 		{"embedded_in_html_error_dump", "<html><pre>stack trace:\n" + armor("BEGIN RSA PRIVATE KEY") + "</pre></html>", "text/html"},
@@ -370,7 +370,7 @@ func TestDetectFormat_PEMPrivateKeys(t *testing.T) {
 	t.Run("certificate_is_not_pem", func(t *testing.T) {
 		format, _ := detectFormat([]byte(armor("BEGIN CERTIFICATE")), "")
 		if format == FormatPEM {
-			t.Fatalf("BEGIN CERTIFICATE classified as FormatPEM — public certs must not count as key disclosure")
+			t.Fatalf("BEGIN CERTIFICATE classified as FormatPEM - public certs must not count as key disclosure")
 		}
 	})
 }
@@ -382,7 +382,7 @@ func TestClassifyAndRedact_PEMFailClosed(t *testing.T) {
 		t.Fatalf("Format = %q, want %q", a.Format, FormatPEM)
 	}
 	if a.redactedPreview != "" {
-		t.Errorf("PEM body produced a preview: %q — key material must never be previewed", a.redactedPreview)
+		t.Errorf("PEM body produced a preview: %q - key material must never be previewed", a.redactedPreview)
 	}
 	if a.RedactionConfidence != ConfidenceNone {
 		t.Errorf("RedactionConfidence = %q, want %q (dual gate must withhold the preview)", a.RedactionConfidence, ConfidenceNone)
@@ -396,7 +396,7 @@ func TestClassifyAndRedact_PEMFailClosed(t *testing.T) {
 }
 
 func TestClassifyAndRedact_FailClosedPathsCountZero(t *testing.T) {
-	// Empty body, binary body, unknown format — redaction never runs,
+	// Empty body, binary body, unknown format - redaction never runs,
 	// SensitiveRedactions stays 0.
 	for _, tc := range []struct {
 		name        string

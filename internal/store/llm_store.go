@@ -13,13 +13,13 @@ import (
 // LLM Decision Audit Trail
 // =============================================================================
 //
-// Every LLM call gets recorded here — the input, the output, and what Observer
+// Every LLM call gets recorded here - the input, the output, and what Observer
 // did because of it. This is the foundation for:
 //
-//   1. Surgical corrections — find the bad call, delete the pattern, done
-//   2. Blast radius analysis — how many downstream matches did this cause?
-//   3. Prompt/model debugging — was this the old nano or the new mini?
-//   4. Future fine-tuning — human-corrected decisions become training data
+//   1. Surgical corrections - find the bad call, delete the pattern, done
+//   2. Blast radius analysis - how many downstream matches did this cause?
+//   3. Prompt/model debugging - was this the old nano or the new mini?
+//   4. Future fine-tuning - human-corrected decisions become training data
 //
 // IMMUTABILITY RULE (design consensus):
 //   The LLM's original response is NEVER modified. Human corrections are
@@ -51,7 +51,7 @@ type LLMDecision struct {
 	EvidenceType    string `json:"evidence_content_type,omitempty"`
 	EvidenceHash    string `json:"evidence_body_hash,omitempty"`
 
-	// LLM output (immutable — never edit this)
+	// LLM output (immutable - never edit this)
 	LLMResponseRaw string  `json:"llm_response_raw"` // full JSON string
 	Classification string  `json:"classification"`
 	Action         string  `json:"action"`
@@ -75,7 +75,7 @@ type LLMDecision struct {
 	PromptVersion string `json:"prompt_version,omitempty"` // hash or label
 	CodeVersion   string `json:"code_version,omitempty"`   // Observer version
 
-	// Human review (gold layer — populated later via API)
+	// Human review (gold layer - populated later via API)
 	ReviewStatus       string `json:"review_status"` // pending, confirmed, corrected, ignored
 	ReviewedBy         string `json:"reviewed_by,omitempty"`
 	ReviewedAt         string `json:"reviewed_at,omitempty"`
@@ -446,7 +446,7 @@ func (s *Store) GetLLMDecisionCounts(ctx context.Context) (*LLMDecisionCounts, e
 }
 
 // PruneLLMDecisions removes old unreviewed decisions.
-// Human-reviewed decisions are never auto-pruned — they're the gold dataset.
+// Human-reviewed decisions are never auto-pruned - they're the gold dataset.
 func (s *Store) PruneLLMDecisions(ctx context.Context, unreviwedTTL time.Duration) error {
 	cutoff := time.Now().Add(-unreviwedTTL).Format(time.RFC3339)
 	result, err := s.db.ExecContext(ctx,

@@ -14,7 +14,7 @@ import (
 )
 
 // =============================================================================
-// Network Namespace Capture — Seeing Inside Container Namespaces
+// Network Namespace Capture - Seeing Inside Container Namespaces
 // =============================================================================
 //
 // WHY THIS EXISTS:
@@ -22,29 +22,29 @@ import (
 //   Docker's virtual network namespaces. It never touches the host's network
 //   stack. An AF_PACKET socket on the host sees nothing.
 //
-//   Multi-node Swarm uses VXLAN tunnels visible on the host — v0.12 handles that.
+//   Multi-node Swarm uses VXLAN tunnels visible on the host - v0.12 handles that.
 //   Single-node Swarm uses kernel veth pairs that route traffic entirely within
-//   the container network namespace — invisible from the host.
+//   the container network namespace - invisible from the host.
 //
 // HOW IT WORKS:
 //   1. Find the reverse proxy container's PID via Docker API
 //   2. Open /proc/<PID>/ns/net (the container's network namespace)
 //   3. Enter that namespace with setns(CLONE_NEWNET)
-//   4. Create the AF_PACKET socket — it binds to the container's network stack
+//   4. Create the AF_PACKET socket - it binds to the container's network stack
 //   5. Return to the host namespace
 //   6. The socket fd is now usable from any goroutine, but it sees the
 //      container's network traffic (nginx ↔ backend HTTP)
 //
 // DESIGN PRINCIPLE:
 //   Still Linux-boundary. No container modifications, no app config changes.
-//   We're using /proc and setns — standard Linux kernel interfaces.
+//   We're using /proc and setns - standard Linux kernel interfaces.
 //   Works with any container runtime that exposes /proc/<PID>/ns/net.
 //
 // THREAD SAFETY:
 //   setns() affects the calling OS thread, not the Go goroutine. We use
 //   runtime.LockOSThread() to pin the goroutine during the namespace switch,
 //   then unlock after returning to the host namespace. The socket fd survives
-//   the switch — once created, it's bound to the namespace it was born in.
+//   the switch - once created, it's bound to the namespace it was born in.
 
 const (
 	// SYS_SETNS is the syscall number for setns on amd64 Linux.
@@ -66,7 +66,7 @@ func setns(fd int, nstype int) error {
 }
 
 // openSocketInNamespace creates an AF_PACKET raw socket inside a container's
-// network namespace. The socket sees the container's network traffic — including
+// network namespace. The socket sees the container's network traffic - including
 // plaintext HTTP between reverse proxy and backend containers on overlay networks.
 //
 // The returned fd is usable from any goroutine after this function returns.
@@ -77,7 +77,7 @@ func setns(fd int, nstype int) error {
 // network namespace but keep the host's user namespace / capabilities).
 func openSocketInNamespace(pid int) (int, error) {
 	// Pin this goroutine to a single OS thread. setns affects the thread,
-	// not the goroutine — without pinning, Go's scheduler could move us
+	// not the goroutine - without pinning, Go's scheduler could move us
 	// to a different thread between setns and socket creation.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -102,11 +102,11 @@ func openSocketInNamespace(pid int) (int, error) {
 		return -1, fmt.Errorf("entering container namespace (PID %d): %w", pid, err)
 	}
 
-	// Create the AF_PACKET socket — this is now inside the container's namespace.
+	// Create the AF_PACKET socket - this is now inside the container's namespace.
 	// It will see the container's network interfaces (eth0, eth1, lo).
 	// ETH_P_ALL (0x0003) captures BOTH incoming AND outgoing packets.
 	// Critical for namespace capture: nginx's outgoing proxy requests to
-	// backend containers are outgoing packets — invisible with ETH_P_IP.
+	// backend containers are outgoing packets - invisible with ETH_P_IP.
 	// See sniffer.go openSocket() comment for full rationale.
 	fd, sockErr := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(0x0003)))
 
@@ -114,7 +114,7 @@ func openSocketInNamespace(pid int) (int, error) {
 	// If we don't, this OS thread stays in the container namespace and
 	// any goroutine scheduled on it would be in the wrong namespace.
 	if err := setns(int(hostNS.Fd()), cloneNewnet); err != nil {
-		// This is catastrophic — the thread is stuck in the wrong namespace.
+		// This is catastrophic - the thread is stuck in the wrong namespace.
 		// Close the socket if we got one, and report the error.
 		if fd >= 0 {
 			syscall.Close(fd)
@@ -212,7 +212,7 @@ func findContainerPID(dockerSocket, namePattern string) (*containerInfo, error) 
 
 // inspectContainerPID resolves a container's host-namespace PID by its exact
 // container ID (GET /containers/<id>/json → State.Pid). Auto-detect mode calls
-// this directly with the discovery inventory's container ID, which is precise —
+// this directly with the discovery inventory's container ID, which is precise -
 // substring name matching could resolve the wrong container.
 func inspectContainerPID(dockerSocket, id, name string) (*containerInfo, error) {
 	client := newDockerClient(dockerSocket)

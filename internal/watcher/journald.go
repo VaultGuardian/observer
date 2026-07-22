@@ -23,7 +23,7 @@ type journalEntry struct {
 	UID               string `json:"_UID"`
 	RealtimeTimestamp string `json:"__REALTIME_TIMESTAMP"` // microseconds since epoch
 
-	// Transport — how the message reached journald
+	// Transport - how the message reached journald
 	Transport string `json:"_TRANSPORT"` // "syslog", "journal", "stdout", "kernel"
 
 	// Process info
@@ -44,14 +44,14 @@ type journalEntry struct {
 // An attacker can spoof SYSLOG_IDENTIFIER but cannot spoof _SYSTEMD_UNIT,
 // which the kernel attaches.
 var defaultNoiseUnits = map[string]bool{
-	"systemd-resolved":    true, // DNS resolver — constant chatter
-	"systemd-timesyncd":   true, // NTP sync — periodic, harmless
-	"systemd-networkd":    true, // Network config — startup noise
-	"systemd-logind":      true, // Session tracking — noisy on multi-user
+	"systemd-resolved":    true, // DNS resolver - constant chatter
+	"systemd-timesyncd":   true, // NTP sync - periodic, harmless
+	"systemd-networkd":    true, // Network config - startup noise
+	"systemd-logind":      true, // Session tracking - noisy on multi-user
 	"systemd-journald":    true, // Journal rotation messages
 	"systemd-udevd":       true, // Device events
 	"snapd":               true, // Snap daemon (if present)
-	"cron":                true, // Cron job execution — predictable
+	"cron":                true, // Cron job execution - predictable
 	"anacron":             true, // Delayed cron
 	"dbus-daemon":         true, // D-Bus system messages
 	"polkitd":             true, // PolicyKit auth agent
@@ -66,7 +66,7 @@ var defaultNoiseUnits = map[string]bool{
 }
 
 // JournaldWatcher streams entries from systemd journal via journalctl subprocess.
-// Zero CGO, zero dependencies — works on any Linux box with journalctl.
+// Zero CGO, zero dependencies - works on any Linux box with journalctl.
 type JournaldWatcher struct {
 	handler      LogHandler
 	excludeUnits map[string]bool // all keys stored lowercase
@@ -137,7 +137,7 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 	log.Println("[journald] Streaming journal entries...")
 
 	scanner := bufio.NewScanner(stdout)
-	// Journal entries can be large (kernel dumps, etc.) — increase buffer.
+	// Journal entries can be large (kernel dumps, etc.) - increase buffer.
 	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
 
 	for scanner.Scan() {
@@ -149,7 +149,7 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 		var entry journalEntry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			// Some journal entries have binary data that doesn't marshal cleanly.
-			// Skip silently — these are almost never security-relevant.
+			// Skip silently - these are almost never security-relevant.
 			continue
 		}
 
@@ -167,7 +167,7 @@ func (j *JournaldWatcher) stream(ctx context.Context) error {
 			continue
 		}
 
-		// Identify the source — SYSLOG_IDENTIFIER is the cleanest identifier.
+		// Identify the source - SYSLOG_IDENTIFIER is the cleanest identifier.
 		// Falls back to _COMM (process name) if identifier isn't set.
 		sourceName := entry.SyslogIdentifier
 		if sourceName == "" {

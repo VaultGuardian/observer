@@ -13,13 +13,13 @@ import (
 )
 
 // =============================================================================
-// Docker public-container discovery (Session 2 — DRY-RUN inventory)
+// Docker public-container discovery (Session 2 - DRY-RUN inventory)
 // =============================================================================
 //
 // This file is observability-only. It queries Docker for running containers,
 // classifies which are publicly reachable (published TCP ports), and logs an
 // inventory of what Session 3 WILL eventually monitor. It opens NO sockets and
-// starts NO sniffers — capture behavior is unchanged in every mode.
+// starts NO sniffers - capture behavior is unchanged in every mode.
 //
 // The fetch (HTTP) and classify (pure) steps are split so the heuristic is
 // unit-testable from a fixture payload with no Docker socket.
@@ -43,7 +43,7 @@ type dockerContainer struct {
 }
 
 // tcpPublish records one published TCP port: the host side (PublicPort) and the
-// container side (PrivatePort). They can differ — Docker can map host 3000 →
+// container side (PrivatePort). They can differ - Docker can map host 3000 →
 // container 80. Session 3 seeds its in-namespace sniffer with the PrivatePort,
 // since REC inside the namespace sees the container port, not the host mapping.
 type tcpPublish struct {
@@ -66,7 +66,7 @@ type skippedContainer struct {
 	Reason string // "no published TCP ports" | "loopback-only publish"
 }
 
-// discoveryInventory is the classified result — a preview of what Session 3 would monitor.
+// discoveryInventory is the classified result - a preview of what Session 3 would monitor.
 type discoveryInventory struct {
 	TotalRunning int
 	Public       []publicContainer  // externally-reachable TCP, not excluded
@@ -85,7 +85,7 @@ func baseName(name string) string {
 	return name
 }
 
-// normalizeName is baseName lowercased — the canonical key for exclude matching.
+// normalizeName is baseName lowercased - the canonical key for exclude matching.
 // Both the container name and each REC_EXCLUDE_CONTAINERS entry pass through it,
 // so "captain-captain", "captain-captain.1.hjf...", and "Captain-Captain" all
 // resolve to the same key. These are the exclusion semantics Session 3 inherits.
@@ -221,7 +221,7 @@ func classifyContainers(containers []dockerContainer, exclude map[string]bool) d
 
 // logInventory emits the [rec]-prefixed startup inventory.
 func logInventory(inv discoveryInventory) {
-	log.Printf("[rec] Discovery (dry-run): %d running containers — %d public-facing TCP, %d excluded, %d skipped",
+	log.Printf("[rec] Discovery (dry-run): %d running containers - %d public-facing TCP, %d excluded, %d skipped",
 		inv.TotalRunning, len(inv.Public), len(inv.Excluded), len(inv.Skipped))
 	for _, pc := range inv.Public {
 		log.Printf("[rec]   public-facing: %s → %s", pc.Name, formatPublishes(pc.Ports))
@@ -235,7 +235,7 @@ func logInventory(inv discoveryInventory) {
 	log.Printf("[rec] Opening a namespace capture per public-facing container above (excluded/skipped are not monitored).")
 }
 
-// privatePorts returns the container-side TCP ports of a public container — the
+// privatePorts returns the container-side TCP ports of a public container - the
 // ports REC sees from inside the namespace (e.g. captain-captain's 80, not host 3000).
 // Duplicates are dropped (Docker lists one Port entry per host binding, so a
 // container published on both IPv4 and IPv6 yields two entries with the same

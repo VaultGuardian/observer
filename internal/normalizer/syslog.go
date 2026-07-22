@@ -14,7 +14,7 @@ import (
 // This normalizer strips the syslog envelope (timestamp, hostname, service[PID])
 // to expose the raw message, then applies generic variable stripping.
 // For services with their own normalizer (sshd, nginx), the Registry
-// will route to those instead — this handles everything else.
+// will route to those instead - this handles everything else.
 type SyslogNormalizer struct {
 	generic GenericNormalizer
 }

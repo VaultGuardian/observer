@@ -16,87 +16,87 @@ func TestIsFailedProbe_NginxErrorFileNotFound(t *testing.T) {
 		desc       string
 	}{
 		{
-			name:       "phpunit scanner spray — clean path, file not found",
+			name:       "phpunit scanner spray - clean path, file not found",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/www/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /www/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "THE BIG ONE — 20+ emails from phpunit spray should be suppressed",
+			desc:       "THE BIG ONE - 20+ emails from phpunit spray should be suppressed",
 		},
 		{
-			name:       "phpunit different prefix — api path",
+			name:       "phpunit different prefix - api path",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/api/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /api/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php HTTP/1.1", host: "example.com"`,
 			suppress:   true,
 			desc:       "same scanner, different prefix",
 		},
 		{
-			name:       "random php probe — file not found",
+			name:       "random php probe - file not found",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/x.php" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /x.php HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "webshell hunting — clean path, file not found",
+			desc:       "webshell hunting - clean path, file not found",
 		},
 		{
-			name:       "mcp probe — file not found",
+			name:       "mcp probe - file not found",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/mcp" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "POST /mcp HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "MCP server scanning — no sensitive path, no payload",
+			desc:       "MCP server scanning - no sensitive path, no payload",
 		},
 		// === v0.47 policy override: sensitive paths now suppress ===
 		// (previously: not suppressed, sent to LLM for sensitive-path classification)
 		// Failed = failed. Probe intelligence preserved via Verdict: "recon" findings,
 		// not by surfacing as orange/alert on main dashboard.
 		{
-			name:       ".env probe — sensitive path",
+			name:       ".env probe - sensitive path",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/.env" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /.env HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       ".env probe failed — suppress (policy override)",
+			desc:       ".env probe failed - suppress (policy override)",
 		},
 		{
-			name:       ".git probe — sensitive path",
+			name:       ".git probe - sensitive path",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/.git/config" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /.git/config HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       ".git probe failed — suppress (policy override)",
+			desc:       ".git probe failed - suppress (policy override)",
 		},
 		{
 			name:       "containers/json Docker API probe",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/containers/json" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /containers/json HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "containers/json probe failed — suppress (policy override)",
+			desc:       "containers/json probe failed - suppress (policy override)",
 		},
 		{
 			name:       "ThinkPHP exploit with attack payload",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/index.php" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "POST /index.php?s=/index/\think\app/invokefunction&function=call_user_func_array&vars[0]=system&vars[1][]=id HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "attack payload + failed status — still a failed probe (policy override)",
+			desc:       "attack payload + failed status - still a failed probe (policy override)",
 		},
 		{
-			name:       "path traversal — failed probe",
+			name:       "path traversal - failed probe",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/something" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /../../etc/passwd HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "path traversal in failed request — suppress (policy override)",
+			desc:       "path traversal in failed request - suppress (policy override)",
 		},
 		{
-			name:       "wp-admin probe — sensitive path",
+			name:       "wp-admin probe - sensitive path",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/wp-admin/setup-config.php" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /wp-admin/setup-config.php HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "wp-admin probe failed — suppress (policy override)",
+			desc:       "wp-admin probe failed - suppress (policy override)",
 		},
 		{
-			name:       "actuator probe — sensitive path",
+			name:       "actuator probe - sensitive path",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/actuator/health" failed (2: No such file or directory), client: <CLIENT>, server: _, request: "GET /actuator/health HTTP/1.1", host: "example.com"`,
 			suppress:   true,
-			desc:       "actuator probe failed — suppress (policy override)",
+			desc:       "actuator probe failed - suppress (policy override)",
 		},
 		// === Non-matching lines ===
 		{
-			name:       "permission denied — NOT file not found",
+			name:       "permission denied - NOT file not found",
 			normalized: `[error] <PID>: *<CONN> open() "/usr/share/nginx/default/secret" failed (13: Permission denied), client: <CLIENT>, server: _, request: "GET /secret HTTP/1.1"`,
 			suppress:   false,
-			desc:       "Permission denied is not 'file not found' — regex doesn't match",
+			desc:       "Permission denied is not 'file not found' - regex doesn't match",
 		},
 		{
 			name:       "not an nginx error line",
 			normalized: `api.example.com GET /some/path HTTP/2.0 200`,
 			suppress:   false,
-			desc:       "access log with 200 — not a failed probe",
+			desc:       "access log with 200 - not a failed probe",
 		},
 	}
 
@@ -133,7 +133,7 @@ func TestIsFailedProbe_AccessLogFormat(t *testing.T) {
 		{"401 auth required", `api.example.com GET /admin HTTP/2.0 401`, false},
 
 		// SUPPRESSED: failed-status probes regardless of payload shape
-		// (v0.47 policy override of v0.16 March 24 decision — failed = failed,
+		// (v0.47 policy override of v0.16 March 24 decision - failed = failed,
 		// no escapes for sensitive paths or attack indicators on failed probes)
 		{"SQL injection 404", `api.example.com GET /?q=UNION+SELECT+1,2,3 HTTP/2.0 404`, true},
 		{"path traversal 404", `api.example.com GET /../../etc/passwd HTTP/2.0 404`, true},
@@ -275,7 +275,7 @@ func TestHasSensitivePath(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Structural HTTP Parser
+// v0.47 - Structural HTTP Parser
 // =============================================================================
 
 func TestParseHTTPIdentity_StandardFormats(t *testing.T) {
@@ -359,7 +359,7 @@ func TestParseHTTPIdentity_StandardFormats(t *testing.T) {
 	}
 }
 
-// TestParseHTTPIdentity_SpoofingDefense — attacker-controlled content in the
+// TestParseHTTPIdentity_SpoofingDefense - attacker-controlled content in the
 // path must not trick the parser into reporting a fake status. The OLD loose
 // `HTTP/\S+\s+(\d{3})` regex would match the first "HTTP/X NNN" anywhere in
 // the line. The structural parser anchors to ^ (Format 1, 3) or to the literal
@@ -371,7 +371,7 @@ func TestParseHTTPIdentity_SpoofingDefense(t *testing.T) {
 		line           string
 		wantStatusCode string
 		// note: we do NOT require any particular method/path on spoofing
-		// rejections — the parser may return zero values entirely. We only
+		// rejections - the parser may return zero values entirely. We only
 		// require that when it DOES return a status, it is the structurally
 		// correct one (the actual response status), never a spoofed one.
 	}{
@@ -403,7 +403,7 @@ func TestParseHTTPIdentity_SpoofingDefense(t *testing.T) {
 			// Application log mentions "HTTP/1.1 404" in prose. OLD loose regex
 			// would have matched and suppressed; structural parser fails to
 			// anchor on any of Format 1/2/3 and returns zero values.
-			line:           `[WARN] upstream service returned HTTP/1.1 404 — falling back`,
+			line:           `[WARN] upstream service returned HTTP/1.1 404 - falling back`,
 			wantStatusCode: "",
 		},
 		{
@@ -426,7 +426,7 @@ func TestParseHTTPIdentity_SpoofingDefense(t *testing.T) {
 	}
 }
 
-// TestIsFailedProbe_RegexSpoofingDefense — end-to-end regression that
+// TestIsFailedProbe_RegexSpoofingDefense - end-to-end regression that
 // the spoofing attack class cannot trick the deterministic suppression
 // gate into suppressing a successful exploit (HTTP 200 with attack payload).
 //
@@ -442,22 +442,22 @@ func TestIsFailedProbe_RegexSpoofingDefense(t *testing.T) {
 		desc     string
 	}{
 		{
-			name:     "200 with HTTP-shaped param — must not suppress",
+			name:     "200 with HTTP-shaped param - must not suppress",
 			line:     `api.example.com GET /api?fake=HTTP/1.1+404 HTTP/2.0 200`,
 			suppress: false,
 			desc:     "OLD loose regex would have matched the injected 404 and suppressed; structural parser sees the real 200 status",
 		},
 		{
-			name:     "quoted 200 with HTTP-shaped param — must not suppress",
+			name:     "quoted 200 with HTTP-shaped param - must not suppress",
 			line:     `1.2.3.4 - - [date] "GET /api?fake=HTTP/1.1+404 HTTP/1.1" 200 1234`,
 			suppress: false,
 			desc:     "Format 2 with closing-quote anchor must read real status 200, not injected 404",
 		},
 		{
-			name:     "bare format with HTTP-shaped param — must not suppress",
+			name:     "bare format with HTTP-shaped param - must not suppress",
 			line:     `GET /api?ref=HTTP/1.1+404 HTTP/1.1 200`,
 			suppress: false,
-			desc:     "Bare format anchored to ^ — path consumed greedily up to whitespace, real status 200 read structurally; OLD loose regex would have matched injected 404",
+			desc:     "Bare format anchored to ^ - path consumed greedily up to whitespace, real status 200 read structurally; OLD loose regex would have matched injected 404",
 		},
 	}
 
@@ -473,7 +473,7 @@ func TestIsFailedProbe_RegexSpoofingDefense(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — URL-Decoded Attack Indicators
+// v0.47 - URL-Decoded Attack Indicators
 // =============================================================================
 
 func TestHasAttackIndicators_URLEncoded(t *testing.T) {
@@ -545,7 +545,7 @@ func TestHasAttackIndicators_URLEncoded(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — High-Risk Disclosure Detection
+// v0.47 - High-Risk Disclosure Detection
 // =============================================================================
 
 // TestContainsHighRiskDisclosure validates the helper directly.
@@ -634,27 +634,27 @@ func TestIsOperationalNoise_HighRiskDisclosureOverride(t *testing.T) {
 
 		// === Negative: ordinary noise-shaped lines still suppressed ===
 		{
-			name:    "java NPE caused-by — still noise",
+			name:    "java NPE caused-by - still noise",
 			line:    "Caused by: java.lang.NullPointerException at line 42",
 			isNoise: true,
 		},
 		{
-			name:    "node stack frame benign — still noise",
+			name:    "node stack frame benign - still noise",
 			line:    "    at handleRequest (/app/index.js:42:7)",
 			isNoise: true,
 		},
 		{
-			name:    "java stack frame benign — still noise",
+			name:    "java stack frame benign - still noise",
 			line:    "\tat com.example.Service.handle(Service.java:88)",
 			isNoise: true,
 		},
 		{
-			name:    "python traceback header — still noise",
+			name:    "python traceback header - still noise",
 			line:    "Traceback (most recent call last):",
 			isNoise: true,
 		},
 		{
-			name:    "go panic line — still noise",
+			name:    "go panic line - still noise",
 			line:    "goroutine 1 [running]:",
 			isNoise: true,
 		},
@@ -674,8 +674,8 @@ func TestIsOperationalNoise_HighRiskDisclosureOverride(t *testing.T) {
 // high-risk disclosure strings are NEVER suppressed as failed probes, even
 // when the line embeds a quoted request shape with a failed status code.
 //
-// This guards the same semantic rule as the noise-filter override —
-// "high-risk disclosure bypasses all deterministic suppression" — at the
+// This guards the same semantic rule as the noise-filter override -
+// "high-risk disclosure bypasses all deterministic suppression" - at the
 // SECOND deterministic gate. Note: without this guard, a line
 // like:
 //
@@ -693,7 +693,7 @@ func TestIsFailedProbe_HighRiskDisclosureOverride(t *testing.T) {
 		name string
 		line string
 		// suppress=true means isFailedProbe says "deterministic suppress"
-		// — which would be WRONG for any of these disclosure-bearing lines.
+		// - which would be WRONG for any of these disclosure-bearing lines.
 		// All entries below set suppress=false.
 		suppress bool
 	}{
@@ -719,14 +719,14 @@ func TestIsFailedProbe_HighRiskDisclosureOverride(t *testing.T) {
 			suppress: false,
 		},
 
-		// === Negative: ordinary failed probe (no disclosure) — still suppressed ===
+		// === Negative: ordinary failed probe (no disclosure) - still suppressed ===
 		{
-			name:     "ordinary clean 404 — still suppressed",
+			name:     "ordinary clean 404 - still suppressed",
 			line:     `1.2.3.4 - - [date] "GET /random HTTP/1.1" 404 0`,
 			suppress: true,
 		},
 		{
-			name:     "ordinary clean 403 — still suppressed",
+			name:     "ordinary clean 403 - still suppressed",
 			line:     `api.example.com GET /forbidden HTTP/2.0 403`,
 			suppress: true,
 		},
@@ -744,7 +744,7 @@ func TestIsFailedProbe_HighRiskDisclosureOverride(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Forgiving URL Decode
+// v0.47 - Forgiving URL Decode
 // =============================================================================
 
 // TestForgivingURLDecode validates that the byte-level decoder tolerates
@@ -763,7 +763,7 @@ func TestForgivingURLDecode(t *testing.T) {
 		{"plus to space", "hello+world", "hello world"},
 		{"mixed", "a+b%2cc", "a b,c"},
 
-		// Malformed forms — pass through, do NOT discard the rest
+		// Malformed forms - pass through, do NOT discard the rest
 		{"trailing %zz", "%3cscript%3e&garbage=%zz", "<script>&garbage=%zz"},
 		{"leading %zz", "%zz%3cscript%3e", "%zz<script>"},
 		{"middle %zz", "before%zzafter", "before%zzafter"},
@@ -787,7 +787,7 @@ func TestForgivingURLDecode(t *testing.T) {
 	}
 }
 
-// TestHasAttackIndicators_MalformedDecodeBypass — the bonus zero-day.
+// TestHasAttackIndicators_MalformedDecodeBypass - the bonus zero-day.
 // An encoded payload paired with a malformed percent-triplet elsewhere in
 // the string would cause stdlib url.QueryUnescape to error out and leave
 // the encoded payload undetected. The forgiving decoder must catch it.
@@ -813,12 +813,12 @@ func TestHasAttackIndicators_MalformedDecodeBypass(t *testing.T) {
 			want:    true,
 		},
 		{
-			name:    "benign request with malformed escape — must NOT trigger",
+			name:    "benign request with malformed escape - must NOT trigger",
 			request: "/search?q=hello+world&debug=%zz",
 			want:    false,
 		},
 		{
-			name:    "benign UTF-8 + malformed escape — must NOT trigger",
+			name:    "benign UTF-8 + malformed escape - must NOT trigger",
 			request: "/search?q=%E2%9C%93&debug=%xx",
 			want:    false,
 		},
@@ -835,7 +835,7 @@ func TestHasAttackIndicators_MalformedDecodeBypass(t *testing.T) {
 }
 
 // =============================================================================
-// v0.47 — Disclosure Learning Guard
+// v0.47 - Disclosure Learning Guard
 // =============================================================================
 
 // TestLearnFromVerdict_DisclosureRefusal validates that learnFromVerdict
@@ -851,7 +851,7 @@ func TestHasAttackIndicators_MalformedDecodeBypass(t *testing.T) {
 // churn on every recurrence (correct security outcome, wasteful operationally).
 //
 // Note: this is a unit test of the guard's input shape. We don't construct a
-// full Analyzer here — we use the helper directly because that's where the
+// full Analyzer here - we use the helper directly because that's where the
 // rule lives. Integration testing happens in real soak.
 func TestContainsHighRiskDisclosure_LearnGuardInputs(t *testing.T) {
 	// These are the line shapes that learnFromVerdict will refuse on

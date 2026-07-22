@@ -20,17 +20,17 @@ import (
 //   - Coordinator correlation keys (nginx + backend → same investigation)
 //   - REC evidence lookup (match captured response to the right request)
 //
-// Format 1 — Hostname-prefixed (CapRover nginx normalizer):
+// Format 1 - Hostname-prefixed (CapRover nginx normalizer):
 //   "api.admin.kovicloud.com GET /?q=UNION+SELECT HTTP/2.0 200"
 //
-// Format 2 — Quoted request line (generic normalizer):
+// Format 2 - Quoted request line (generic normalizer):
 //   `<IP> - - [<TS>] "GET /?q=UNION+SELECT HTTP/1.0" 200 <NUM>`
 //
-// Format 3 — Bare (no hostname, no quotes):
+// Format 3 - Bare (no hostname, no quotes):
 //   "GET /?q=UNION+SELECT+1,2,3 HTTP/1.0 200"
 //
 // =============================================================================
-// NORMALIZED vs RAW — why we have two parsers (P0 fix, design consensus)
+// NORMALIZED vs RAW - why we have two parsers (P0 fix, design consensus)
 // =============================================================================
 //
 // The generic/Docker normalizer applies `\b\d{4,}\b -> <NUM>` GLOBALLY on the
@@ -52,39 +52,39 @@ import (
 
 var httpMethods = `GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE`
 
-// reNormalizedHTTPHosted matches Format 1 — hostname prefix + method + path + status.
+// reNormalizedHTTPHosted matches Format 1 - hostname prefix + method + path + status.
 var reNormalizedHTTPHosted = regexp.MustCompile(
 	`^(\S+)\s+(` + httpMethods + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// reNormalizedHTTPQuoted matches Format 2 — method + path inside quotes, status after.
+// reNormalizedHTTPQuoted matches Format 2 - method + path inside quotes, status after.
 var reNormalizedHTTPQuoted = regexp.MustCompile(
 	`"(` + httpMethods + `)\s+(\S+)\s+HTTP/\S+"\s+(\d{3})`)
 
-// reNormalizedHTTPBare matches Format 3 — method at start of line, no quotes.
+// reNormalizedHTTPBare matches Format 3 - method at start of line, no quotes.
 var reNormalizedHTTPBare = regexp.MustCompile(
 	`^(` + httpMethods + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// reMorganHTTP matches Format 4 — Express/morgan access logs, as emitted by
+// reMorganHTTP matches Format 4 - Express/morgan access logs, as emitted by
 // CapRover's captain-captain backend:
 //
 //	GET /api/keys 200 0.563 ms - 83
 //
 // Unlike Formats 1–3 there is NO "HTTP/x.x" token and the status code follows
 // the path directly. The matcher is deliberately STRICT to the observed
-// production shape — status, integer-or-decimal response time, "ms", and a
+// production shape - status, integer-or-decimal response time, "ms", and a
 // trailing byte count (or "-" when unknown). It does NOT support colorized/dev
 // morgan output. Requiring the full "<status> <time> ms - <bytes|->" tail is
 // what keeps this from firing on arbitrary "METHOD path 200 ..." lines.
 //
 // Tried only AFTER the HTTP/x.x parsers, so nginx-format lines never reach it.
-// Host stays empty — a morgan line carries no host; buffer.Lookup skips the
+// Host stays empty - a morgan line carries no host; buffer.Lookup skips the
 // host filter when req.Host=="" so these events still correlate on
 // method+path+status+time-window.
 //
-// KEEP IN SYNC with reHTTPMorgan in internal/analyzer (parseHTTPIdentity) —
+// KEEP IN SYNC with reHTTPMorgan in internal/analyzer (parseHTTPIdentity) -
 // this parser decides an event IS HTTP for routing/REC, the analyzer's twin
 // drives the T1 malicious clamp and the learning gates. If they drift,
-// morgan lines route as HTTP but escape the clamp — LLM-malicious with no
+// morgan lines route as HTTP but escape the clamp - LLM-malicious with no
 // evidence, the exact gap Format 4 parity closes.
 var reMorganHTTP = regexp.MustCompile(
 	`^(` + httpMethods + `)\s+(\S+)\s+(\d{3})\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+|-)`)
@@ -119,7 +119,7 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 		return m[1], m[2], "", code
 	}
 
-	// Format 4: Express/morgan (captain-captain) — fallback, no HTTP/x.x token.
+	// Format 4: Express/morgan (captain-captain) - fallback, no HTTP/x.x token.
 	if m := reMorganHTTP.FindStringSubmatch(normalized); m != nil {
 		code, _ := strconv.Atoi(m[3])
 		return m[1], m[2], "", code
@@ -130,14 +130,14 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 
 // parseRawHTTPLine extracts HTTP components from a RAW (pre-normalization)
 // log line. Used for REC evidence lookup, which requires the literal path
-// the client sent on the wire — including any numeric values that the
+// the client sent on the wire - including any numeric values that the
 // generic/Docker normalizer would substitute with <NUM>.
 //
 // Tries Format 2 (quoted request line) and Format 3 (bare). Format 1
-// (hostname-prefixed) does NOT occur in raw logs — it is produced by the
+// (hostname-prefixed) does NOT occur in raw logs - it is produced by the
 // nginx normalizer prepending the resolved vhost to the request line.
 //
-// Returns method, path (with query string, RAW), host (always empty — raw
+// Returns method, path (with query string, RAW), host (always empty - raw
 // access logs do not carry the resolved vhost in a position we can extract
 // generically), and statusCode. Returns zero values for non-HTTP logs.
 //
@@ -146,13 +146,13 @@ func parseNormalizedLine(normalized string) (method, path, host string, statusCo
 // parseNormalizedLine" is what feeds REC's LookupRequest.
 func parseRawHTTPLine(raw string) (method, path, host string, statusCode int) {
 	// Format 2: quoted request line (covers raw nginx access log AND raw
-	// generic backend access log — both wrap the request line in quotes).
+	// generic backend access log - both wrap the request line in quotes).
 	if m := reNormalizedHTTPQuoted.FindStringSubmatch(raw); m != nil {
 		code, _ := strconv.Atoi(m[3])
 		return m[1], m[2], "", code
 	}
 
-	// Format 3: bare (rare — some custom containers emit "METHOD path HTTP/x" directly).
+	// Format 3: bare (rare - some custom containers emit "METHOD path HTTP/x" directly).
 	if m := reNormalizedHTTPBare.FindStringSubmatch(raw); m != nil {
 		code, _ := strconv.Atoi(m[3])
 		return m[1], m[2], "", code
@@ -220,7 +220,7 @@ func extractResponseBytes(rawLine string) int64 {
 //
 // canonicalPath applies the same number replacement so both containers produce
 // the same coordinator key. This does NOT affect normalizer output, hash stability,
-// or classification — only the coordinator's correlation key.
+// or classification - only the coordinator's correlation key.
 var reCanonicalNumbers = regexp.MustCompile(`\b\d{4,}\b`)
 
 func canonicalPath(path string) string {
@@ -232,7 +232,7 @@ func canonicalPath(path string) string {
 // status-aware routing in routeAlert() to short-circuit repeat probes.
 //
 // Conservative first cut: 403/404/405/410 only.
-// 400 excluded — revisit after watching production logs.
+// 400 excluded - revisit after watching production logs.
 // 200/3xx/5xx/unknown always route to coordinator for REC/T2 evidence.
 func statusCodeRejectsAttack(code int) bool {
 	switch code {
@@ -244,12 +244,12 @@ func statusCodeRejectsAttack(code int) bool {
 
 // deterministicDisclosure is the shared tier-1 predicate for the disclosure
 // gate (P0 fix, Jul 2026), used by BOTH the evidence-check callback in main.go
-// and the cache-hit status shortcut in resultrouter.go — one helper so the two
+// and the cache-hit status shortcut in resultrouter.go - one helper so the two
 // gates cannot drift.
 //
 // True only for format identity: passwd, dotenv, or PEM private-key material,
 // which the REC detectors only ever emit at high confidence. Deliberately NOT
-// keyed on Disclosure.SensitiveRedactions — that counter increments for every
+// keyed on Disclosure.SensitiveRedactions - that counter increments for every
 // href/src/meta-content in HTML and every long string or email in JSON, so a
 // styled 404 page would count as "disclosing." Bodies with redaction counts
 // but no disclosing format go to the LLM instead (and Lane B already forbids

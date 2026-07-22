@@ -9,7 +9,7 @@ import (
 )
 
 // CatchAllRule represents a verified catch-all fingerprint persisted to SQLite.
-// This is a DTO — the coordinator maps it to/from its internal types.
+// This is a DTO - the coordinator maps it to/from its internal types.
 //
 // Fix 2 (v1.0 hardening): Fingerprint key changed from ResponseBytes to
 // BodyPreviewHash (SHA-256). Prevents "accordion padding" attack where
@@ -25,7 +25,7 @@ type CatchAllRule struct {
 	Host                string
 	HTTPMethod          string
 	HTTPStatus          int
-	BodyPreviewHash     string // SHA-256 of redacted response body — fingerprint key
+	BodyPreviewHash     string // SHA-256 of redacted response body - fingerprint key
 	VerifiedAt          time.Time
 	SamplePath          string
 	ContentType         string

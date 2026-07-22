@@ -1,13 +1,13 @@
 package rec
 
 // =============================================================================
-// BPF Kernel Filtering — Phase 2 Optimization
+// BPF Kernel Filtering - Phase 2 Optimization
 // =============================================================================
 //
 // STATUS: Not yet implemented. Requires adding external dependencies:
 //   go get golang.org/x/net/bpf golang.org/x/sys/unix
 //
-// The sniffer works correctly without BPF — it just processes more packets
+// The sniffer works correctly without BPF - it just processes more packets
 // in userspace. BPF is a CPU optimization for busy hosts, not a correctness fix.
 //
 // WHAT IT WOULD DO:
@@ -22,9 +22,9 @@ package rec
 //   3. Assemble with bpf.Assemble() → []bpf.RawInstruction
 //   4. Attach with unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &prog)
 //   5. Call in openSocket() after the socket is created, before readLoop starts
-//   6. If attachment fails, log warning and continue — BPF is best-effort
+//   6. If attachment fails, log warning and continue - BPF is best-effort
 //
-// REFERENCE (from VXLAN research — verified against gopacket's BPF approach):
+// REFERENCE (from VXLAN research - verified against gopacket's BPF approach):
 //
 //   filter for "tcp port 80 or tcp port 8080 or udp dst port 4789":
 //

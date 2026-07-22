@@ -13,7 +13,7 @@ import (
 // =============================================================================
 //
 // Detects the format of a response body preview for redaction routing.
-// Operates on TRUNCATED preview (max 2KB) — format detection confidence
+// Operates on TRUNCATED preview (max 2KB) - format detection confidence
 // accounts for the possibility that we're seeing partial content.
 //
 // Priority:
@@ -96,7 +96,7 @@ func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) 
 		return FormatHTML, ConfidenceLow
 	}
 
-	// text/plain Content-Type — try body sniffing for dotenv/passwd
+	// text/plain Content-Type - try body sniffing for dotenv/passwd
 	if strings.HasPrefix(ct, "text/plain") {
 		if looksLikePasswd(trimmed) {
 			return FormatPasswd, ConfidenceHigh
@@ -110,7 +110,7 @@ func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) 
 }
 
 // pemPrivateKeyHeaders maps PEM armor headers to a short key-type label for
-// the disclosure summary. Only PRIVATE key armor counts — "BEGIN CERTIFICATE"
+// the disclosure summary. Only PRIVATE key armor counts - "BEGIN CERTIFICATE"
 // is public material and must NOT classify as FormatPEM. More specific
 // headers precede the generic "BEGIN PRIVATE KEY" so the label is accurate.
 var pemPrivateKeyHeaders = []struct {
@@ -128,7 +128,7 @@ var pemPrivateKeyHeaders = []struct {
 	{"BEGIN PRIVATE KEY", "PKCS#8"},
 }
 
-// pemKeyType scans the whole body preview (not just offset zero — keys are
+// pemKeyType scans the whole body preview (not just offset zero - keys are
 // often embedded mid-dump) for a private-key armor header, case-insensitively.
 // Returns the key-type label, or "" if none found.
 func pemKeyType(body []byte) string {
@@ -252,7 +252,7 @@ func redactHTML(body []byte) (string, int) {
 			// Find end of tag
 			tagEnd := strings.IndexByte(s[i:], '>')
 			if tagEnd < 0 {
-				// Unclosed tag at end of preview — write remainder and stop
+				// Unclosed tag at end of preview - write remainder and stop
 				out.WriteString(s[i:])
 				break
 			}
@@ -260,7 +260,7 @@ func redactHTML(body []byte) (string, int) {
 			tag := s[i:tagEnd]
 			tagLower := strings.ToLower(tag)
 
-			// Check for script/style blocks — strip content entirely
+			// Check for script/style blocks - strip content entirely
 			if strings.HasPrefix(tagLower, "<script") {
 				out.WriteString("<script>[STRIPPED]</script>")
 				// Skip past closing </script>
@@ -289,7 +289,7 @@ func redactHTML(body []byte) (string, int) {
 			out.WriteString(redactedTag)
 			i = tagEnd
 		} else {
-			// Text content — keep it (visible text helps re-classification)
+			// Text content - keep it (visible text helps re-classification)
 			nextTag := strings.IndexByte(s[i:], '<')
 			if nextTag < 0 {
 				out.WriteString(s[i:])
@@ -317,7 +317,7 @@ func redactHTML(body []byte) (string, int) {
 //     href on anchors, src on media, action on forms).
 //  2. Name-based: any attribute whose name contains a secret-shaped token
 //     (token, key, auth, password, secret, credential, session, bearer,
-//     csrf, apikey) is redacted regardless of tag — catches data-api-key,
+//     csrf, apikey) is redacted regardless of tag - catches data-api-key,
 //     x-csrf-token, sessionToken, etc.
 //
 // URL attributes (href/src/action) are redacted wholesale rather than
@@ -329,7 +329,7 @@ func redactHTMLAttributes(tag string) (string, int) {
 		return tag, 0
 	}
 	if tag[1] == '/' || tag[1] == '!' {
-		return tag, 0 // closing tag, comment, or doctype — nothing to redact
+		return tag, 0 // closing tag, comment, or doctype - nothing to redact
 	}
 
 	// Walk past tag name.
@@ -374,7 +374,7 @@ func redactHTMLAttributes(tag string) (string, int) {
 		}
 
 		if i >= len(tag) || tag[i] != '=' {
-			// Boolean attribute (e.g. disabled, checked) — no value.
+			// Boolean attribute (e.g. disabled, checked) - no value.
 			continue
 		}
 		b.WriteByte('=')
@@ -432,7 +432,7 @@ func redactHTMLAttributes(tag string) (string, int) {
 
 // isHTMLSpace reports whether b is HTML whitespace as defined by the parser
 // (space, tab, LF, CR, FF). We use this everywhere the spec calls for
-// "ASCII whitespace" — between attributes, around '=', etc.
+// "ASCII whitespace" - between attributes, around '=', etc.
 func isHTMLSpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
 }
@@ -468,7 +468,7 @@ func positionalSecretAttrsFor(tagName string) map[string]bool {
 // attrNameLooksSecret reports whether the attribute name (already lowercased)
 // contains any token strongly associated with secrets. The match is a plain
 // substring scan: "data-api-key", "x-csrf-token", "sessionToken", and
-// "accessKey" all hit. Some false positives are acceptable — over-redacting
+// "accessKey" all hit. Some false positives are acceptable - over-redacting
 // a benign attribute value costs the LLM minor structural context, while
 // under-redaction leaks credentials.
 func attrNameLooksSecret(nameLower string) bool {
@@ -570,7 +570,7 @@ func redactJSONValue(v interface{}, parentKey string, depth int, redactions *int
 		return val
 
 	case float64, bool, nil:
-		// Numbers, booleans, nulls are rarely secrets — keep them
+		// Numbers, booleans, nulls are rarely secrets - keep them
 		return val
 
 	default:
@@ -599,8 +599,8 @@ func isSensitiveKey(key string) bool {
 //
 // v0.48.x hotfix (2026-05-11): false-positive trigger on English sentences.
 // Before: ratio threshold 0.85 with no whitespace check. A 41-char string
-// like "This captain instance only accepts API v2" scored 35/41 ≈ 0.854 —
-// just above 0.85 — and got `[REDACTED:encoded]`, which then poisoned the
+// like "This captain instance only accepts API v2" scored 35/41 ≈ 0.854 -
+// just above 0.85 - and got `[REDACTED:encoded]`, which then poisoned the
 // body preview, hashed differently than the actual response, and surfaced
 // as a false positive in the Option-4 investigation (kovicloud.com upload
 // log line, May 8 2026).
@@ -609,7 +609,7 @@ func isSensitiveKey(key string) bool {
 //  1. Early-out if `s` contains any whitespace. In the contexts this
 //     function actually runs (HTTP response bodies as JSON string values,
 //     header values, query parameters), base64 payloads are contiguous
-//     tokens — no spaces, tabs, or embedded newlines. Whitespace is the
+//     tokens - no spaces, tabs, or embedded newlines. Whitespace is the
 //     strongest signal that the string is human text masquerading as a
 //     high-density alphabet. Note: MIME/PEM-style base64 IS line-wrapped
 //     with newlines (76-char chunks), but those forms travel as document
@@ -629,7 +629,7 @@ func looksLikeBase64(s string) bool {
 	if len(s) < 20 {
 		return false
 	}
-	// Whitespace early-out — in the contexts this runs (inline JSON values,
+	// Whitespace early-out - in the contexts this runs (inline JSON values,
 	// header values), real base64 payloads are contiguous tokens. MIME/PEM
 	// line-wrapped base64 is a different shape we don't encounter here.
 	if strings.ContainsAny(s, " \t\n\r\v\f") {
@@ -648,7 +648,7 @@ func looksLikeBase64(s string) bool {
 // Dotenv Redaction
 // =============================================================================
 //
-// Pure secrets — always redact ALL values. The key names tell the story:
+// Pure secrets - always redact ALL values. The key names tell the story:
 // "DB_PASSWORD=<REDACTED>" is enough for the LLM to know this is a config leak.
 
 func redactDotenv(body []byte) (string, int) {
@@ -684,7 +684,7 @@ func redactDotenv(body []byte) (string, int) {
 			out.WriteString("=[REDACTED]")
 			redactions++
 		} else {
-			// Not a KEY=VALUE line — pass through (could be a comment variant)
+			// Not a KEY=VALUE line - pass through (could be a comment variant)
 			out.WriteString(line)
 		}
 
@@ -723,21 +723,21 @@ func redactPasswd(body []byte) (string, int) {
 		if len(fields) >= 7 {
 			// passwd format: user:pass:uid:gid:gecos:home:shell
 			out.WriteString(fmt.Sprintf("%s:[REDACTED]:%s:%s:[REDACTED]:[REDACTED]:%s",
-				fields[0], // username — keep
-				fields[2], // UID — keep
-				fields[3], // GID — keep
-				fields[6], // shell — keep
+				fields[0], // username - keep
+				fields[2], // UID - keep
+				fields[3], // GID - keep
+				fields[6], // shell - keep
 			))
-			redactions += 3 // hash, GECOS, home — the three markers written above
+			redactions += 3 // hash, GECOS, home - the three markers written above
 		} else if len(fields) >= 2 && strings.Contains(fields[1], "$") {
-			// shadow format: user:$hash$...:... — keep only username
+			// shadow format: user:$hash$...:... - keep only username
 			out.WriteString(fields[0])
 			for j := 1; j < len(fields); j++ {
 				out.WriteString(":[REDACTED]")
 				redactions++
 			}
 		} else {
-			// Unknown format — redact entire line
+			// Unknown format - redact entire line
 			out.WriteString("[REDACTED]")
 			redactions++
 		}
@@ -751,7 +751,7 @@ func redactPasswd(body []byte) (string, int) {
 }
 
 // =============================================================================
-// Helpers — note: min() is built-in as of Go 1.21
+// Helpers - note: min() is built-in as of Go 1.21
 // =============================================================================
 
 // =============================================================================
@@ -806,7 +806,7 @@ func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 		analysis.redactedPreview, analysis.SensitiveRedactions = redactHTML(bodyPreview)
 		analysis.DisclosureSummary = "HTML CONTENT DETECTED"
 	case FormatPEM:
-		// Fail closed: never preview key material, not even redacted — the
+		// Fail closed: never preview key material, not even redacted - the
 		// armor header alone is the disclosure. SensitiveRedactions is
 		// forced to at least 1 so count-based logic (the Lane A benign-cache
 		// gate) treats this body as disclosing; escalation itself keys off

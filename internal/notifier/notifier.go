@@ -20,7 +20,7 @@ const (
 	SeverityAlert      Severity = "alert"
 )
 
-// Tunables for the worker pool and limiter sweeper. Conservative defaults —
+// Tunables for the worker pool and limiter sweeper. Conservative defaults -
 // a 32-deep queue per channel is enough to absorb burst alert storms without
 // unbounded goroutine spawn. Past that, we drop and log: the operator gets
 // a visible counter on stats rather than silent memory growth.
@@ -32,7 +32,7 @@ const (
 )
 
 // Alert is the unified payload sent to all notification channels.
-// Built as an immutable snapshot from a single event — all fields must come
+// Built as an immutable snapshot from a single event - all fields must come
 // from the same event/result pair to prevent cross-event contamination.
 type Alert struct {
 	EventID        string        `json:"event_id" yaml:"event_id"`
@@ -199,10 +199,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) int {
 		case <-d.stopCh:
 			return enqueued
 		default:
-			// Queue full — drop and log. Limiter NOT committed: a real
+			// Queue full - drop and log. Limiter NOT committed: a real
 			// alert in the next interval gets its slot, not a dropped one.
 			d.dropped.Add(1)
-			log.Printf("[notifier] %s queue full (depth=%d) — dropped event=%s severity=%s",
+			log.Printf("[notifier] %s queue full (depth=%d) - dropped event=%s severity=%s",
 				ch.Name(), len(q), alert.EventID, alert.Severity)
 		}
 	}
@@ -210,7 +210,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, alert Alert) int {
 	return enqueued
 }
 
-// runWorker drains one channel's queue. Send errors are logged, not retried —
+// runWorker drains one channel's queue. Send errors are logged, not retried -
 // individual notifier implementations own their retry policy.
 func (d *Dispatcher) runWorker(n Notifier, q chan Alert) {
 	defer d.wg.Done()
@@ -286,7 +286,7 @@ func (d *Dispatcher) Stop(ctx context.Context) {
 	select {
 	case <-done:
 	case <-ctx.Done():
-		// Drain deadline exceeded — accept the loss.
+		// Drain deadline exceeded - accept the loss.
 	}
 }
 

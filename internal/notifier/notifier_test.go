@@ -62,7 +62,7 @@ func newTestDispatcher(t *testing.T, n *stubNotifier, rateLimit time.Duration) *
 
 // TestRateLimit_TwoPhase verifies the commit-on-success split that fixes
 // the "dropped alert silences next real alert" bug. With the old code,
-// a check that returned not-limited also stamped lastSent — so if the
+// a check that returned not-limited also stamped lastSent - so if the
 // caller went on to drop the alert (queue full), the stamp was still
 // committed and silenced the next legitimate alert.
 //
@@ -87,12 +87,12 @@ func TestRateLimit_TwoPhase(t *testing.T) {
 		t.Fatal("expected non-empty key on not-limited check")
 	}
 
-	// Simulate "enqueue failed" — caller does NOT commit. The bug being
+	// Simulate "enqueue failed" - caller does NOT commit. The bug being
 	// fixed is precisely that the old code committed here unconditionally.
 	// A second check must still return not-limited.
 	limited, _ = d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if limited {
-		t.Fatal("second check should still be not-limited — no commit happened in between")
+		t.Fatal("second check should still be not-limited - no commit happened in between")
 	}
 
 	// Commit the rate-limit (this is what a successful enqueue triggers).
@@ -101,7 +101,7 @@ func TestRateLimit_TwoPhase(t *testing.T) {
 	// Now within the interval, the next check must be limited.
 	limited, _ = d.rateLimitCheck("webhook", "alpha", SeveritySuspicious)
 	if !limited {
-		t.Fatal("third check should be limited — we just committed")
+		t.Fatal("third check should be limited - we just committed")
 	}
 
 	// After the interval elapses, the next check is not-limited again.
@@ -214,7 +214,7 @@ func TestStop_IsIdempotent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// One more for good measure — should be a no-op.
+	// One more for good measure - should be a no-op.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	d.Stop(ctx)
@@ -312,6 +312,6 @@ func TestRateLimit_SameSeveritySuppressedAndCounted(t *testing.T) {
 	}
 }
 
-// Sanity that stubNotifier.returnErr field is at least addressable —
+// Sanity that stubNotifier.returnErr field is at least addressable -
 // unused in current tests but kept on the struct for future cases.
 var _ = errors.New

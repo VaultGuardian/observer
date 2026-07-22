@@ -130,7 +130,7 @@ func (hc *HintCollector) checkConsensus(scopeKey string, sh *sourceHints) {
 	}
 }
 
-// GetSuggestions returns the current state for a source key — for future
+// GetSuggestions returns the current state for a source key - for future
 // dashboard/API use. Returns nil if no hints collected yet.
 func (hc *HintCollector) GetSuggestions(scopeKey string) map[string]*TypeSuggestion {
 	hc.mu.Lock()

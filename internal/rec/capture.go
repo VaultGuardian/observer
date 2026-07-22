@@ -15,7 +15,7 @@ import (
 // namespaceCapture is one capture source: a single network-namespace socket
 // (or the host). It owns its socket, capture goroutines, cancel func, and
 // (later) its own container-side port registry. It does NOT own the ring
-// buffer, VIP store, or request↔response pairing state — those live on the
+// buffer, VIP store, or request↔response pairing state - those live on the
 // liveCollector and are shared by pointer across all instances, so the
 // coordinator's Lookup path stays unified regardless of which namespace
 // captured a given response.
@@ -49,7 +49,7 @@ type namespaceCapture struct {
 // Partial-failure isolation: if the opener fails, the instance records its
 // lastError and stays running=false, but the error is returned for the CALLER
 // to decide what to do. It never flips a global flag, so sibling instances are
-// unaffected — this is the whole reason for the refactor.
+// unaffected - this is the whole reason for the refactor.
 func (lc *liveCollector) startCapture(parent context.Context, nc *namespaceCapture, open func() (int, error)) error {
 	ctx, cancel := context.WithCancel(parent)
 	nc.cancel = cancel
@@ -100,12 +100,12 @@ func (lc *liveCollector) startCapture(parent context.Context, nc *namespaceCaptu
 // exists for deterministic teardown in tests.
 //
 // Session 7: in auto-detect mode Close() FIRST stops the runtime reconciliation
-// manager (events listener, rescan ticker, reconcile loop, and vipCleanupLoop —
+// manager (events listener, rescan ticker, reconcile loop, and vipCleanupLoop -
 // all owned by mgrCancel/mgrWG) and joins them, THEN tears down the captures.
 // Stopping the manager first guarantees no in-flight reconcile is mutating the
 // captures map while we snapshot and cancel it below. In legacy NSContainer mode
 // mgrCancel is nil (no manager runs); vipCleanupLoop there is still bound to the
-// parent ctx and stops only on parent cancel — unchanged from prior behavior.
+// parent ctx and stops only on parent cancel - unchanged from prior behavior.
 func (lc *liveCollector) Close() {
 	if lc.mgrCancel != nil {
 		lc.mgrCancel()

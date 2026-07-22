@@ -11,7 +11,7 @@ import (
 )
 
 // bareCollector builds a liveCollector with the shared machinery wired up but
-// no captures started — the same white-box shape the existing collector tests
+// no captures started - the same white-box shape the existing collector tests
 // use, plus the captures map.
 func bareCollector() *liveCollector {
 	return &liveCollector{
@@ -23,7 +23,7 @@ func bareCollector() *liveCollector {
 }
 
 // testCapture builds a namespaceCapture whose sniffer feeds the collector's
-// SHARED buffer and SHARED VIP handler — exactly how Start() wires a real one.
+// SHARED buffer and SHARED VIP handler - exactly how Start() wires a real one.
 func testCapture(lc *liveCollector, name string) *namespaceCapture {
 	s := newSniffer(lc.buffer, "", []int{80}, 64, DefaultMaxBodyBytes, DefaultVXLANPort,
 		false, DefaultReassemblyConfig(), DefaultFlowConfig())
@@ -32,7 +32,7 @@ func testCapture(lc *liveCollector, name string) *namespaceCapture {
 }
 
 // dgramFD returns one end of an AF_UNIX datagram socketpair with a short
-// receive timeout, so the real readLoop polls ctx.Done() and exits cleanly —
+// receive timeout, so the real readLoop polls ctx.Done() and exits cleanly -
 // no CAP_NET_RAW or AF_PACKET socket needed. readLoop owns and closes the
 // returned fd; the peer end is closed on test cleanup.
 func dgramFD(t *testing.T) int {
@@ -42,7 +42,7 @@ func dgramFD(t *testing.T) int {
 		t.Fatalf("socketpair: %v", err)
 	}
 	t.Cleanup(func() { syscall.Close(pair[1]) })
-	tv := syscall.Timeval{Sec: 0, Usec: 100_000} // 100ms — readLoop polls ctx between recvs
+	tv := syscall.Timeval{Sec: 0, Usec: 100_000} // 100ms - readLoop polls ctx between recvs
 	if err := syscall.SetsockoptTimeval(pair[0], syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
 		syscall.Close(pair[0])
 		syscall.Close(pair[1])
@@ -53,7 +53,7 @@ func dgramFD(t *testing.T) int {
 
 // TestSharedBufferAcrossInstances proves that responses captured by two
 // separate instances land in the ONE shared ring buffer and are both findable
-// via the existing Lookup path — the unified-evidence guarantee.
+// via the existing Lookup path - the unified-evidence guarantee.
 func TestSharedBufferAcrossInstances(t *testing.T) {
 	lc := bareCollector()
 

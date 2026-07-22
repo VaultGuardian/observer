@@ -12,7 +12,7 @@ import (
 	"github.com/vaultguardian/observer/internal/store"
 )
 
-// newReviewTestServer builds a Server with only the store wired up —
+// newReviewTestServer builds a Server with only the store wired up -
 // handleDecisionReview touches nothing else.
 func newReviewTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
@@ -77,7 +77,7 @@ func postReview(t *testing.T, srv *Server, id int64, status string) *httptest.Re
 }
 
 // TestDecisionReviewResolvesLinkedFinding: an "ignored" review is a triage
-// decision — it must resolve the linked pending finding via human_review
+// decision - it must resolve the linked pending finding via human_review
 // without touching its verdict.
 func TestDecisionReviewResolvesLinkedFinding(t *testing.T) {
 	ctx := context.Background()
@@ -116,7 +116,7 @@ func TestDecisionReviewResolvesLinkedFinding(t *testing.T) {
 }
 
 // TestDecisionReviewNoopOnResolvedFinding: reviewing a decision whose finding
-// is already resolved still succeeds — the resolution step is a silent no-op.
+// is already resolved still succeeds - the resolution step is a silent no-op.
 func TestDecisionReviewNoopOnResolvedFinding(t *testing.T) {
 	ctx := context.Background()
 	srv, st := newReviewTestServer(t)
@@ -151,7 +151,7 @@ func TestDecisionReviewNoopOnResolvedFinding(t *testing.T) {
 }
 
 // TestDecisionReviewWithoutLinkedFinding: a decision whose event never
-// produced a finding reviews cleanly — resolve-if-exists, no error.
+// produced a finding reviews cleanly - resolve-if-exists, no error.
 func TestDecisionReviewWithoutLinkedFinding(t *testing.T) {
 	srv, st := newReviewTestServer(t)
 	id := recordDecision(t, st, "")

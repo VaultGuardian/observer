@@ -63,7 +63,7 @@ func (r *Registry) Register(n Normalizer) {
 // Lookup finds the best normalizer for an event.
 // Priority:
 //  1. Exact match on "source_type:source_name" (e.g. "docker:nginx")
-//  2. Exact match on source_name alone (e.g. "nginx" — works across docker/systemd/file)
+//  2. Exact match on source_name alone (e.g. "nginx" - works across docker/systemd/file)
 //  3. Fuzzy match: source_name contains a registered family (e.g. "demo-nginx" contains "nginx")
 //  4. Match on source_type alone (e.g. "docker")
 //  5. Fallback generic normalizer

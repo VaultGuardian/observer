@@ -180,7 +180,7 @@ func TestTimeoutDefersToInFlightDowngrade(t *testing.T) {
 	// Let the finalize deadline fire and dispatchTimedOut defer several times.
 	time.Sleep(200 * time.Millisecond)
 	if got := fd.count(); got != 0 {
-		t.Fatalf("timeout dispatched while a check was in flight (got %d alerts) — the race fix did not defer", got)
+		t.Fatalf("timeout dispatched while a check was in flight (got %d alerts) - the race fix did not defer", got)
 	}
 	if c.pendingLen() != 1 {
 		t.Fatalf("pending entry was deleted out from under the in-flight check; pending=%d", c.pendingLen())
@@ -225,7 +225,7 @@ func TestTimeoutFinalizesAfterNoChangeCheck(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	if got := fd.count(); got != 0 {
-		t.Fatalf("timeout dispatched while check in flight (got %d) — should have deferred", got)
+		t.Fatalf("timeout dispatched while check in flight (got %d) - should have deferred", got)
 	}
 
 	releaseAt := time.Now()
@@ -241,7 +241,7 @@ func TestTimeoutFinalizesAfterNoChangeCheck(t *testing.T) {
 		t.Fatalf("expected a plain suspicious alert, got Downgraded=%v Escalated=%v", alerts[0].Downgraded, alerts[0].Escalated)
 	}
 	if fd.at[0].Before(releaseAt) {
-		t.Fatalf("suspicious alert dispatched before the check completed — defer was not honored")
+		t.Fatalf("suspicious alert dispatched before the check completed - defer was not honored")
 	}
 	if outcome, ok := c.graveyardOutcome(key); !ok || outcome != "alerted" {
 		t.Fatalf("graveyard outcome = %q, ok=%v; want alerted", outcome, ok)
@@ -249,7 +249,7 @@ func TestTimeoutFinalizesAfterNoChangeCheck(t *testing.T) {
 }
 
 // TestTimeoutFinalizesWhenCheckWedged: a check that runs longer than
-// MaxEvidenceCheckWait must not hang the investigation — the timeout finalizes
+// MaxEvidenceCheckWait must not hang the investigation - the timeout finalizes
 // suspicious once the cap is exceeded, and the late result is dropped without
 // a second dispatch.
 func TestTimeoutFinalizesWhenCheckWedged(t *testing.T) {
@@ -309,7 +309,7 @@ func TestTimeoutNoRegressionWhenNoCheckInFlight(t *testing.T) {
 	}
 	// No added latency beyond the finalize window + a couple of retry ticks.
 	if elapsed > 300*time.Millisecond {
-		t.Fatalf("suspicious dispatch took %s — unexpected latency on the common path", elapsed)
+		t.Fatalf("suspicious dispatch took %s - unexpected latency on the common path", elapsed)
 	}
 	if c.pendingLen() != 0 {
 		t.Fatalf("pending not cleared; pending=%d", c.pendingLen())

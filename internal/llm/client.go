@@ -85,7 +85,7 @@ type Client struct {
 	httpClient  *http.Client
 	model       string
 	apiKey      string
-	tier1Effort string // reasoning_effort for Tier 1 (AnalyzeLog) — "low", "medium", "high"
+	tier1Effort string // reasoning_effort for Tier 1 (AnalyzeLog) - "low", "medium", "high"
 	tier2Effort string // reasoning_effort for Tier 2 (ReclassifyWithEvidence)
 }
 
@@ -217,7 +217,7 @@ INTENT × OUTCOME IS EVERYTHING. The request path tells you what the attacker WA
 - "safe" + "allow": Normal operational logs (app startup, health checks, routine requests, crawler/bot traffic with normal responses)
 - "noise" + "suppress": Uninteresting output (debug spam, metric dumps, heartbeats, routine status)
 - "recon_failed" + "suppress": Attacker probed and GOT NOTHING (error response codes on suspicious paths)
-- "recon_success" + "alert": Attacker probed something sensitive and GOT A REAL RESPONSE (200 on /.env, /.git, /config, etc.) — this is URGENT
+- "recon_success" + "alert": Attacker probed something sensitive and GOT A REAL RESPONSE (200 on /.env, /.git, /config, etc.) - this is URGENT
 - "suspicious" + "alert": Unusual activity that is NOT a simple failed probe (unexpected auth, abnormal response sizes, legitimate paths with abnormal behavior)
 - "malicious" + "malicious": Confirmed attack payloads in the request when the response did NOT clearly reject the request (200/301/500/etc.), OR when the line contains command output / disclosure evidence (root:x:0:0:root, BEGIN PRIVATE KEY, AWS_SECRET_ACCESS_KEY, uid=0(root))
 
@@ -225,9 +225,9 @@ KEY RULES:
 - ALWAYS look at the HTTP status code
 - Status 200 on a sensitive path = recon_success = alert
 - Status 302 to login = recon_failed. Status 302 to content = recon_success
-- Attack payloads in the URL (UNION SELECT, ;ls, php://) on a 200/ambiguous response = malicious. On a clearly rejected response (400/403/404/405/410), classify as recon_failed + suppress — the server didn't process the payload
+- Attack payloads in the URL (UNION SELECT, ;ls, php://) on a 200/ambiguous response = malicious. On a clearly rejected response (400/403/404/405/410), classify as recon_failed + suppress - the server didn't process the payload
 
-EXPLICIT EDGE CASES — THESE HAVE BEEN INCORRECTLY CLASSIFIED BEFORE:
+EXPLICIT EDGE CASES - THESE HAVE BEEN INCORRECTLY CLASSIFIED BEFORE:
 
 Protocol mismatch on port 80 (ALWAYS noise + suppress):
 - TLS handshake bytes (\x16\x03) in the request line + status 400 = noise + suppress. This is an HTTPS client hitting an HTTP port. Not an attack. Not suspicious. Just wrong protocol.
@@ -243,8 +243,8 @@ Failed file probes (ALWAYS recon_failed + suppress):
 - Status 405 on any path = recon_failed + suppress. Wrong HTTP method, request rejected.
 
 DO NOT contradict yourself:
-- If your reason says the probe "failed", "was rejected", "got nothing", "did not disclose", or "no sensitive data was exposed" — then your classification MUST be recon_failed, NOT alert or suspicious.
-- If your reason says "open() failed" or "No such file or directory" — that is ALWAYS recon_failed + suppress. No exceptions.
+- If your reason says the probe "failed", "was rejected", "got nothing", "did not disclose", or "no sensitive data was exposed" - then your classification MUST be recon_failed, NOT alert or suspicious.
+- If your reason says "open() failed" or "No such file or directory" - that is ALWAYS recon_failed + suppress. No exceptions.
 - A failed probe is not suspicious. A failed probe is a FAILED probe. Classify it as such.
 
 Status 200 is the ONLY ambiguous case:
@@ -272,7 +272,7 @@ Every public Linux server gets thousands of failed SSH attempts per day. This is
 - "PAM X more authentication failure" = recon_failed + suppress
 Do NOT classify failed SSH as "suspicious" or "alert". A failed login is a FAILED login. The attacker did not get in. This is recon_failed, exactly like a 404 probe on a web server. Use prefix pattern "Failed password for" or "Invalid user" for suppress patterns.
 
-SSH SUCCESS (suspicious + alert — DIFFERENT from brute force):
+SSH SUCCESS (suspicious + alert - DIFFERENT from brute force):
 - "Accepted password for" or "Accepted publickey for" = suspicious + alert. This means someone actually logged in. Worth flagging.
 
 OTHER SYSTEM LOG RULES:
@@ -295,7 +295,7 @@ A web application container should NEVER output the contents of system files, pr
 - AWS/cloud credentials (AKIA, aws_secret_access_key) = malicious. Cloud credential theft.
 Do NOT classify these as "suspicious" or "alert". A web app dumping root credentials to its log stream is a confirmed, active compromise. Confidence 0.95, action malicious.
 
-IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases. Do NOT hedge with 0.60-0.75 on failed SSH — you will poison the pattern cache with wrong classifications that persist forever.
+IMPORTANT: For system logs, be confident. These patterns are well-understood. Use confidence 0.90+ for clear-cut cases. Do NOT hedge with 0.60-0.75 on failed SSH - you will poison the pattern cache with wrong classifications that persist forever.
 
 === EPISTEMIC HUMILITY / NO SPECULATIVE ALERTS ===
 
@@ -314,7 +314,7 @@ Suspicious or malicious requires POSITIVE EVIDENCE, such as:
 - explicit exploit payloads (UNION SELECT, ;ls, php://, ../../etc/passwd)
 - credential access attempts (probing /.env, /.git, /id_rsa, /credentials)
 - privilege escalation attempts (sudo failure patterns, kernel module load,
-  useradd) — see the threat model categories above for the full set
+  useradd) - see the threat model categories above for the full set
 - sensitive file/path probing on successful (200) responses
 - command execution evidence in container logs (uid=0(root), /etc/passwd
   contents, BEGIN PRIVATE KEY, AKIA*, AWS_SECRET_ACCESS_KEY)
@@ -336,7 +336,7 @@ If the event is unusual but lacks positive attack evidence:
 
 PATTERN RULES:
 - Only return a pattern when action is "allow" or "suppress". Never for "alert" or "malicious".
-- PREFER "prefix" — fastest and safest.
+- PREFER "prefix" - fastest and safest.
 - Use "regex" only when variable content is in the MIDDLE. Always anchor with ^. Be specific. Minimum 10 characters.
 - DO NOT use "contains". Auto-learned contains patterns are rejected by the validator. Only human/seeded rules may use contains. If a prefix or anchored regex won't fit the case, omit the pattern entirely and let the system hash-cache the exact line.
 - PATTERN MUST match the NORMALIZED version (timestamps=<TS>, IPs=<IP>, numbers=<NUM>, UUIDs=<UUID>).
@@ -453,7 +453,7 @@ CRITICAL JSON RULES:
 
 	// Sanitize: don't trust malicious or alert patterns from the LLM.
 	// They can be suggested but should not be auto-learned. Done AFTER reconcile
-	// so we use the final action — if reconcile flipped allow→alert (because the
+	// so we use the final action - if reconcile flipped allow→alert (because the
 	// classification was suspicious), we still want to drop the proposed pattern.
 	if verdict.Action == "malicious" || verdict.Action == "alert" {
 		verdict.PatternType = ""
@@ -476,25 +476,25 @@ func reconcileClassificationAction(classification, action, reason string) string
 	switch classification {
 	case "safe":
 		if action != "allow" {
-			log.Printf("[llm] Contradiction: classification=%q but action=%q reason=%q — overriding to allow",
+			log.Printf("[llm] Contradiction: classification=%q but action=%q reason=%q - overriding to allow",
 				classification, action, reason)
 			return "allow"
 		}
 	case "noise", "recon_failed":
 		if action != "suppress" {
-			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to suppress",
+			log.Printf("[llm] Contradiction: classification=%q but action=%q - overriding to suppress",
 				classification, action)
 			return "suppress"
 		}
 	case "recon_success", "suspicious":
 		if action != "alert" {
-			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to alert",
+			log.Printf("[llm] Contradiction: classification=%q but action=%q - overriding to alert",
 				classification, action)
 			return "alert"
 		}
 	case "malicious":
 		if action != "malicious" {
-			log.Printf("[llm] Contradiction: classification=%q but action=%q — overriding to malicious",
+			log.Printf("[llm] Contradiction: classification=%q but action=%q - overriding to malicious",
 				classification, action)
 			return "malicious"
 		}
@@ -502,7 +502,7 @@ func reconcileClassificationAction(classification, action, reason string) string
 		// v0.52: Unknown classification must fail closed. Prior to this fix,
 		// unknown values fell through to `return action`, so a hallucinated
 		// classification:"benign", action:"suppress" would survive as suppress.
-		log.Printf("[llm] UNKNOWN classification=%q action=%q — overriding to alert (fail closed)",
+		log.Printf("[llm] UNKNOWN classification=%q action=%q - overriding to alert (fail closed)",
 			classification, action)
 		return "alert"
 	}
@@ -540,7 +540,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 // The LLM assumes 200 + big body = "attack succeeded."
 //
 // Re-classification sees the log line PLUS the redacted response body:
-// "<!DOCTYPE html>...Laravel v11.36.1..." — clearly a welcome page, not a
+// "<!DOCTYPE html>...Laravel v11.36.1..." - clearly a welcome page, not a
 // database dump. The attack was ignored by the app.
 //
 // This is the difference between "someone tried something" and
@@ -558,7 +558,7 @@ type ReclassifyVerdict struct {
 	// generic, templated page (app shell, framework error page, login
 	// redirect, default 404) that contains no request-specific or sensitive
 	// data. Required field in the response schema; if the model omits it,
-	// json.Unmarshal leaves the zero value false — fail closed. Taken from
+	// json.Unmarshal leaves the zero value false - fail closed. Taken from
 	// the LLM as-is (unlike Downgraded/Escalated, which are recomputed
 	// client-side).
 	GenericResponse bool `json:"generic_response"`
@@ -598,7 +598,7 @@ Your job: determine if the attack actually SUCCEEDED (server returned sensitive 
 === WHAT TO LOOK FOR IN THE RESPONSE ===
 
 The request LOOKED malicious. Your job is to determine whether the server
-actually EXPOSED ANYTHING in response. Status code alone is not enough —
+actually EXPOSED ANYTHING in response. Status code alone is not enough -
 many apps return 200 for default pages, login redirects, or generic error
 HTML regardless of query parameters.
 
@@ -616,10 +616,10 @@ Concrete evidence of compromise in the response body:
 - Internal paths, stack traces, framework errors, SQL error messages
 - Configuration files, admin tokens, deploy keys, webhook secrets
 
-If the response shows ONE OR MORE of these — the attack succeeded.
+If the response shows ONE OR MORE of these - the attack succeeded.
 Classify accordingly.
 
-If the response shows NONE of these, even if the request looked attack-y —
+If the response shows NONE of these, even if the request looked attack-y -
 the attack did not succeed visibly. Classify as recon_failed + suppress.
 
 === END WHAT TO LOOK FOR ===
@@ -635,30 +635,30 @@ Respond ONLY with a JSON object. ALL fields are REQUIRED:
 
 GENERIC_RESPONSE FIELD (required):
 Set "generic_response" to true ONLY when the response body is a generic,
-templated page — an application shell, framework default error page, login
-redirect, or default 404 — that contains NO request-specific data and NO
+templated page - an application shell, framework default error page, login
+redirect, or default 404 - that contains NO request-specific data and NO
 sensitive data. In other words: the server would serve these exact same bytes
 to anyone, for any request. This is a POSITIVE assertion that the body is
-boilerplate. "No breach evident" is NOT sufficient — a body can lack
+boilerplate. "No breach evident" is NOT sufficient - a body can lack
 compromise evidence and still be request-specific or contain stripped
 sensitive values. When unsure, set it to false.
 
 RULES:
-- If the response body is a standard framework page (Laravel, Rails, Django, Express, etc.), error page, login page, or API status — the attack FAILED. The application ignored the malicious input. Classify as "recon_failed" + "suppress" with a reason explaining it's a normal response.
-- If the response body contains database records, user data, configuration values, system files, or any data that should not be exposed — the attack SUCCEEDED. Keep or upgrade the severity.
-- If the response body is an API error message revealing stack traces, database errors, or internal paths — classify as "recon_success" + "alert" (information disclosure even if not the intended exploit).
+- If the response body is a standard framework page (Laravel, Rails, Django, Express, etc.), error page, login page, or API status - the attack FAILED. The application ignored the malicious input. Classify as "recon_failed" + "suppress" with a reason explaining it's a normal response.
+- If the response body contains database records, user data, configuration values, system files, or any data that should not be exposed - the attack SUCCEEDED. Keep or upgrade the severity.
+- If the response body is an API error message revealing stack traces, database errors, or internal paths - classify as "recon_success" + "alert" (information disclosure even if not the intended exploit).
 - The attack payload in the REQUEST still happened. You are judging the OUTCOME based on the RESPONSE.
 - A 200 status code does NOT mean the attack succeeded. Many apps return 200 for their default page regardless of query parameters.
-- A 403/404 with a large body could be a custom error page — check the content.
-- TIMING EVIDENCE: if an observed server processing time is provided and it is anomalously long for an error/4xx response to an injection-shaped request (e.g. SQL injection carrying SLEEP, WAITFOR DELAY, BENCHMARK, pg_sleep, or other time-based blind payloads), the delay itself can be evidence that the injected statement EXECUTED — successful time-based blind injection. Do NOT downgrade solely because the status code looks like a rejection when the timing is anomalous; weigh the timing as positive evidence.
+- A 403/404 with a large body could be a custom error page - check the content.
+- TIMING EVIDENCE: if an observed server processing time is provided and it is anomalously long for an error/4xx response to an injection-shaped request (e.g. SQL injection carrying SLEEP, WAITFOR DELAY, BENCHMARK, pg_sleep, or other time-based blind payloads), the delay itself can be evidence that the injected statement EXECUTED - successful time-based blind injection. Do NOT downgrade solely because the status code looks like a rejection when the timing is anomalous; weigh the timing as positive evidence.
 
-ESCALATION RULES — when to UPGRADE severity:
+ESCALATION RULES - when to UPGRADE severity:
 - If the response body contains KEY=VALUE pairs with credentials (passwords, API keys, secret keys, tokens) → classify as "malicious" + "malicious". This is confirmed credential exposure.
 - If the response body contains /etc/passwd or /etc/shadow formatted output → "malicious" + "malicious". System file exfiltration confirmed.
 - If the response body contains SQL query results, database dumps, or table data → "malicious" + "malicious". Data exfiltration confirmed.
 - If the response body contains JSON with user records, emails, or PII → "malicious" + "malicious". Data breach confirmed.
 
-DOWNGRADE RULES — when to REDUCE severity:
+DOWNGRADE RULES - when to REDUCE severity:
 - Generic HTML page (framework welcome page, admin login, redirect landing) → "recon_failed" + "suppress"
 - Nginx default pages (302 Found, 404 Not Found, standard error HTML) → "recon_failed" + "suppress"
 - MinIO Console HTML (login page served for any unknown path) → "recon_failed" + "suppress"
@@ -708,7 +708,7 @@ Based on this response evidence, did the attack succeed or did the server ignore
 	)
 
 	// Wire-paired request duration, when REC measured one. Say nothing when
-	// absent — mentioning unavailability would only invite speculation.
+	// absent - mentioning unavailability would only invite speculation.
 	if latencySource == "wire_pair" && requestDuration > 0 {
 		userPrompt += fmt.Sprintf("\n\nObserved server processing time: %d ms.", requestDuration.Milliseconds())
 	}
@@ -864,7 +864,7 @@ func stripCodeBlock(s string) string {
 //   - Preserves valid JSON escapes: \" \\ \/ \b \f \n \r \t \uXXXX
 //   - Converts regex metachar escapes (\d \w \s \S \D \W) to double-escaped (\\d etc.)
 //     so the JSON is valid AND the regex meaning is preserved
-//   - Strips backslash from everything else (\; \+ \( etc.) — junk escapes
+//   - Strips backslash from everything else (\; \+ \( etc.) - junk escapes
 func sanitizeJSON(s string) string {
 	var result strings.Builder
 	result.Grow(len(s))
@@ -873,12 +873,12 @@ func sanitizeJSON(s string) string {
 		if s[i] == '\\' && i+1 < len(s) {
 			next := s[i+1]
 			switch next {
-			// Valid JSON escapes — keep as-is
+			// Valid JSON escapes - keep as-is
 			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
 				result.WriteByte(s[i])
 				result.WriteByte(next)
 				i++
-			// Regex metacharacter escapes — the LLM meant \d, \w, \s etc.
+			// Regex metacharacter escapes - the LLM meant \d, \w, \s etc.
 			// but wrote it as a raw \d which is invalid JSON.
 			// Double the backslash so JSON sees \\d → which decodes to \d in the string.
 			case 'd', 'w', 's', 'S', 'D', 'W':

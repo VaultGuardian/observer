@@ -11,7 +11,7 @@ import (
 )
 
 // =============================================================================
-// Alert Coordinator — "Forensic Huddle" + "Graveyard"
+// Alert Coordinator - "Forensic Huddle" + "Graveyard"
 // =============================================================================
 //
 // WHY THIS EXISTS:
@@ -20,25 +20,25 @@ import (
 //   holds alerts for evidence collection.
 //
 // HOW IT WORKS:
-//   PENDING — active investigations with evidence timers.
-//   GRAVEYARD — recently finalized outcomes (TTL 300s).
+//   PENDING - active investigations with evidence timers.
+//   GRAVEYARD - recently finalized outcomes (TTL 300s).
 //
 // =============================================================================
 // Section 3 fixes (v1.0 hardening):
 // =============================================================================
 //
-//   Finding 2 — host in correlation key:
+//   Finding 2 - host in correlation key:
 //     resultrouter now builds keys as "host|method|path|status" so two vhosts
 //     hitting the same path/status don't false-join the same investigation.
-//     `extractPath()` is gone — the coordinator reads pending.HTTPPath /
+//     `extractPath()` is gone - the coordinator reads pending.HTTPPath /
 //     alert.HTTPPath directly instead of parsing the key. Key is opaque.
 //
-//   Finding 3 — better merge on join:
+//   Finding 3 - better merge on join:
 //     Process() now upgrades Host, ResponseBytes, weak StatusCode, and other
 //     metadata when a sibling event has stronger data than the existing
 //     pending alert. Previously only HTTPPath was upgraded.
 //
-//   Findings 4+5 — concurrency refactor:
+//   Findings 4+5 - concurrency refactor:
 //     EvidenceCheckFunc now returns an EvidenceDecision struct. The callback
 //     no longer mutates pending state; the coordinator applies the decision
 //     under lock. Dispatch happens outside the mutex.
@@ -75,10 +75,10 @@ const (
 type DispatchFunc func(alert FinalAlert)
 
 // EvidenceDecision carries the evidenceCheck callback's verdict back to the
-// coordinator. The callback no longer mutates pending state directly — it
+// coordinator. The callback no longer mutates pending state directly - it
 // returns this struct and the coordinator applies it under its own lock.
 //
-// Section 3 / Findings 4+5 — purity discipline:
+// Section 3 / Findings 4+5 - purity discipline:
 //
 //	Pre-fix the callback signature was
 //	  func(*PendingAlert) (downgraded, escalated bool, reason, newSeverity string)
@@ -98,7 +98,7 @@ type EvidenceDecision struct {
 }
 
 // EvidenceCheckFunc is called by the coordinator to look up and re-classify
-// evidence for a pending alert. The callback receives a snapshot of pending —
+// evidence for a pending alert. The callback receives a snapshot of pending -
 // reads only, no mutation. All decisions and any state to apply come back via
 // the returned EvidenceDecision.
 type EvidenceCheckFunc func(snapshot *PendingAlert) EvidenceDecision
@@ -429,7 +429,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 //   - keep first-arrival Timestamp (don't churn) but update LastSeen via
 //     EventCount increment which the caller already did
 //   - update BuildAlert/NormalizedLine/SourceName/Classification/Pattern* if
-//     incoming has them — they're correctness-preserving overrides
+//     incoming has them - they're correctness-preserving overrides
 func mergePendingMetadata(existing, incoming *PendingAlert) {
 	if incoming.BuildAlert != nil {
 		existing.BuildAlert = incoming.BuildAlert
@@ -482,7 +482,7 @@ func mergePendingMetadata(existing, incoming *PendingAlert) {
 	}
 
 	// Reason / Line / SourceType: upgrade if incoming is non-empty and
-	// existing is empty. Don't churn — first-arrival wins when both populated.
+	// existing is empty. Don't churn - first-arrival wins when both populated.
 	if existing.Reason == "" && incoming.Reason != "" {
 		existing.Reason = incoming.Reason
 	}
@@ -550,7 +550,7 @@ finalize:
 dispatch:
 	// Bounded retry: dispatchTimedOut returns false while an evidence check
 	// is in flight for this key (within maxEvidenceCheckWait), letting that
-	// check own the final dispatch. Once it clears — or the cap is exceeded —
+	// check own the final dispatch. Once it clears - or the cap is exceeded -
 	// dispatchTimedOut finalizes and returns true. Runs in this same
 	// goroutine (no new goroutines, no lock held across the wait).
 	for {
@@ -586,7 +586,7 @@ func (c *Coordinator) dispatchTimedOut(key string) bool {
 	}
 
 	// v0.53: an evidence check is in flight for this key. Defer the timeout
-	// (within the bounded wait) and let the check own the final dispatch —
+	// (within the bounded wait) and let the check own the final dispatch -
 	// this is the fix for the dropped-verdict race where the timeout deleted
 	// the pending entry while the check was still running. checkingSince is
 	// measured from the current check's start so the cap bounds a single
@@ -669,7 +669,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 	// guard must still be cleared or this key wedges (timeouts keep
 	// deferring to a check that will never finish) until the janitor sweep.
 	// The normal path clears the guard inline in Step 3, under the same
-	// lock acquisition that re-reads pending — this defer fires only when
+	// lock acquisition that re-reads pending - this defer fires only when
 	// that clear was never reached. A panic while HOLDING c.mu is already
 	// fatal to the coordinator and out of scope here.
 	guardCleared := false
@@ -698,7 +698,7 @@ func (c *Coordinator) tryEvidenceCheck(key string) bool {
 		return true
 	}
 
-	// Apply attached evidence first — this lets Phase 2 catch-all re-arm
+	// Apply attached evidence first - this lets Phase 2 catch-all re-arm
 	// see the populated BodyPreviewHash even when no downgrade/escalation
 	// fired this iteration.
 	if decision.BodyPreviewHash != "" {
@@ -800,7 +800,7 @@ type finalShape struct {
 
 // buildFinalAlert constructs a FinalAlert from a pending alert plus
 // verdict-specific shape. Caller is responsible for holding the lock or
-// using a snapshot — buildFinalAlert just reads.
+// using a snapshot - buildFinalAlert just reads.
 func buildFinalAlert(pending *PendingAlert, shape finalShape) *FinalAlert {
 	reason := pending.Reason
 	if shape.escalated && shape.escalateReason != "" {
@@ -924,7 +924,7 @@ func (c *Coordinator) CatchAllStats() (total, candidates, pending, verified, rej
 }
 
 // HostlessKeys returns the lifetime count of new investigations created with
-// the "<unknown-host>" placeholder. Section 3 follow-up telemetry — see
+// the "<unknown-host>" placeholder. Section 3 follow-up telemetry - see
 // Coordinator struct comment.
 func (c *Coordinator) HostlessKeys() int64 {
 	return c.hostlessKeys.Load()

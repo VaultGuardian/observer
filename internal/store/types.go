@@ -4,7 +4,7 @@ package store
 import "time"
 
 // Finding represents a single classification decision from the pipeline.
-// Every event that makes it past noise suppression gets recorded here —
+// Every event that makes it past noise suppression gets recorded here -
 // alerts, denies, suppressions, downgrades, recon, everything.
 //
 // This is the "what happened" store. The pattern store remembers HOW to
@@ -41,7 +41,7 @@ type Finding struct {
 	Reason         string  `json:"reason"`
 	MatchedVia     string  `json:"matched_via"` // pattern, llm, noise_filter, seeded
 
-	// Pattern match info — populated on cache hits so the dashboard
+	// Pattern match info - populated on cache hits so the dashboard
 	// can delete incorrect patterns without needing an LLM decision ID.
 	MatchedPatternScope  string `json:"matched_pattern_scope,omitempty"`
 	MatchedPatternBucket string `json:"matched_pattern_bucket,omitempty"` // allow, malicious, alert, suppress

@@ -17,7 +17,7 @@ import (
 )
 
 // pairingStream builds an httpStream over a synthetic server→client flow,
-// wired to the given sniffer — the same shape httpStreamFactory.New produces,
+// wired to the given sniffer - the same shape httpStreamFactory.New produces,
 // minus the goroutine and the tcpreader (runResponse takes the reader
 // directly, so no live capture machinery is needed).
 func pairingStream(s *sniffer) *httpStream {
@@ -78,7 +78,7 @@ func TestOrphanResponseHasNoRequestTimestamp(t *testing.T) {
 
 	hs := pairingStream(s)
 
-	// No request enqueued — the response queues as an orphan candidate and
+	// No request enqueued - the response queues as an orphan candidate and
 	// onCapture does not fire until cleanup expires it.
 	hs.runResponse(bufio.NewReader(strings.NewReader(
 		"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi")))

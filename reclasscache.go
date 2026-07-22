@@ -56,7 +56,7 @@ type reclassCache struct {
 
 // reclassFlightResult is the shared outcome of one coalesced T2
 // reclassification. Mirrors analyzer.classifyFlightResult: the leader is
-// identified by LeaderEventID == its own snapshot.EventID — NOT by
+// identified by LeaderEventID == its own snapshot.EventID - NOT by
 // singleflight's shared bool (the leader can also observe shared==true).
 // Followers read Reclass but never mutate it.
 type reclassFlightResult struct {
@@ -82,7 +82,7 @@ func (c *reclassCache) put(bodyHash string, downgraded bool, escalated bool, rea
 	defer c.mu.Unlock()
 
 	// Bounded: if cache is full, clear it and start fresh.
-	// In practice this almost never happens — distinct response bodies
+	// In practice this almost never happens - distinct response bodies
 	// are a small set (welcome page, 404, API status, etc.)
 	if len(c.entries) >= maxReclassCacheEntries {
 		c.entries = make(map[string]reclassCacheEntry)
@@ -97,7 +97,7 @@ func (c *reclassCache) put(bodyHash string, downgraded bool, escalated bool, rea
 }
 
 // delete removes a specific body hash from the cache. Called when a human
-// correction overrides a Tier 2 evidence decision — the old cached verdict
+// correction overrides a Tier 2 evidence decision - the old cached verdict
 // must not persist. (design consensus: if you leave the wrong answer in
 // the fast-access cache, you haven't actually fixed the problem.)
 func (c *reclassCache) delete(bodyHash string) {

@@ -32,7 +32,7 @@ func TestAttackGuard_NginxEmbeddedAttackStillCaught(t *testing.T) {
 }
 
 // Documents the root cause: the old whole-line scanner DID match these, proving
-// the guard — not the data — was the problem.
+// the guard - not the data - was the problem.
 func TestAttackGuard_OldWholeLineScannerWasTheBug(t *testing.T) {
 	if !hasAttackIndicators("Started fwupd.service - Firmware update daemon.") {
 		t.Fatal("sanity: the bare-keyword scanner should still match UPDATE in service text")

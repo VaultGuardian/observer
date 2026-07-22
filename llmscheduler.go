@@ -6,13 +6,13 @@ import (
 )
 
 // =============================================================================
-// LLM Scheduler — Global Concurrency Control for All LLM Call Sites
+// LLM Scheduler - Global Concurrency Control for All LLM Call Sites
 // =============================================================================
 //
 // PROBLEM:
 //   Tier 1 classification had a semaphore. Tier 2 reclassification and
 //   catch-all verification did not. Under load, T2 and catch-all calls
-//   could run unbounded while T1 was being throttled — defeating the
+//   could run unbounded while T1 was being throttled - defeating the
 //   purpose of concurrency control.
 //
 // SOLUTION:

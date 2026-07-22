@@ -8,7 +8,7 @@
 //
 // The fundamental problem with v0.42.0–v0.42.6 was that TCP reassembly created
 // separate goroutines for request and response directions. The Go scheduler
-// determined which goroutine ran first — a coin flip when the kernel buffered
+// determined which goroutine ran first - a coin flip when the kernel buffered
 // both packets. Pair rate dropped from 99.6% to ~50%.
 //
 // The fix separates responsibilities:
@@ -18,13 +18,13 @@
 //   state before the response packet is even read from the socket.
 //
 //   Response body: parsed via TCP reassembly (gopacket/tcpassembly) in a
-//   goroutine. This is the thing reassembly was needed for — nginx splits
+//   goroutine. This is the thing reassembly was needed for - nginx splits
 //   response headers/body across segments for bare-IP / sendfile traffic.
 //
 //   Pairing: event-driven. Response side checks for a waiting request and
 //   pairs immediately. If no request exists (split headers, mid-stream
 //   capture), the response queues and expires after 2s as an orphan. Request
-//   side ONLY appends — it never consumes queued responses, because doing so
+//   side ONLY appends - it never consumes queued responses, because doing so
 //   on a keep-alive connection could pair Request B with Response A if
 //   Request A's headers were split.
 //
@@ -33,7 +33,7 @@
 // =============================================================================
 //
 // - Payload must START with a known HTTP method token (GET, POST, etc.).
-//   Never scan for "HTTP/" arbitrarily — a POST body could contain it.
+//   Never scan for "HTTP/" arbitrarily - a POST body could contain it.
 //
 // - TCP sequence dedupe: a ring buffer of the last 32 sequence numbers
 //   per flow prevents retransmits and duplicate captures from creating
@@ -91,7 +91,7 @@ func (sk streamKey) reverse() streamKey {
 
 type pendingRequest struct {
 	method    string
-	path      string // raw path including query string — SACRED
+	path      string // raw path including query string - SACRED
 	host      string
 	userAgent string
 	timestamp time.Time
@@ -106,7 +106,7 @@ type pendingResponse struct {
 }
 
 // seqRingSize is the number of TCP sequence numbers tracked per flow for
-// retransmit/duplicate detection. 32 is enough — a flow rarely has more
+// retransmit/duplicate detection. 32 is enough - a flow rarely has more
 // than a handful of requests in-flight simultaneously.
 const seqRingSize = 32
 
@@ -117,19 +117,19 @@ type flowPair struct {
 	requests  []*pendingRequest
 	responses []*pendingResponse
 
-	// TCP sequence dedupe ring — prevents retransmit/duplicate packets
+	// TCP sequence dedupe ring - prevents retransmit/duplicate packets
 	// from creating duplicate pending requests that poison FIFO pairing.
 	seenSeqs [seqRingSize]uint32
 	seenSeqN int // entries filled (up to seqRingSize)
 	seenSeqW int // next write position (wraps)
 
-	// Body tracking — when inline parser finds Content-Length > 0, we
+	// Body tracking - when inline parser finds Content-Length > 0, we
 	// track remaining body bytes to skip segments that are request body
 	// data. Prevents a crafted POST body starting with "GET /fake" from
 	// creating a ghost pending request.
 	bodyRemaining int64
 
-	// Chunked/unknown body guard — when the inline parser finds a
+	// Chunked/unknown body guard - when the inline parser finds a
 	// body-capable request with Transfer-Encoding: chunked or unknown
 	// body length, we cannot predict when the body ends from the request
 	// side alone. Set this flag to skip all subsequent client payloads
@@ -182,7 +182,7 @@ const maxInlineScan = 8192
 
 // httpMethodPrefixes is the exhaustive set of HTTP/1.x method tokens.
 // The inline parser requires the payload to START with one of these.
-// Parse all methods — let the classifier decide what matters.
+// Parse all methods - let the classifier decide what matters.
 var httpMethodPrefixes = [][]byte{
 	[]byte("GET "),
 	[]byte("POST "),
@@ -199,7 +199,7 @@ var httpMethodPrefixes = [][]byte{
 // Used by the port-learning fallback in processFrame to identify response
 // segments arriving on a port we don't yet know about. HTTP/2's binary
 // preface ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") is intentionally out of
-// scope — this sniffer is built for plaintext HTTP/1.x backends.
+// scope - this sniffer is built for plaintext HTTP/1.x backends.
 var httpResponsePrefixes = [][]byte{
 	[]byte("HTTP/1.1 "),
 	[]byte("HTTP/1.0 "),
@@ -263,7 +263,7 @@ func inlineParseRequest(payload []byte) *inlineParseResult {
 		return nil
 	}
 
-	// Cap scan length — never read beyond payload bounds.
+	// Cap scan length - never read beyond payload bounds.
 	scanLen := len(payload)
 	if scanLen > maxInlineScan {
 		scanLen = maxInlineScan
@@ -350,7 +350,7 @@ func inlineParseRequest(payload []byte) *inlineParseResult {
 	}
 
 	// Headers didn't terminate with \r\n\r\n within our scan window.
-	// We still have method/path — return what we have. headerLen stays 0
+	// We still have method/path - return what we have. headerLen stays 0
 	// which means body tracking won't activate (safe: we'd rather miss
 	// body tracking than skip legitimate requests).
 	return result
@@ -366,7 +366,7 @@ type sniffer struct {
 	maxBody   int
 	vxlanPort uint16
 
-	// HTTP ports — request direction: dstPort in set. Response direction:
+	// HTTP ports - request direction: dstPort in set. Response direction:
 	// srcPort in set.
 	//
 	// Backed by an atomic-snapshot registry that supports runtime port
@@ -446,7 +446,7 @@ func newSniffer(buffer *RingBuffer, iface string, ports []int, learnedPortCap in
 	s.assembler = tcpassembly.NewAssembler(pool)
 	s.assembler.MaxBufferedPagesTotal = reasm.MaxBufferedPagesTotal
 	s.assembler.MaxBufferedPagesPerConnection = reasm.MaxBufferedPagesPerConn
-	log.Printf("[rec:reassembly] response-only — maxBody=%d streamTTL=%s idleTimeout=%s pages_total=%d pages_per_conn=%d max_streams=%d",
+	log.Printf("[rec:reassembly] response-only - maxBody=%d streamTTL=%s idleTimeout=%s pages_total=%d pages_per_conn=%d max_streams=%d",
 		reasm.MaxBody, reasm.StreamTTL, reasm.IdleTimeout,
 		reasm.MaxBufferedPagesTotal, reasm.MaxBufferedPagesPerConn, reasm.MaxActiveStreams)
 	log.Printf("[rec:flows] maxFlows=%d maxReqPerFlow=%d maxRespPerFlow=%d respOrphanTimeout=%s reqExpireTimeout=%s",
@@ -527,7 +527,7 @@ func (s *sniffer) readLoop(ctx context.Context, fd int) {
 }
 
 // =============================================================================
-// processFrame — the packet dispatch hub
+// processFrame - the packet dispatch hub
 // =============================================================================
 //
 // Request-direction packets (dstPort is HTTP): inline-parsed for metadata,
@@ -542,7 +542,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 		return
 	}
 
-	// Try VXLAN decapsulation first — Swarm overlay traffic is wrapped.
+	// Try VXLAN decapsulation first - Swarm overlay traffic is wrapped.
 	if result, err := decapVXLAN(frame, s.vxlanPort); err == nil {
 		atomic.AddInt64(&s.vxlanCount, 1)
 		s.processFrame(result.InnerFrame, depth+1)
@@ -615,7 +615,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 	//
 	// CRITICAL: processing must be gated on registry
 	// admission (has(port)), NOT on learn()'s return value. learn()
-	// returns false in cases that should still be processed (race —
+	// returns false in cases that should still be processed (race -
 	// another goroutine learned the same port a moment earlier) AND in
 	// cases that should NOT be processed (cap=0 disables learning,
 	// cap full refuses, invalid port). The post-learn has() check
@@ -632,7 +632,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 				log.Printf("[rec:portlearn] Learned request port %d (HTTP method prefix)", port)
 			}
 			if !s.ports.has(port) {
-				return // refused (cap=0 / cap full / invalid) — not safe to process
+				return // refused (cap=0 / cap full / invalid) - not safe to process
 			}
 			isRequest = true
 		case hasHTTPResponsePrefix(payload):
@@ -641,7 +641,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 				log.Printf("[rec:portlearn] Learned response port %d (HTTP/1.x status line)", port)
 			}
 			if !s.ports.has(port) {
-				return // refused — not safe to process
+				return // refused - not safe to process
 			}
 			isResponse = true
 		default:
@@ -667,7 +667,7 @@ func (s *sniffer) processFrame(frame []byte, depth int) {
 }
 
 // =============================================================================
-// handleInlineRequest — synchronous request metadata capture
+// handleInlineRequest - synchronous request metadata capture
 // =============================================================================
 
 func (s *sniffer) handleInlineRequest(flowKey streamKey, tcpSeq uint32, payload []byte) {
@@ -720,7 +720,7 @@ func (s *sniffer) handleInlineRequest(flowKey streamKey, tcpSeq uint32, payload 
 
 	// Enforce max requests per flow.
 	if len(fp.requests) >= s.flowConfig.MaxRequestsPerFlow {
-		// Drop oldest — it was probably never going to get a response.
+		// Drop oldest - it was probably never going to get a response.
 		fp.requests = fp.requests[1:]
 		atomic.AddInt64(&s.requestsExpired, 1)
 	}
@@ -745,7 +745,7 @@ func (s *sniffer) handleInlineRequest(flowKey streamKey, tcpSeq uint32, payload 
 			fp.bodyRemaining = 0
 		}
 	} else if parsed.contentLength == -2 {
-		// Chunked transfer encoding — we cannot predict body end from
+		// Chunked transfer encoding - we cannot predict body end from
 		// the request side without parsing chunk framing. Set the guard
 		// flag and let the response side clear it when it pairs.
 		fp.skipUntilPaired = true
@@ -779,11 +779,11 @@ const evictionScanLimit = 64
 //
 // Priority order (best victim first):
 //
-//	priority 2: both queues empty — safest to drop, no in-flight pairing
-//	priority 1: responses queued, no pending requests — losing an orphan
+//	priority 2: both queues empty - safest to drop, no in-flight pairing
+//	priority 1: responses queued, no pending requests - losing an orphan
 //	            response is worse than losing an empty entry but does not
 //	            split a live request/response pair
-//	priority 0: pending requests — most expensive to drop because the
+//	priority 0: pending requests - most expensive to drop because the
 //	            matching response may still be in flight
 //
 // Within a tier, the first scanned candidate wins (no timestamp ordering;
@@ -794,7 +794,7 @@ const evictionScanLimit = 64
 // flow-table size. If no candidate is found in the scan window (only
 // possible when len(s.flows) > evictionScanLimit AND every scanned flow
 // holds a pending request), we still evict the first scanned entry so
-// the caller can make room — better to drop a live flow than to refuse
+// the caller can make room - better to drop a live flow than to refuse
 // admission and silently drop the incoming packet.
 //
 // flowEvictionsLive increments when the evicted flow had any pending
@@ -840,7 +840,7 @@ func (s *sniffer) evictOneFlow() {
 			victimKey = key
 			victimPriority = priority
 			if priority == 2 {
-				break // empty flow found — no better candidate possible
+				break // empty flow found - no better candidate possible
 			}
 		}
 	}
@@ -848,7 +848,7 @@ func (s *sniffer) evictOneFlow() {
 	if victimPriority < 0 {
 		// Scan returned nothing usable (map empty or all entries probed
 		// concurrently). Fall back to the first key the iterator
-		// produced — guaranteed valid as long as scanned > 0.
+		// produced - guaranteed valid as long as scanned > 0.
 		if !haveFallback {
 			return
 		}
@@ -882,19 +882,19 @@ func (s *sniffer) getOrCreateFlow(key streamKey) *flowPair {
 // it queues the response for later orphan expiry.
 //
 // Returns the paired pendingRequest (nil if queued as orphan candidate).
-// Does NOT hold the flow lock during buffer.Insert or onCapture — builds
+// Does NOT hold the flow lock during buffer.Insert or onCapture - builds
 // the action, unlocks, then the caller executes.
 //
 // Lock discipline (deadlock fix + queue-before-log race avoidance):
 //
 //   - flowsMu is acquired and released first to look up / create the flow.
 //   - fp.mu is then acquired. The state transition (pair or queue) happens
-//     entirely under fp.mu — no intermediate unlock. This is required
+//     entirely under fp.mu - no intermediate unlock. This is required
 //     because the request side only APPENDS to fp.requests; it never
 //     consumes queued responses. If we unlocked between "no request found"
 //     and "queue this response," a request could land in fp.requests in
 //     the gap, the response would queue after it, and neither side would
-//     ever pair them — they'd both sit until cleanupLoop expired them.
+//     ever pair them - they'd both sit until cleanupLoop expired them.
 //   - fp.mu is released before any verbose diagnostic runs.
 //   - logPairMiss (verbose path) snapshots candidate flows under flowsMu,
 //     releases flowsMu, then inspects each candidate's fp.mu independently.
@@ -919,7 +919,7 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 	if len(fp.requests) > 0 {
 		req := fp.requests[0]
 		fp.requests = fp.requests[1:]
-		// Clear chunked / split-header body guard — the response arrived,
+		// Clear chunked / split-header body guard - the response arrived,
 		// so the request body (chunked or otherwise) has been fully sent.
 		// Next client payload is a new request.
 		fp.skipUntilPaired = false
@@ -945,7 +945,7 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 
 	fp.mu.Unlock()
 
-	// Diagnostics run AFTER fp.mu is released — they may touch flowsMu
+	// Diagnostics run AFTER fp.mu is released - they may touch flowsMu
 	// and other fp.mus, which would deadlock against runCleanup if we
 	// still held this fp.mu.
 	if s.verbose {
@@ -957,14 +957,14 @@ func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pe
 
 // logPairMiss emits verbose diagnostic logging for a response that arrived
 // without a waiting request. Includes a cross-flow scan that looks for the
-// same server-side endpoint reached from a different ephemeral port — a
+// same server-side endpoint reached from a different ephemeral port - a
 // telltale sign of NAT or port rewriting separating request and response
 // into different flow keys.
 //
 // MUST be called with NO flow locks held. Takes flowsMu briefly to snapshot
 // candidate flow pointers into a slice, releases flowsMu, then probes each
 // candidate's fp.mu one at a time. The flow pointers remain valid even if
-// the flow is concurrently evicted from the map — the *flowPair struct
+// the flow is concurrently evicted from the map - the *flowPair struct
 // itself is GC-rooted by our snapshot slice for the duration of the scan.
 func (s *sniffer) logPairMiss(flowKey streamKey, captured CapturedResponse) {
 	log.Printf("[rec] PAIR MISS: status=%d body_bytes=%d src=%d.%d.%d.%d:%d dst=%d.%d.%d.%d:%d",
@@ -978,7 +978,7 @@ func (s *sniffer) logPairMiss(flowKey streamKey, captured CapturedResponse) {
 		atomic.LoadInt64(&s.requestsExpired))
 
 	// Snapshot candidate flows targeting the same server endpoint.
-	// Hold flowsMu only for the snapshot — do NOT take any fp.mu here.
+	// Hold flowsMu only for the snapshot - do NOT take any fp.mu here.
 	type otherFlow struct {
 		key streamKey
 		fp  *flowPair
@@ -1014,7 +1014,7 @@ func (s *sniffer) logPairMiss(flowKey streamKey, captured CapturedResponse) {
 }
 
 // =============================================================================
-// feedAssembler — response direction only
+// feedAssembler - response direction only
 // =============================================================================
 //
 // Only called for packets where srcPort is a known HTTP port. Feeds to
@@ -1036,19 +1036,19 @@ func (s *sniffer) feedAssembler(srcIP, dstIP [4]byte, srcPort, dstPort uint16, t
 }
 
 // =============================================================================
-// flushLoop — idle-timeout flush for response assembler
+// flushLoop - idle-timeout flush for response assembler
 // =============================================================================
 
 func (s *sniffer) flushLoop(ctx context.Context) {
 	// 200ms tick + the (now 250ms-default) IdleTimeout bounds the worst-case
 	// emit delay to ~450ms after the last packet of an idle stream. This
 	// SHRINKS the race window where a fast pattern-path finalize beats the
-	// captured response into the coordinator — it does NOT eliminate races.
+	// captured response into the coordinator - it does NOT eliminate races.
 	//
 	// Safe to tighten: FlushOlderThan only closes streams that have gone idle
 	// for longer than IdleTimeout. Active/large transfers keep receiving
 	// packets, so their cutoff keeps moving forward and they are never flushed
-	// mid-stream — i.e. no truncation of in-progress responses.
+	// mid-stream - i.e. no truncation of in-progress responses.
 	//
 	// TODO(rec): eager-emit. Emit a flow the moment a complete response is
 	// parseable (Content-Length satisfied / chunked terminator) instead of
@@ -1074,7 +1074,7 @@ func (s *sniffer) flushLoop(ctx context.Context) {
 }
 
 // =============================================================================
-// cleanupLoop — bidirectional flow expiry (1s interval)
+// cleanupLoop - bidirectional flow expiry (1s interval)
 // =============================================================================
 //
 // Response orphan timeout: 2s. If a response has been queued without a
@@ -1106,7 +1106,7 @@ func (s *sniffer) runCleanup() {
 	reqCutoff := now.Add(-s.flowConfig.RequestExpireTimeout)
 
 	// Step 1: Snapshot flow pointers under the global lock.
-	// This keeps flowsMu held for O(N) pointer copies — no per-flow
+	// This keeps flowsMu held for O(N) pointer copies - no per-flow
 	// locking, no buffer.Insert, no callbacks. On a busy server with
 	// 50K flows, this is ~50K pointer copies (~400KB), sub-millisecond.
 	type flowEntry struct {
@@ -1143,7 +1143,7 @@ func (s *sniffer) runCleanup() {
 			fp.responses = fp.responses[i:]
 		}
 
-		// Expire old requests — log each one when verbose.
+		// Expire old requests - log each one when verbose.
 		j := 0
 		for j < len(fp.requests) && fp.requests[j].timestamp.Before(reqCutoff) {
 			if s.verbose {

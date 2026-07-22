@@ -11,7 +11,7 @@ import (
 )
 
 // RecordFinding writes a classification outcome to the findings table.
-// This is the synchronous write path — used for direct/critical writes
+// This is the synchronous write path - used for direct/critical writes
 // (resolution updates, reconciler). For high-volume pipeline writes,
 // use Store.SubmitFinding() which routes through the async writer.
 func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
@@ -335,7 +335,7 @@ func (s *Store) RecordPipelineStats(ctx context.Context, stats *PipelineStats) e
 // security events while choking on noise logging.
 //
 // The FindingsWriter batches INSERTs in a background goroutine. If the
-// channel is full under DDoS, only recon/noise logging is dropped — real
+// channel is full under DDoS, only recon/noise logging is dropped - real
 // threat findings block until space is available.
 //
 // Design rule: "Never let async writer dropping apply to anything
@@ -346,7 +346,7 @@ func (s *Store) RecordPipelineStats(ctx context.Context, stats *PipelineStats) e
 // v0.52 P0 fix: prior to this fix, Stop() called
 // close(w.ch) while producers could still be in Submit(). Any goroutine in the
 // blocking send path (critical findings, channel full) would panic with
-// "send on closed channel". Fixed by using a dedicated stopCh signal — the data
+// "send on closed channel". Fixed by using a dedicated stopCh signal - the data
 // channel is never closed, so sends never race against a close.
 type FindingsWriter struct {
 	store   *Store
@@ -385,7 +385,7 @@ func (w *FindingsWriter) Submit(f *Finding) {
 	default:
 	}
 
-	// Channel full — only drop noise/recon
+	// Channel full - only drop noise/recon
 	if isDroppable(f) {
 		w.dropped.Add(1)
 		return
@@ -489,7 +489,7 @@ func (w *FindingsWriter) flushBatch(ctx context.Context, batch []*Finding) {
 
 	tx, err := w.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("[findings-writer] Failed to begin transaction: %v — writing %d findings individually", err, len(batch))
+		log.Printf("[findings-writer] Failed to begin transaction: %v - writing %d findings individually", err, len(batch))
 		// Fallback: try individual inserts
 		for _, f := range batch {
 			w.store.RecordFinding(ctx, f)
@@ -566,7 +566,7 @@ func (w *FindingsWriter) flushBatch(ctx context.Context, batch []*Finding) {
 }
 
 // isDroppable returns true for findings that can be safely dropped under
-// pressure. Only recon/allow/suppress are droppable — NEVER malicious,
+// pressure. Only recon/allow/suppress are droppable - NEVER malicious,
 // alert, policy, or resolution findings.
 func isDroppable(f *Finding) bool {
 	switch f.Verdict {

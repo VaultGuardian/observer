@@ -64,7 +64,7 @@ type Config struct {
 	// Memory pressure is now the primary eviction trigger: the byte ceiling
 	// is min(RECBufferMaxBytes, RECBufferMaxMB*1MB), and entries live up to
 	// RECBufferMaxAge (10m) as a relaxed safety backstop. The long age window
-	// is deliberate — during scanner bursts the LLM inference pipeline can
+	// is deliberate - during scanner bursts the LLM inference pipeline can
 	// queue 30–60s+ of work, so a tight 30s age cap evicted REC responses
 	// before the coordinator's evidence check could read them. RECBufferMaxMB
 	// (default 64) is the preferred operator dial and tightens the effective
@@ -98,13 +98,13 @@ type Config struct {
 	ExcludeUnits    map[string]bool
 
 	// LLM reasoning effort per tier
-	Tier1Effort string // "low", "medium", "high" — default "low"
-	Tier2Effort string // "low", "medium", "high" — default "medium"
+	Tier1Effort string // "low", "medium", "high" - default "low"
+	Tier2Effort string // "low", "medium", "high" - default "medium"
 
 	// SlowResponseThresholdMs gates the Path-1 transport-only downgrade in
 	// the evidence callback. When REC measured a real wire-paired request
 	// duration (LatencySource == "wire_pair") at or above this many
-	// milliseconds, a 403/404/405/410 is NOT auto-downgraded — the timing
+	// milliseconds, a 403/404/405/410 is NOT auto-downgraded - the timing
 	// may itself be evidence (time-based blind injection), so the event
 	// falls through to body-aware reclassification with the latency in the
 	// prompt. Absent or sub-threshold durations downgrade as before.
@@ -154,11 +154,11 @@ func LoadConfig() Config {
 		DashboardKeyFile:        getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
 		DashboardBindAddr:       getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
 
-		// REC reassembly tuning — response-only, bounds are tunable.
+		// REC reassembly tuning - response-only, bounds are tunable.
 		RECReassemblyMaxBody:   getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
 		RECReassemblyStreamTTL: getEnvDuration("REC_REASSEMBLY_STREAM_TTL", 5*time.Second),
 		// 250ms (was 2s): a completed response should not wait on a 2s idle
-		// flush before REC emits it — fast pattern-path finalizes were beating
+		// flush before REC emits it - fast pattern-path finalizes were beating
 		// the evidence into the coordinator, yielding "no response captured".
 		// This SHRINKS the race window (worst case ~450ms with the 200ms
 		// flushLoop tick); it does not make races impossible. Idle-only flush
@@ -217,7 +217,7 @@ func LoadConfig() Config {
 		log.Printf("[observer] Excluding containers: %s", raw)
 	}
 
-	// REC_EXCLUDE_CONTAINERS — containers to exclude from REC namespace
+	// REC_EXCLUDE_CONTAINERS - containers to exclude from REC namespace
 	// monitoring. Session 2 uses this only to annotate the dry-run discovery
 	// inventory; matching normalizes both sides (base name, lowercased) inside
 	// the rec package, so a Swarm-suffixed or differently-cased name still matches.
@@ -249,7 +249,7 @@ func LoadConfig() Config {
 	// the registry explicitly: REC_PORTS=80,8080,3000.
 	//
 	// The sniffer learns additional ports at runtime from payload
-	// prefixes, so this list is a seed/hint — getting it exactly
+	// prefixes, so this list is a seed/hint - getting it exactly
 	// right is not required for correctness.
 	cfg.RECPorts = []int{80, 8080}
 	if raw := getEnv("REC_PORTS", ""); raw != "" {

@@ -26,8 +26,8 @@ type AnalysisResult struct {
 	Reason  string                   `json:"reason,omitempty"` // Why this verdict
 	Source  string                   `json:"source,omitempty"` // "pattern", "llm", "seeded"
 
-	// Pattern match fields — populated on cache hits so the dashboard
-	// can offer "Wrong — delete pattern" for cached events.
+	// Pattern match fields - populated on cache hits so the dashboard
+	// can offer "Wrong - delete pattern" for cached events.
 	PatternScope  string `json:"pattern_scope,omitempty"`
 	PatternBucket string `json:"pattern_bucket,omitempty"` // allow, malicious, alert, suppress
 	PatternValue  string `json:"pattern_value,omitempty"`
@@ -44,7 +44,7 @@ type AnalysisResult struct {
 	LLMVerdict        *llm.Verdict `json:"-"` // full verdict with call metadata for audit trail
 
 	// LLMClampedToAlert: the T1 LLM said action=malicious for an HTTP event,
-	// and the applied verdict was capped to alert — outcome claims require
+	// and the applied verdict was capped to alert - outcome claims require
 	// response evidence (T2). The LLMVerdict above keeps the model's original
 	// action; the divergence is intentional and queryable (the audit row's
 	// Action stays "malicious", FinalVerdict records "alert"). Set on leader
@@ -74,7 +74,7 @@ type Analyzer struct {
 	// prePinEvidence is called before an event enters the LLM path
 	// (pattern store miss). Promotes any matching REC ring buffer entry
 	// to VIP so evidence survives the LLM classification delay.
-	// Optional — nil means no pre-pinning (REC disabled or not wired).
+	// Optional - nil means no pre-pinning (REC disabled or not wired).
 	prePinEvidence func(evt *event.Event)
 
 	// classifyGroup coalesces concurrent Tier-1 classifications for the same
@@ -82,10 +82,10 @@ type Analyzer struct {
 	// call. A burst of identical events that all miss the pattern cache before
 	// the first verdict is learned would otherwise each acquire a slot, call
 	// the LLM, and re-learn the same pattern. One shared group covers BOTH
-	// Analyze and AnalyzeRetry — see classifyDeduped. Zero value is ready to use.
+	// Analyze and AnalyzeRetry - see classifyDeduped. Zero value is ready to use.
 	classifyGroup singleflight.Group
 
-	// stats uses atomic counters — safe for concurrent goroutines.
+	// stats uses atomic counters - safe for concurrent goroutines.
 	stats Stats
 }
 
@@ -96,7 +96,7 @@ type Analyzer struct {
 type classifyFlightResult struct {
 	Verdict        *llm.Verdict              // shared LLM verdict; nil for non-llm outcomes
 	PatternLearned bool                      // whether the leader learned a pattern
-	LeaderEventID  string                    // the leader's evt.ID — used to tell leader from followers
+	LeaderEventID  string                    // the leader's evt.ID - used to tell leader from followers
 	Source         string                    // "llm" | "pattern" | "backpressure" | "retry_cancelled" | "error"
 	Reason         string                    // populated for "error"
 	Match          *patternstore.MatchResult // populated for "pattern" (in-flight re-check hit)
@@ -134,7 +134,7 @@ type Stats struct {
 	// log lines to identify offending patterns or LLM behavior to correct.
 	DisclosureOverrides atomic.Int64 `json:"disclosure_overrides"`
 
-	// T1 LLM "malicious" verdicts on HTTP events capped to "alert" —
+	// T1 LLM "malicious" verdicts on HTTP events capped to "alert" -
 	// outcome-claiming verdicts require response evidence (T2 escalation is
 	// the legitimate path to malicious). Counted once per coalesced flight,
 	// like LLMCalls. See the [clamp] log lines for the affected events.
@@ -198,7 +198,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// 404" and decides "failed probe, no attack payload in /missing").
 	// The disclosure would never reach the malicious-seed check.
 	//
-	// We check BOTH raw and normalized — the normalizer may scrub or
+	// We check BOTH raw and normalized - the normalizer may scrub or
 	// preserve the disclosure depending on source family, so checking
 	// both forms catches it either way.
 	hasDisclosure := containsHighRiskDisclosure(evt.Line) ||
@@ -230,10 +230,10 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// says "alert" for a clean 404 probe. One bad call, cached forever, 70 emails.
 	// Same lesson as stack traces: don't let the LLM vote on structural facts.
 	//
-	// POLICY (v0.47 override): suppression is pure status-based — attack
+	// POLICY (v0.47 override): suppression is pure status-based - attack
 	// indicators in the path do NOT escape this gate (a failed probe is a
 	// failed probe regardless of what was probed; see isFailedProbe). Only
-	// high-risk disclosures bypass it, via the guard above — those are
+	// high-risk disclosures bypass it, via the guard above - those are
 	// actual data leakage in the line, not scanner intent.
 	if !hasDisclosure {
 		if reason, ok := isFailedProbe(evt.NormalizedLine); ok {
@@ -257,7 +257,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// strings. Even post-v0.47 caches could land on a poisoned line at
 	// 0.70+ confidence by accident.
 	//
-	// MALICIOUS and ALERT cache hits are escalations, not suppression —
+	// MALICIOUS and ALERT cache hits are escalations, not suppression -
 	// they fire the alert path and are correct to honor regardless of
 	// disclosure presence. Only SUPPRESS and ALLOW are overridden.
 	//
@@ -313,7 +313,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 // then does a BLOCKING LLM acquire if still unknown.
 //
 // v0.47: same disclosure-override semantics
-// as Analyze() — a cached SUPPRESS or ALLOW verdict on a disclosure-bearing
+// as Analyze() - a cached SUPPRESS or ALLOW verdict on a disclosure-bearing
 // line must not be honored. Falls through to blocking LLM classification.
 func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisResult {
 	a.stats.Retried.Add(1)
@@ -367,7 +367,7 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 //
 // One leader runs runClassifyFlight; every follower attaches to its result. The
 // leader is identified by LeaderEventID == evt.ID (NOT singleflight's shared
-// bool — the leader can also observe shared==true). Each caller then builds its
+// bool - the leader can also observe shared==true). Each caller then builds its
 // own per-event AnalysisResult.
 func (a *Analyzer) classifyDeduped(ctx context.Context, evt *event.Event, hasDisclosure, retry bool) AnalysisResult {
 	key := evt.ScopeKey() + "\x00" + evt.Hash + "\x00disc=" + strconv.FormatBool(hasDisclosure)
@@ -392,14 +392,14 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 	// (AcquireBlocking), the leader's acquire mode applies to every coalesced
 	// follower: under scheduler saturation a fresh event may block for one
 	// LLM-call duration instead of deferring, and a retry event may defer again
-	// instead of blocking. This is an accepted, bounded trade-off — it only
+	// instead of blocking. This is an accepted, bounded trade-off - it only
 	// applies within the pre-learn window for a given key and self-heals once
 	// the pattern is cached. The single shared group is intentional; do not
 	// split it (splitting would re-open the cross-path stampede).
 	var release func()
 	var ok bool
 	if retry {
-		// Blocking acquire — wait for a slot, this event deserves classification.
+		// Blocking acquire - wait for a slot, this event deserves classification.
 		if release, ok = a.llmScheduler.AcquireBlocking(ctx); !ok {
 			fr.Source = "retry_cancelled"
 			return fr
@@ -418,7 +418,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 	// band (operator action, T2 reclassification) since the per-event Match.
 	// Re-checking after the (possibly blocking) acquire and before the LLM call
 	// avoids a redundant classification. The disclosure-override guard mirrors
-	// Analyze/AnalyzeRetry — a cached suppress/allow on a disclosure line is not
+	// Analyze/AnalyzeRetry - a cached suppress/allow on a disclosure line is not
 	// honored. We do not re-increment DisclosureOverrides here: the per-event
 	// Match already counted any poisoned cache entry, and learnFromVerdict never
 	// learns suppress/allow for a disclosure line, so no fresh such entry exists.
@@ -447,7 +447,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 		a.stats.LLMErrors.Add(1)
 		log.Printf("[analyzer] LLM error for %s: %v", evt.ScopeKey(), err)
 
-		// On LLM failure, return unknown — don't auto-allow or auto-malicious
+		// On LLM failure, return unknown - don't auto-allow or auto-malicious
 		fr.Source = "error"
 		fr.Reason = fmt.Sprintf("LLM error: %v", err)
 		fr.Err = err
@@ -476,7 +476,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 	// A T1 verdict judges only the REQUEST; "malicious" is an outcome claim,
 	// and outcomes require response evidence (T2 escalation is the legitimate
 	// path to malicious). Computed HERE, before learning, so the learned hash
-	// lands in the ALERT bucket — clamping only at verdict-mapping time would
+	// lands in the ALERT bucket - clamping only at verdict-mapping time would
 	// let the pattern tier resurrect malicious-without-evidence on the next
 	// identical line. verdict itself is never mutated: it is the immutable
 	// original that resultRouter records to the audit trail. Non-HTTP events
@@ -498,7 +498,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 
 // buildResult turns a shared classifyFlightResult into this caller's own
 // AnalysisResult. Followers (isLeader == false) carry the shared verdict's flat
-// fields so routing and findings work, but NOT the *llm.Verdict — that keeps
+// fields so routing and findings work, but NOT the *llm.Verdict - that keeps
 // followers from writing duplicate llm_decisions audit rows (resultRouter gates
 // the audit row on Source=="llm" && LLMVerdict != nil), so the audit count
 // reflects real LLM calls, not coalesced events.
@@ -548,7 +548,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 	default: // "llm"
 		v := mapActionToVerdict(fr.Verdict.Action)
 		if fr.ClampedToAlert {
-			// Applied verdict only — fr.Verdict stays the immutable original.
+			// Applied verdict only - fr.Verdict stays the immutable original.
 			v = patternstore.VerdictAlert
 		}
 		result := AnalysisResult{
@@ -578,7 +578,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 //   - Confidence gate at 0.70 for hash learning of allow/suppress (was: no gate).
 //   - Confidence gate at 0.85 for generalized prefix/regex/contains (unchanged).
 //   - Regex-fallback-to-prefix learning REMOVED. Validation saying "no" now
-//     means no — we don't downgrade a failed regex into a 40-char prefix.
+//     means no - we don't downgrade a failed regex into a 40-char prefix.
 //     The exact hash was already learned earlier in this function (when
 //     confidence >= 0.70), so we still get fast-path caching for repeats.
 //
@@ -587,7 +587,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 //   - allow / suppress: hash at >= 0.70, generalized at >= 0.85
 //   - low confidence (< 0.70): nothing is learned
 //
-// effectiveAction is the action actually applied to the event — usually
+// effectiveAction is the action actually applied to the event - usually
 // verdict.Action, but "alert" when the T1 malicious clamp fired. Passed
 // separately rather than via a mutated verdict copy: verdict is the immutable
 // original the audit trail records, and a divergent copy invites accidental
@@ -620,7 +620,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// would fire repeatedly on every recurrence, burning LLM calls and
 	// cluttering [analyzer] DISCLOSURE_OVERRIDE log lines forever.
 	//
-	// MALICIOUS and ALERT learning is still allowed — those are escalations,
+	// MALICIOUS and ALERT learning is still allowed - those are escalations,
 	// not suppression. Caching them on a disclosure line is correct (and the
 	// cache hit on next encounter takes the alert/escalation path correctly).
 	hasDisclosure := containsHighRiskDisclosure(evt.Line) ||
@@ -638,13 +638,13 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// for it. A bad LLM call (wrong classification at 0.70+ confidence) would
 	// otherwise permanently suppress lines containing e.g. UNION SELECT.
 	//
-	// MALICIOUS and ALERT learning is still allowed — caching an escalation
+	// MALICIOUS and ALERT learning is still allowed - caching an escalation
 	// on an attack-indicator line is correct behavior.
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
 		if hasAttackPayloadForLearning(evt.NormalizedLine) {
 			log.Printf("[analyzer] ATTACK_INDICATOR_REFUSE_LEARN: refusing to learn %s for %s - parsed HTTP request contains attack indicators",
 				v, scopeKey)
-			a.stats.DisclosureOverrides.Add(1) // reuse counter — both are "refuse to learn" events
+			a.stats.DisclosureOverrides.Add(1) // reuse counter - both are "refuse to learn" events
 			return false
 		}
 	}
@@ -664,7 +664,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	}
 
 	// For alert, learn the exact hash so identical suspicious lines get instant
-	// alerts without burning another LLM call. Stored as VerdictAlert — semantically
+	// alerts without burning another LLM call. Stored as VerdictAlert - semantically
 	// distinct from VerdictMalicious (suspicious vs confirmed-bad). Hash-only, no patterns,
 	// no generalization. The conservative trust model is preserved.
 	if effectiveAction == "alert" {
@@ -677,7 +677,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 		return false
 	}
 
-	// SOURCE HINT CHECK — REMOVED (v0.12)
+	// SOURCE HINT CHECK - REMOVED (v0.12)
 	//
 	// Previously, we asked the LLM to tell us what service the log came from,
 	// then verified its guess against the actual source. This was backwards:
@@ -690,11 +690,11 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// known source directly. The sourceHintMatches() function is preserved below
 	// for reference but no longer gates pattern learning.
 	//
-	// If source_hint is still in the LLM prompt, it's harmless — we just ignore it.
+	// If source_hint is still in the LLM prompt, it's harmless - we just ignore it.
 
 	// === Generalized-pattern gate (unchanged) ===
 	// Hash learning was permitted at 0.70+, but generalized prefix/regex/contains
-	// requires more confidence — these affect future events that don't share the
+	// requires more confidence - these affect future events that don't share the
 	// exact normalized line.
 	if verdict.Confidence < 0.85 {
 		log.Printf("[analyzer] Confidence %.2f below 0.85 for generalized pattern (hash-only learned)", verdict.Confidence)
@@ -782,7 +782,7 @@ func (a *Analyzer) Persist() error {
 // =============================================================================
 //
 // Cheap, regex-free detection of application noise that should never reach
-// the LLM or pattern store. These are structural patterns — the shape of
+// the LLM or pattern store. These are structural patterns - the shape of
 // the line tells you it's noise, not the content.
 //
 // WHY THIS EXISTS:
@@ -806,7 +806,7 @@ func (a *Analyzer) Persist() error {
 // The operational-noise filter suppresses stack traces and framework noise
 // before they can reach the pattern store or LLM. That filter must NEVER
 // shadow a confirmed exfiltration string. A Java exception with the file
-// content stuck in the message — e.g.
+// content stuck in the message - e.g.
 //
 //	"Caused by: java.io.IOException: read failed: root:x:0:0:root:/root:..."
 //
@@ -822,10 +822,10 @@ func (a *Analyzer) Persist() error {
 // Strings here are duplicated from seeds.go (package main, not importable
 // from internal/analyzer). They are stable, manually curated, and short
 // enough that a periodic cross-check is the right consistency strategy.
-// Length floor of ~12 chars per indicator is intentional — these must be
+// Length floor of ~12 chars per indicator is intentional - these must be
 // distinctive enough that benign log content cannot collide.
 var highRiskDisclosureIndicators = []string{
-	// /etc/passwd format — root:x:0:0:root...
+	// /etc/passwd format - root:x:0:0:root...
 	"root:x:0:0:root",
 	// Cryptographic key headers
 	"BEGIN RSA PRIVATE KEY",
@@ -836,12 +836,12 @@ var highRiskDisclosureIndicators = []string{
 	// Cloud / infrastructure credentials
 	"AWS_SECRET_ACCESS_KEY",
 	"aws_secret_access_key",
-	// Shell / privilege markers — output of `id` command in a web container
+	// Shell / privilege markers - output of `id` command in a web container
 	"uid=0(root)",
 }
 
 // containsHighRiskDisclosure returns true if the line contains any string
-// from highRiskDisclosureIndicators. Case-sensitive on purpose — the seeded
+// from highRiskDisclosureIndicators. Case-sensitive on purpose - the seeded
 // indicators are exact wire formats (private key PEM headers, /etc/passwd
 // records, AWS env-var names), not natural-language tokens. Lowercasing
 // would create false positives on technical prose.
@@ -856,7 +856,7 @@ func containsHighRiskDisclosure(line string) bool {
 
 func isOperationalNoise(line string) bool {
 	// v0.47: if the line contains a high-risk disclosure
-	// string, never suppress as noise — let it proceed to malicious-seed
+	// string, never suppress as noise - let it proceed to malicious-seed
 	// matching and LLM classification. Catches the case where an exception
 	// stack trace happens to wrap dumped credentials in its message.
 	if containsHighRiskDisclosure(line) {
@@ -878,7 +878,7 @@ func isOperationalNoise(line string) bool {
 	// --- Node.js / JavaScript stack frames ---
 	// "    at handleDocumentRequest (/app/node_modules/@remix-run/server-runtime/dist/server.js:275:35)"
 	// "    at async Object.requestHandler (/app/node_modules/...)"
-	// CHECK BEFORE TrimSpace — the leading whitespace IS the signal.
+	// CHECK BEFORE TrimSpace - the leading whitespace IS the signal.
 	// TrimSpace would eat the indentation that distinguishes a stack frame
 	// from a normal log line starting with "at".
 	if len(trimmed) > 4 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
@@ -931,11 +931,11 @@ func isOperationalNoise(line string) bool {
 //
 // Two detection paths:
 //
-// Path 1 — HTTP access logs with failed status codes (404/403/405/400/410).
+// Path 1 - HTTP access logs with failed status codes (404/403/405/400/410).
 //   The normalizer preserves the status code. If the request has no attack
 //   payload and isn't targeting a sensitive path, suppress it.
 //
-// Path 2 — Nginx error logs with "No such file or directory" (v0.16).
+// Path 2 - Nginx error logs with "No such file or directory" (v0.16).
 //   Structurally equivalent to a 404. The file doesn't exist on disk.
 //   Same safety checks apply: attack indicators and sensitive paths
 //   bypass suppression.
@@ -951,7 +951,7 @@ func isOperationalNoise(line string) bool {
 //   produced 70 alert patterns and 20+ emails from a single phpunit scan.
 
 // =============================================================================
-// !!! SYNC WITH httpparse.go — keep these in lockstep !!!
+// !!! SYNC WITH httpparse.go - keep these in lockstep !!!
 // =============================================================================
 //
 // The structural HTTP regexes below are intentionally duplicated from the
@@ -990,7 +990,7 @@ func isOperationalNoise(line string) bool {
 //
 // FIX: Use STRUCTURED parsers anchored to format. These are direct copies of
 // the regexes in the package-main httpparse.go (Format 1/2/3 nginx/Apache
-// log shapes) — cross-package import isn't possible because httpparse.go is
+// log shapes) - cross-package import isn't possible because httpparse.go is
 // package main. The duplication is small and the formats have been stable
 // since the 1990s; if they ever drift, both sites must update together.
 //
@@ -1002,41 +1002,41 @@ func isOperationalNoise(line string) bool {
 //   to a real request-line terminator, not a free-floating "first match wins."
 //
 // PARSED PATH ONLY: Safety checks (hasSensitivePath, hasAttackIndicators)
-// now run on the parsed `path` — not the whole line. This eliminates the
+// now run on the parsed `path` - not the whole line. This eliminates the
 // secondary attack class where an attack indicator inside the *response
 // portion* of the log triggered "looks safe" or "looks dangerous" wrongly.
 
 var httpMethodsRE = `GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE`
 
-// reHTTPHosted: Format 1 — "vhost METHOD /path HTTP/x.y NNN"
+// reHTTPHosted: Format 1 - "vhost METHOD /path HTTP/x.y NNN"
 var reHTTPHosted = regexp.MustCompile(
 	`^\S+\s+(` + httpMethodsRE + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// reHTTPQuoted: Format 2 — `... "METHOD /path HTTP/x.y" NNN`
+// reHTTPQuoted: Format 2 - `... "METHOD /path HTTP/x.y" NNN`
 // Status anchored after the literal closing quote of HTTP version.
 var reHTTPQuoted = regexp.MustCompile(
 	`"(` + httpMethodsRE + `)\s+(\S+)\s+HTTP/\S+"\s+(\d{3})`)
 
-// reHTTPBare: Format 3 — "METHOD /path HTTP/x.y NNN" at start of line.
+// reHTTPBare: Format 3 - "METHOD /path HTTP/x.y NNN" at start of line.
 var reHTTPBare = regexp.MustCompile(
 	`^(` + httpMethodsRE + `)\s+(\S+)\s+HTTP/\S+\s+(\d{3})`)
 
-// reHTTPMorgan: Format 4 — Express/morgan access logs (captain-captain):
+// reHTTPMorgan: Format 4 - Express/morgan access logs (captain-captain):
 // "GET /api/keys 200 0.563 ms - 83". No HTTP/x.x token; the status follows
 // the path directly, so the strict "<status> <time> ms - <bytes|->" tail is
 // what keeps this from firing on arbitrary "METHOD path 200 ..." lines.
 //
-// KEEP IN SYNC with reMorganHTTP in the root package (httpparse.go) — the
+// KEEP IN SYNC with reMorganHTTP in the root package (httpparse.go) - the
 // router uses that one to decide an event IS HTTP (coordinator routing, REC
 // lookup) while the clamp/learning gates here use this one. If they drift,
-// morgan lines become HTTP to the router but invisible to the T1 clamp —
+// morgan lines become HTTP to the router but invisible to the T1 clamp -
 // exactly the LLM-malicious-with-no-evidence gap this format closes.
 var reHTTPMorgan = regexp.MustCompile(
 	`^(` + httpMethodsRE + `)\s+(\S+)\s+(\d{3})\s+\d+(?:\.\d+)?\s+ms\s+-\s+(\d+|-)`)
 
 // parseHTTPIdentity extracts (method, path, status) from a normalized log
 // line using the structured Format 1/2/3 parsers. Returns zero values for
-// non-HTTP lines (error logs, syslog, etc.) — callers must treat the empty
+// non-HTTP lines (error logs, syslog, etc.) - callers must treat the empty
 // method as "not an access log line."
 //
 // Path is returned with query string intact. Status is returned as a string
@@ -1052,7 +1052,7 @@ func parseHTTPIdentity(normalizedLine string) (method, path, status string) {
 	if m := reHTTPBare.FindStringSubmatch(normalizedLine); m != nil {
 		return m[1], m[2], m[3]
 	}
-	// Format 4 tried LAST, mirroring httpparse.go's ordering — nginx-format
+	// Format 4 tried LAST, mirroring httpparse.go's ordering - nginx-format
 	// lines with an HTTP/x.x token never reach it.
 	if m := reHTTPMorgan.FindStringSubmatch(normalizedLine); m != nil {
 		return m[1], m[2], m[3]
@@ -1075,7 +1075,7 @@ func eventHasHTTPIdentity(evt *event.Event) bool {
 
 // hasAttackPayloadForLearning reports whether a line carries an actual attack
 // payload that should block suppress/allow learning. It scans ONLY the HTTP
-// request portion of the line — never arbitrary service text.
+// request portion of the line - never arbitrary service text.
 //
 // The raw attackIndicators list contains bare SQL keywords ("UPDATE", "SELECT",
 // "DROP", "DELETE", ...). Run against a whole non-HTTP log line via
@@ -1085,7 +1085,7 @@ func eventHasHTTPIdentity(evt *event.Event) bool {
 // ATTACK_INDICATOR_REFUSE_LEARN and re-classify on every occurrence instead of
 // caching. Attack payloads only appear in request paths/query strings, so we
 // restrict the scan to a parsed request path or the request embedded in an
-// nginx error log. Malicious/alert learning is unaffected — this guards only
+// nginx error log. Malicious/alert learning is unaffected - this guards only
 // the suppress/allow learn path.
 func hasAttackPayloadForLearning(normalizedLine string) bool {
 	if _, path, _ := parseHTTPIdentity(normalizedLine); path != "" {
@@ -1108,7 +1108,7 @@ var (
 
 // failedStatusCodes are HTTP status codes that indicate a probe found nothing.
 // NOTE: 401 (Unauthorized) is deliberately excluded. A 401 means "this endpoint
-// exists and requires auth" — that's surface discovery, not pure nothing.
+// exists and requires auth" - that's surface discovery, not pure nothing.
 // Note: /admin returning 401 is a meaningful finding.
 var failedStatusCodes = map[string]bool{
 	"400": true, // Bad request
@@ -1119,7 +1119,7 @@ var failedStatusCodes = map[string]bool{
 }
 
 // =============================================================================
-// Probe Classification Helpers — RESERVED FOR FUTURE PROBES VIEW
+// Probe Classification Helpers - RESERVED FOR FUTURE PROBES VIEW
 // =============================================================================
 //
 // v0.47 (policy override): the helpers below classify probe shape
@@ -1133,7 +1133,7 @@ var failedStatusCodes = map[string]bool{
 // IMPORTANT: deterministic-suppressed failed probes are currently NOT
 // persisted anywhere. The orchestration path returns at Route() before
 // any finding write. If the future Probes view needs probe history, a
-// dedicated write path (or `probes` table) must be added — the classifier
+// dedicated write path (or `probes` table) must be added - the classifier
 // helpers below will then be useful for filtering and aggregation. Until
 // that view is built, these helpers are dead code maintained as
 // intelligence-surface scaffolding.
@@ -1161,8 +1161,8 @@ var attackIndicators = []string{
 // Probes view classification. Not used in routing.
 //
 // Original source: deep research (2026-03-24).
-// That decision was overridden in v0.47 — sensitive-path probes no longer
-// escape suppression — but the path list itself remains useful as a
+// That decision was overridden in v0.47 - sensitive-path probes no longer
+// escape suppression - but the path list itself remains useful as a
 // classifier label for the Probes view.
 var sensitivePaths = []string{
 	"/.env",
@@ -1198,7 +1198,7 @@ var sensitivePaths = []string{
 // the Probes view is built.
 //
 // Decode is bounded: input + decode-once + decode-twice. No recursion, no
-// loop — three candidates max — so a malformed input cannot expand without
+// loop - three candidates max - so a malformed input cannot expand without
 // limit. Forgiving decoder so malformed escapes don't discard the whole
 // string (the way stdlib url.QueryUnescape does).
 func hasAttackIndicators(request string) bool {
@@ -1254,7 +1254,7 @@ func attackIndicatorCandidates(input string) []string {
 //
 // Performance: single pass, O(n), no allocations beyond the result builder.
 func forgivingURLDecode(input string) string {
-	// Fast path: no percent-encoded bytes and no plus signs — nothing to do.
+	// Fast path: no percent-encoded bytes and no plus signs - nothing to do.
 	if !strings.ContainsAny(input, "%+") {
 		return input
 	}
@@ -1266,14 +1266,14 @@ func forgivingURLDecode(input string) string {
 		c := input[i]
 		switch {
 		case c == '%' && i+2 < len(input) && isHexByte(input[i+1]) && isHexByte(input[i+2]):
-			// Valid triplet — decode it
+			// Valid triplet - decode it
 			b.WriteByte(unhexByte(input[i+1])<<4 | unhexByte(input[i+2]))
 			i += 3
 		case c == '+':
 			b.WriteByte(' ')
 			i++
 		default:
-			// Malformed escape (e.g. "%zz") or any non-encoded byte — pass through.
+			// Malformed escape (e.g. "%zz") or any non-encoded byte - pass through.
 			b.WriteByte(c)
 			i++
 		}
@@ -1330,7 +1330,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false
 	}
 
-	// v0.47: defense-in-depth — high-risk disclosure
+	// v0.47: defense-in-depth - high-risk disclosure
 	// must never be suppressed by ANY deterministic gate. The Analyze()
 	// orchestration layer also enforces this, but a function-level guard
 	// keeps the safety property correct in isolation. Cheap (single-pass
@@ -1352,7 +1352,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 	// the main dashboard with orange noise that drowns real alerts.
 	//
 	// NOTE: deterministic-suppressed failed probes are NOT currently written
-	// to the findings store — they return at Route() before any DB write.
+	// to the findings store - they return at Route() before any DB write.
 	// If the future Probes view needs probe history, a separate write path
 	// (or a dedicated `probes` table) must be added. The classifier helpers
 	// below (hasSensitivePath, hasAttackIndicators) remain available for
@@ -1372,7 +1372,7 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 	// regex-spoofing attack class.
 	//
 	// v0.47 (policy override): pure status-based suppression. No
-	// sensitive-path or attack-indicator escapes — failed = suppress.
+	// sensitive-path or attack-indicator escapes - failed = suppress.
 	method, _, statusCode := parseHTTPIdentity(normalizedLine)
 	if method == "" {
 		return "", false // not an HTTP access log line

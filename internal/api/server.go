@@ -32,7 +32,7 @@ import (
 //
 // DESIGN PRINCIPLE: The API is the control surface for Observer.
 // It must live in the same process as the pattern store, SQLite,
-// and LLM client — not a separate service.
+// and LLM client - not a separate service.
 
 // ServerConfig holds API server configuration.
 type ServerConfig struct {
@@ -43,7 +43,7 @@ type ServerConfig struct {
 	// If the file doesn't exist, a new key is auto-generated.
 	KeyFile string
 
-	// Interface address to bind. Default 127.0.0.1 (localhost only — safest).
+	// Interface address to bind. Default 127.0.0.1 (localhost only - safest).
 	// Set to 0.0.0.0 ONLY when fronting with a reverse proxy or VPN, AND
 	// firewalling the port to known sources. Bare 0.0.0.0 + open firewall
 	// exposes the control plane to the public internet.
@@ -75,7 +75,7 @@ type Server struct {
 	// Pre-computed CORS origin lookup for O(1) allowlist checks.
 	allowedOrigins map[string]struct{}
 
-	// Human correction callbacks — narrow interfaces to avoid coupling
+	// Human correction callbacks - narrow interfaces to avoid coupling
 	// the API package to coordinator/reclassCache internals.
 	// Set via SetCorrectionCallbacks() after construction.
 	//
@@ -196,7 +196,7 @@ func (s *Server) Start() error {
 	mux.Handle("/api/trusted-ips/delete", s.requireAuth(http.HandlerFunc(s.handleDeleteTrustedIP)))
 	mux.Handle("/api/corrections", s.requireAuth(http.HandlerFunc(s.handleCorrection)))
 
-	// Default bind to localhost if not configured. Defense in depth — if
+	// Default bind to localhost if not configured. Defense in depth - if
 	// somehow the config arrived without a BindAddr, lock down rather than
 	// expose the control plane.
 	bindAddr := s.config.BindAddr
@@ -205,7 +205,7 @@ func (s *Server) Start() error {
 	}
 	addr := net.JoinHostPort(bindAddr, strconv.Itoa(s.config.Port))
 
-	// Visible startup state — makes "why doesn't my dashboard connect" debuggable.
+	// Visible startup state - makes "why doesn't my dashboard connect" debuggable.
 	log.Printf("[api] Dashboard API listening: bind=%s port=%d cors_origins=%d key_file=%s",
 		bindAddr, s.config.Port, len(s.allowedOrigins), s.config.KeyFile)
 
@@ -246,7 +246,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // corsMiddleware sets CORS headers only for explicitly allowed origins.
 //
 // Empty allowlist = no CORS headers (correct for server-side proxy patterns
-// where the browser never directly hits Observer — e.g. Vercel proxy).
+// where the browser never directly hits Observer - e.g. Vercel proxy).
 //
 // Non-empty allowlist = echo matched Origin (not wildcard). Browsers reject
 // wildcard + credentials, and our bearer-token API benefits from the same
@@ -267,7 +267,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Preflight — return immediately, don't hit auth.
+		// Preflight - return immediately, don't hit auth.
 		// (CORS-non-compliant browsers will fail at the missing CORS headers
 		// above; this just avoids wasting auth checks on OPTIONS.)
 		if r.Method == http.MethodOptions {
@@ -281,7 +281,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 // securityHeadersMiddleware adds defensive headers to every response.
 //
-// HSTS is intentionally omitted — Observer's API serves HTTP locally and TLS
+// HSTS is intentionally omitted - Observer's API serves HTTP locally and TLS
 // is terminated upstream (nginx/Caddy/Vercel proxy). Setting HSTS on a raw
 // HTTP response is meaningless and can confuse browsers when behind a proxy
 // that already sets it correctly.
@@ -301,7 +301,7 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 // requireAuth wraps a handler with bearer token verification.
 //
 // v0.45.0 hardening:
-//   - Header-only authentication. Query-param token support removed — bearer
+//   - Header-only authentication. Query-param token support removed - bearer
 //     tokens leak into shell history, browser history, reverse proxy logs,
 //     access logs, and Referer headers. Use curl -H instead for testing.
 //   - Length check before ConstantTimeCompare. Go's subtle.ConstantTimeCompare
@@ -335,7 +335,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 // Handlers
 // =============================================================================
 
-// GET /api/health — No auth, just proves the API is up.
+// GET /api/health - No auth, just proves the API is up.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
 		"status":  "ok",
@@ -365,7 +365,7 @@ func (s *Server) handleFindings(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Single finding by event_id — used by Event Detail Page
+	// Single finding by event_id - used by Event Detail Page
 	if eventID != "" {
 		finding, err := s.store.GetFindingByEventID(ctx, eventID)
 		if err != nil {
@@ -420,7 +420,7 @@ func (s *Server) handleFindingCounts(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, counts)
 }
 
-// GET /api/stats — Pipeline stats, pattern store stats, REC telemetry.
+// GET /api/stats - Pipeline stats, pattern store stats, REC telemetry.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -494,7 +494,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleRECCoverage surfaces the REC coverage-status model: what REC is
 // capturing right now and the actionable blind spots (skipped / excluded /
-// dropped-by-cap). Pure observability — Coverage() is race-safe and changes no
+// dropped-by-cap). Pure observability - Coverage() is race-safe and changes no
 // capture decision. When REC is disabled the no-op collector returns
 // RECCoverage{Mode:"disabled"}, which serializes fine, so no special-casing.
 func (s *Server) handleRECCoverage(w http.ResponseWriter, r *http.Request) {
@@ -549,7 +549,7 @@ func (s *Server) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /api/patterns/delete — Remove a pattern from the store.
+// POST /api/patterns/delete - Remove a pattern from the store.
 // Body: {"scope": "docker:captain-nginx", "verdict": "alert", "value": "abc123..."}
 func (s *Server) handleDeletePattern(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -742,7 +742,7 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Validate status against the documented enum. The previous "Status != ''"
-	// check let arbitrary strings into the database — confusing dashboards and
+	// check let arbitrary strings into the database - confusing dashboards and
 	// breaking any future query that filters on status.
 	switch req.Review.Status {
 	case "confirmed", "corrected", "ignored":
@@ -752,7 +752,7 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete-only correction is disabled — use /api/corrections instead.
+	// Delete-only correction is disabled - use /api/corrections instead.
 	// The old path deleted patterns without creating replacements, leaving
 	// the line to go back to the LLM naked. That's a half-feature that can
 	// reintroduce the same bad classification.
@@ -766,8 +766,8 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the linked finding (best-effort). Any human review — confirm,
-	// correct, or ignore — is a triage decision that closes the loop on the
+	// Resolve the linked finding (best-effort). Any human review - confirm,
+	// correct, or ignore - is a triage decision that closes the loop on the
 	// originating finding. Already-resolved or missing findings are a silent
 	// no-op: the review itself succeeded.
 	if decision, err := s.store.GetLLMDecision(r.Context(), req.ID); err != nil {
@@ -789,8 +789,8 @@ func (s *Server) handleDecisionReview(w http.ResponseWriter, r *http.Request) {
 // =============================================================================
 
 // handleTrustedIPs handles GET (list) and POST (add) for trusted IPs.
-// GET /api/trusted-ips — List all trusted IPs/CIDRs
-// POST /api/trusted-ips — Add a trusted IP or CIDR range
+// GET /api/trusted-ips - List all trusted IPs/CIDRs
+// POST /api/trusted-ips - Add a trusted IP or CIDR range
 func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -896,14 +896,14 @@ func (s *Server) handleDeleteTrustedIP(w http.ResponseWriter, r *http.Request) {
 //
 // Two correction types, each wired to a different pipeline layer:
 //
-//   "noise" — Infrastructure noise (healthchecks, admin panel, deployment logs).
+//   "noise" - Infrastructure noise (healthchecks, admin panel, deployment logs).
 //     Safe BY IDENTITY. Creates a hash pattern in the correct bucket so the
 //     pattern store catches it deterministically on repeat. The LLM never
 //     sees this line again.
 //
-//   "failed_probe" — Attack that had no observable impact (SQL injection that
+//   "failed_probe" - Attack that had no observable impact (SQL injection that
 //     returned a generic page). Safe BY OUTCOME, not by identity. The request
-//     IS dangerous — it just didn't work THIS time. Fingerprints the harmless
+//     IS dangerous - it just didn't work THIS time. Fingerprints the harmless
 //     RESPONSE and seeds it into the catch-all evidence layer. T1 still flags
 //     the request as malicious next time, but T2 recognizes the same harmless
 //     response body and auto-downgrades. If the response ever changes (attack
@@ -939,7 +939,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Look up the finding server-side — never trust frontend-supplied data
+	// Look up the finding server-side - never trust frontend-supplied data
 	// for a security control plane.
 	finding, err := s.store.GetFindingByEventID(ctx, req.EventID)
 	if err != nil {
@@ -953,7 +953,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 		decision, err = s.store.GetLLMDecision(ctx, req.DecisionID)
 		if err != nil {
 			log.Printf("[correction] Warning: decision %d not found: %v", req.DecisionID, err)
-			// Not fatal — cache-hit events have no decision
+			// Not fatal - cache-hit events have no decision
 		}
 	}
 
@@ -979,7 +979,7 @@ func (s *Server) handleCorrection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleNoiseCorrection — "This is routine infrastructure noise"
+// handleNoiseCorrection - "This is routine infrastructure noise"
 // Creates a deterministic hash pattern in the suppress/allow bucket.
 // Deletes the old bad pattern using server-side data (decision or finding).
 func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Context,
@@ -995,7 +995,7 @@ func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Contex
 		humanReason = "human: marked as " + targetVerdict
 	}
 
-	// Resolve hash and line — prefer finding, fall back to decision.
+	// Resolve hash and line - prefer finding, fall back to decision.
 	// Empty hash patterns are dirty state waiting to happen.
 	hash := finding.NormalizedHash
 	line := finding.NormalizedLine
@@ -1051,7 +1051,7 @@ func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Contex
 		return
 	}
 
-	// Step 3: Persist to disk — hard error for human corrections.
+	// Step 3: Persist to disk - hard error for human corrections.
 	// The whole point is "permanent fix." If persist fails, the pattern
 	// disappears on restart and the user thinks they fixed it.
 	if err := s.patterns.Persist(); err != nil {
@@ -1083,14 +1083,14 @@ func (s *Server) handleNoiseCorrection(w http.ResponseWriter, ctx context.Contex
 	jsonOK(w, map[string]string{"status": "ok", "type": "noise", "verdict": targetVerdict})
 }
 
-// handleFailedProbeCorrection — "Attack attempt, no observable impact"
+// handleFailedProbeCorrection - "Attack attempt, no observable impact"
 // Fingerprints the harmless RESPONSE, not the request. All data built
 // server-side from the finding and decision records.
 func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.Context,
 	finding *store.Finding, decision *store.LLMDecision, reason string) {
 
 	// Build evidence fingerprint from server-side data.
-	// Prefer evidence status over access-log status — they can diverge.
+	// Prefer evidence status over access-log status - they can diverge.
 	host := finding.DestHost
 	method := finding.HTTPMethod
 	status := finding.EvidenceStatusCode
@@ -1129,7 +1129,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 	//
 	// Section 3 / Landmine A: persist finding.ResponseBytes so the byte-aware
 	// Phase 3 fallback can use it. If the finding has no recorded
-	// response_bytes (legacy or non-HTTP case), we save 0 — fallback will
+	// response_bytes (legacy or non-HTTP case), we save 0 - fallback will
 	// skip until something re-verifies with a real measurement.
 	err := s.store.SaveVerifiedCatchAll(ctx, &store.CatchAllRule{
 		Host:                host,
@@ -1185,7 +1185,7 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 	jsonOK(w, map[string]string{"status": "ok", "type": "failed_probe"})
 }
 
-// handleExpectedEndpointCorrection — "Expected sensitive response" (Card 4).
+// handleExpectedEndpointCorrection - "Expected sensitive response" (Card 4).
 //
 // Path-scoped operator confirmation that an endpoint is supposed to return
 // sensitive-looking data (login/token/reset/OAuth flows). The match is keyed
@@ -1196,13 +1196,13 @@ func (s *Server) handleFailedProbeCorrection(w http.ResponseWriter, ctx context.
 //
 // SECURITY INVARIANT: This NEVER creates a request-line pattern. The match
 // is strictly (host, method, path, status, shape_hash). The endpoint stays
-// under inspection — same shape downgrades, novel shape (CVE, data leak,
+// under inspection - same shape downgrades, novel shape (CVE, data leak,
 // misconfig) still escalates correctly. That's the safety net.
 //
 // Architectural distinction from failed_probe:
 //
-//	failed_probe         → catchall_verified_v2  — path-agnostic, statistical
-//	expected_endpoint    → expected_endpoints    — path-scoped, deterministic
+//	failed_probe         → catchall_verified_v2  - path-agnostic, statistical
+//	expected_endpoint    → expected_endpoints    - path-scoped, deterministic
 //
 // CRITICAL: this handler REQUIRES decision != nil && decision.CacheKey != "".
 // The redacted shape hash lives on decision.CacheKey; without it, we can't
@@ -1232,10 +1232,10 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 	// Build the shape hash from the best available source.
 	//
 	// Priority order:
-	//   1. decision.CacheKey from a reclassify decision — this is the REDACTED
+	//   1. decision.CacheKey from a reclassify decision - this is the REDACTED
 	//      response-shape hash (tokens → [REDACTED] before hashing). Stable
 	//      across rotating JWT tokens. This is what makes Card 4 work.
-	//   2. finding.EvidenceBodyHash — the RAW wire hash. Only useful as fallback
+	//   2. finding.EvidenceBodyHash - the RAW wire hash. Only useful as fallback
 	//      when the response body didn't need redaction (no tokens/secrets).
 	shapeHash := ""
 	if decision != nil && decision.Tier == "reclassify" && isHexHash64(decision.CacheKey) {
@@ -1269,7 +1269,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		return
 	}
 
-	// Build fingerprint from server-side data only — never trust frontend.
+	// Build fingerprint from server-side data only - never trust frontend.
 	host := finding.DestHost
 	rawMethod := finding.HTTPMethod
 	rawPath := finding.HTTPPath
@@ -1306,11 +1306,11 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 	// inference. Card 4 is the deterministic response-shape policy. The
 	// stale auto-pattern is request-level inference. When operator-explicit
 	// policy is set, the inference-level pattern must yield. Same logic
-	// handleNoiseCorrection already applies — we just forgot it here.
+	// handleNoiseCorrection already applies - we just forgot it here.
 	//
 	// Distinction from failed_probe: failed probes ARE attacks; we keep
 	// the malicious pattern so the Bouncer flags them, and let T2 downgrade
-	// on the 4xx evidence. Expected endpoints are NOT attacks — keeping a
+	// on the 4xx evidence. Expected endpoints are NOT attacks - keeping a
 	// malicious tag on a legitimate API call is a lie to the DB.
 	// =========================================================================
 	correctionScope := finding.SourceType + ":" + finding.SourceName
@@ -1342,7 +1342,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		log.Printf("[correction:expected_endpoint] Warning: pattern store persist failed after delete: %v - stale pattern may return on Observer restart", err)
 	}
 
-	// Step 2: Persist expected endpoint (UPSERT on full key tuple — idempotent re-click).
+	// Step 2: Persist expected endpoint (UPSERT on full key tuple - idempotent re-click).
 	// Normalized fields go to DB so rows match runtime tracker keys 1:1.
 	err := s.store.SaveExpectedEndpoint(ctx, &store.ExpectedEndpoint{
 		Host:             host,
@@ -1374,7 +1374,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 		s.onInvalidateReclassCache(shapeHash)
 	}
 
-	// Step 5: Update finding verdict to "allow" — semantically distinct from
+	// Step 5: Update finding verdict to "allow" - semantically distinct from
 	// failed_probe's "recon". The request was LEGITIMATE (not a hostile probe
 	// that happened to fail).
 	if err := s.store.UpdateFindingVerdict(ctx, finding.EventID, "allow", humanReason); err != nil {
@@ -1399,7 +1399,7 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 	jsonOK(w, map[string]string{"status": "ok", "type": "expected_endpoint"})
 }
 
-// handleConfirmCorrection — "The AI got it right"
+// handleConfirmCorrection - "The AI got it right"
 // Marks the matched pattern as human-validated AND updates the LLM decision review.
 func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Context,
 	finding *store.Finding, decision *store.LLMDecision, sourceScope string) {
@@ -1461,7 +1461,7 @@ func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Cont
 const maxRequestBody = 64 * 1024 // 64 KB
 
 // decodeJSON reads a bounded request body and decodes it into v with strict
-// schema enforcement. Unknown fields are rejected — typos in client requests
+// schema enforcement. Unknown fields are rejected - typos in client requests
 // surface as errors instead of silently corrupting control-plane semantics.
 //
 // Returns true on success, or false after writing an error response.
@@ -1488,7 +1488,7 @@ func jsonError(w http.ResponseWriter, message string, code int) {
 }
 
 // isHexHash64 returns true iff s is exactly 64 characters of lowercase or
-// uppercase hex — the shape of a SHA-256 hex digest. Used as a sanity check
+// uppercase hex - the shape of a SHA-256 hex digest. Used as a sanity check
 // in handleExpectedEndpointCorrection to catch non-hash values that slipped
 // past the Tier filter.
 //

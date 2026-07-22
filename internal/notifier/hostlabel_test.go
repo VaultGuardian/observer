@@ -73,7 +73,7 @@ func newCapturingDispatcher(t *testing.T, n *capturingNotifier, hostname, ip str
 }
 
 // TestDispatchStampsServerIdentity verifies the dispatcher stamps Hostname and
-// ServerIP from its config onto the delivered alert — even though the inbound
+// ServerIP from its config onto the delivered alert - even though the inbound
 // Alert leaves those fields empty.
 func TestDispatchStampsServerIdentity(t *testing.T) {
 	n := newCapturingNotifier()

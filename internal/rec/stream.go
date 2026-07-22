@@ -52,12 +52,12 @@ import (
 // safeReaderStream wraps tcpreader.ReaderStream to make ReassemblyComplete
 // idempotent. gopacket's ReaderStream panics on double-close of its internal
 // channel. Both the streamTTL AfterFunc and FlushOlderThan can trigger
-// ReassemblyComplete on the same stream — whichever fires first wins,
+// ReassemblyComplete on the same stream - whichever fires first wins,
 // the other is a no-op. (v0.43 crash-loop fix.)
 type safeReaderStream struct {
 	reader *tcpreader.ReaderStream
 	once   sync.Once
-	closed atomic.Bool // set after ReassemblyComplete — Reassembled becomes no-op
+	closed atomic.Bool // set after ReassemblyComplete - Reassembled becomes no-op
 }
 
 func (s *safeReaderStream) Reassembled(rs []tcpassembly.Reassembly) {
@@ -83,7 +83,7 @@ func (s *safeReaderStream) ReassemblyComplete() {
 }
 
 // =============================================================================
-// httpStreamFactory — response streams only
+// httpStreamFactory - response streams only
 // =============================================================================
 
 type httpStreamFactory struct {
@@ -93,7 +93,7 @@ type httpStreamFactory struct {
 }
 
 // discardStream silently drops all data. Used when MaxActiveStreams is hit.
-// gopacket/tcpassembly requires a Stream to be returned from New() — we
+// gopacket/tcpassembly requires a Stream to be returned from New() - we
 // can't return nil. This eats the data without allocating goroutines.
 type discardStream struct{}
 
@@ -102,7 +102,7 @@ func (discardStream) ReassemblyComplete()                  {}
 
 // New is called by tcpassembly when it sees a new TCP flow. Since we only
 // feed response-direction packets to the assembler, every stream here is
-// a response stream — no direction detection needed.
+// a response stream - no direction detection needed.
 //
 // MaxActiveStreams enforcement: CAS loop on reassemblyStreamsActive. If
 // the cap is hit, return a discardStream instead of spawning a goroutine.
@@ -145,7 +145,7 @@ func (f *httpStreamFactory) New(netFlow, transFlow gopacket.Flow) tcpassembly.St
 }
 
 // =============================================================================
-// httpStream — one per response direction per TCP flow
+// httpStream - one per response direction per TCP flow
 // =============================================================================
 
 type httpStream struct {
@@ -193,12 +193,12 @@ func (s *httpStream) flowKey() streamKey {
 // run consumes the reassembled response byte stream. Lives in its own goroutine.
 //
 // =============================================================================
-// v0.47.2 hotfix — symmetric read-side close-race recover
+// v0.47.2 hotfix - symmetric read-side close-race recover
 // =============================================================================
 // gopacket's tcpreader.ReaderStream.Read sends on its internal `next` channel
 // as part of its read protocol (signaling "ready for more data"). If
-// ReassemblyComplete fires while Read is mid-iteration — either via the
-// streamTTL deadline below OR via FlushOlderThan from the assembler — the
+// ReassemblyComplete fires while Read is mid-iteration - either via the
+// streamTTL deadline below OR via FlushOlderThan from the assembler - the
 // `next` channel is closed and the next send panics:
 //
 //	panic: send on closed channel
@@ -211,7 +211,7 @@ func (s *httpStream) flowKey() streamKey {
 //
 // safeReaderStream.Reassembled already has a `defer recover()` for the
 // assembler-side version of this race (v0.43.1 fix). This is the symmetric
-// READ-side version — same shape, opposite goroutine, same recovery pattern.
+// READ-side version - same shape, opposite goroutine, same recovery pattern.
 // The v0.43.1 fix only guarded one side; production showed twice in 12h
 // that the read side needed it too.
 // =============================================================================
@@ -240,19 +240,19 @@ func (s *httpStream) run() {
 	})
 	defer deadline.Stop()
 
-	// All streams are response streams — go straight to parsing.
+	// All streams are response streams - go straight to parsing.
 	bufReader := bufio.NewReader(&s.reader)
 	s.runResponse(bufReader)
 }
 
 // =============================================================================
-// runResponse — the only parsing path
+// runResponse - the only parsing path
 // =============================================================================
 //
 // Parses responses from the reassembled server→client stream. For each
 // response: captures body, calls sniffer.pairResponse to match with a
 // waiting request (or queue as orphan), then inserts into the ring buffer
-// and fires onCapture — all OUTSIDE any flow lock.
+// and fires onCapture - all OUTSIDE any flow lock.
 
 func (s *httpStream) runResponse(r *bufio.Reader) {
 	fk := s.flowKey()
@@ -296,7 +296,7 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 		pendingReq := s.sniffer.pairResponse(fk, captured)
 
 		if pendingReq != nil {
-			// Paired — stamp request metadata onto the response.
+			// Paired - stamp request metadata onto the response.
 			captured.Method = pendingReq.method
 			captured.Path = pendingReq.path
 			captured.Host = pendingReq.host

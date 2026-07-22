@@ -1,7 +1,7 @@
 package policy
 
 // Result is the outcome of a policy evaluation.
-// Returned by Engine.Evaluate for every event — Matched=false means
+// Returned by Engine.Evaluate for every event - Matched=false means
 // "policy has no opinion, continue to LLM pipeline."
 //
 // Design: generic, not journald-specific. The first rules target SSH/access
@@ -13,9 +13,9 @@ type Result struct {
 	Matched bool
 
 	// Action is what Observer should do:
-	//   "escalate" — record finding + send email immediately
-	//   "alert"    — record finding, no email (dashboard review)
-	//   "allow"    — trusted/known-good, suppress silently
+	//   "escalate" - record finding + send email immediately
+	//   "alert"    - record finding, no email (dashboard review)
+	//   "allow"    - trusted/known-good, suppress silently
 	Action string
 
 	// RuleID identifies which policy rule fired (e.g. "ssh_login_unknown_ip").
@@ -25,7 +25,7 @@ type Result struct {
 	// Reason is the human-readable explanation shown in findings and emails.
 	Reason string
 
-	// Extracted fields — populated by the matching rule even if not all
+	// Extracted fields - populated by the matching rule even if not all
 	// are used for the current action. Future-proofing per the advice:
 	// "extract username, auth method, source IP now, even if you only use IP today."
 	SourceIP   string

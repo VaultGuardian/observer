@@ -9,7 +9,7 @@ import (
 )
 
 // =============================================================================
-// Expected Endpoint Store — Persistent storage for Option 4 corrections
+// Expected Endpoint Store - Persistent storage for Option 4 corrections
 // =============================================================================
 //
 // Operator-confirmed "this endpoint is supposed to return sensitive-looking
@@ -26,7 +26,7 @@ import (
 // IMPORTANT: body_preview_hash here is the REDACTED response-shape hash
 // (rec.HashBody(SafeBodyPreview), surfaced as decision.CacheKey), NOT the
 // raw transport body hash. Storing the raw hash here would break the entire
-// feature for auth/token endpoints — every login produces a new token, so
+// feature for auth/token endpoints - every login produces a new token, so
 // every login produces a new raw hash, so the rule would only match the one
 // specific token string the operator clicked on. The redacted shape hash is
 // stable across rotations because the redactor replaces secret values with
@@ -42,16 +42,16 @@ import (
 //
 // Architectural distinction:
 //
-//   catchall_verified_v2  — emergent, statistical, path-agnostic
+//   catchall_verified_v2  - emergent, statistical, path-agnostic
 //                           Threshold of 5+ distinct paths sharing the same
 //                           body hash before verification runs.
 //
-//   expected_endpoints    — explicit, deterministic, path-scoped
+//   expected_endpoints    - explicit, deterministic, path-scoped
 //                           Single operator click = single rule. The human
 //                           IS the verification.
 
 // ExpectedEndpoint represents one operator-confirmed "this endpoint's response
-// is expected to look sensitive" rule. DTO — the coordinator's in-memory
+// is expected to look sensitive" rule. DTO - the coordinator's in-memory
 // tracker maps to/from this for hot-path lookups.
 type ExpectedEndpoint struct {
 	Host             string
@@ -60,13 +60,13 @@ type ExpectedEndpoint struct {
 	HTTPStatus       int
 	BodyPreviewHash  string // REDACTED response-shape hash; NEVER raw transport hash
 	CreatedAt        time.Time
-	CreatedByEventID string // finding event_id that triggered the click — audit trail
+	CreatedByEventID string // finding event_id that triggered the click - audit trail
 	Description      string // human-supplied reason ("captain login returns auth token by design")
 }
 
 // SaveExpectedEndpoint persists a new operator-confirmed expected endpoint.
 // UPSERT on the full key tuple so repeated clicks on the same response are
-// idempotent — no row duplication, but description/created_at refresh.
+// idempotent - no row duplication, but description/created_at refresh.
 func (s *Store) SaveExpectedEndpoint(ctx context.Context, ee *ExpectedEndpoint) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO expected_endpoints (
@@ -121,7 +121,7 @@ func (s *Store) LoadExpectedEndpoints(ctx context.Context) ([]ExpectedEndpoint, 
 }
 
 // DeleteExpectedEndpoint removes a specific rule by full key tuple. Not yet
-// exposed via /api/* in v1.0 — present for future pattern-review UI work
+// exposed via /api/* in v1.0 - present for future pattern-review UI work
 // (Drew's note: "a year from now an endpoint might accumulate dozens of stale
 // shapes from app versions that no longer exist; pattern-review UI can let
 // operators prune them. v1.x problem.").

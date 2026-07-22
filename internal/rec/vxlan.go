@@ -12,7 +12,7 @@ import (
 )
 
 // =============================================================================
-// VXLAN Decapsulation — RFC 7348
+// VXLAN Decapsulation - RFC 7348
 // =============================================================================
 //
 // WHY THIS EXISTS:
@@ -28,7 +28,7 @@ import (
 //
 // DESIGN PRINCIPLE:
 //   Always-on, no-op when absent. decapVXLAN() returns errNotVXLAN in constant time
-//   for non-VXLAN packets. No toggle needed — works transparently on both Swarm and
+//   for non-VXLAN packets. No toggle needed - works transparently on both Swarm and
 //   plain docker-compose hosts.
 //
 // CROSS-VALIDATED:
@@ -56,7 +56,7 @@ const (
 // vxlanResult holds the unwrapped inner frame and tunnel metadata.
 type vxlanResult struct {
 	VNI        uint32 // VXLAN Network Identifier (identifies the overlay network)
-	InnerFrame []byte // Inner Ethernet frame — feed this back to parseFrame()
+	InnerFrame []byte // Inner Ethernet frame - feed this back to parseFrame()
 }
 
 var (
@@ -66,7 +66,7 @@ var (
 
 // decapVXLAN detects and unwraps a VXLAN-encapsulated packet.
 //
-// Returns errNotVXLAN for non-VXLAN traffic — this is the common case and
+// Returns errNotVXLAN for non-VXLAN traffic - this is the common case and
 // NOT worth logging. The sniffer calls this on every packet; only VXLAN
 // packets on the configured port with a valid I-flag get unwrapped.
 //
@@ -142,7 +142,7 @@ func decapVXLAN(pkt []byte, vxlanPort uint16) (*vxlanResult, error) {
 }
 
 // =============================================================================
-// Docker Swarm Detection — Startup Probe
+// Docker Swarm Detection - Startup Probe
 // =============================================================================
 //
 // Queries the Docker daemon at startup to detect:
@@ -150,7 +150,7 @@ func decapVXLAN(pkt []byte, vxlanPort uint16) (*vxlanResult, error) {
 //   2. The configured data-path port (default 4789, but configurable via
 //      `docker swarm init --data-path-port`)
 //
-// Uses the Docker Unix socket directly — no external Docker client library.
+// Uses the Docker Unix socket directly - no external Docker client library.
 // This is a best-effort startup probe, not a runtime dependency.
 
 // SwarmInfo holds Docker Swarm detection results from startup probe.

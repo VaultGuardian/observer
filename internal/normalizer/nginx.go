@@ -19,7 +19,7 @@ import (
 //	2026/03/17 15:10:04 [error] 28#28: *1 open() "/usr/share/nginx/html/favicon.ico" failed ...
 //
 // We strip: IP, timestamps, PID#TID, *connID, client IP, user-agent, referrer,
-// byte count, upstream times, and numeric path segments — preserving the
+// byte count, upstream times, and numeric path segments - preserving the
 // structural identity (method, path pattern, status code, error type).
 type NginxNormalizer struct{}
 
@@ -116,7 +116,7 @@ func (n *NginxNormalizer) normalizeAccess(line string) string {
 		}
 	}
 
-	// Couldn't find a request line — return minimally cleaned version
+	// Couldn't find a request line - return minimally cleaned version
 	if requestLine == "" {
 		return strings.Join(strings.Fields(line), " ")
 	}
@@ -134,7 +134,7 @@ func (n *NginxNormalizer) normalizeAccess(line string) string {
 	}
 
 	// Build the normalized output.
-	// The request line is SACRED — method, path, query string, protocol all preserved.
+	// The request line is SACRED - method, path, query string, protocol all preserved.
 	// This ensures different attack payloads produce different hashes.
 	//
 	// We strip: IP, timestamp, byte count, referrer, user-agent, x-forwarded-for.

@@ -49,7 +49,7 @@ var (
 	// SHA256 fingerprint: SHA256:xyzabc123...
 	reSshdFingerprint = regexp.MustCompile(`SHA256:\S+`)
 
-	// "Invalid user <name>" — the username is always attacker-fabricated
+	// "Invalid user <name>" - the username is always attacker-fabricated
 	// (the account does not exist on this host). Normalizing it to <USER>
 	// means all "Invalid user" brute-force attempts hash to the same
 	// normalized line regardless of which made-up username the scanner
@@ -64,14 +64,14 @@ var (
 	// instead of one per (username, IP, port) tuple.
 	reSshdInvalidUser = regexp.MustCompile(`(?i)(invalid user )\S+`)
 
-	// "PAM N more authentication failure(s)" — pam_unix emits a running
+	// "PAM N more authentication failure(s)" - pam_unix emits a running
 	// retry count, and the suffix is singular at 1 ("failure") and plural
 	// otherwise ("failures"). Both the count and the suffix vary per
 	// attacker, so without collapsing them every retry tier produces a
 	// distinct normalized line. (v0.56: SSH brute-force cache-miss fix.)
 	reSshdPAMCount = regexp.MustCompile(`(?i)PAM \d+ more authentication failures?`)
 
-	// "rhost=<IP>" — PAM auth-failure lines carry the source IP as an
+	// "rhost=<IP>" - PAM auth-failure lines carry the source IP as an
 	// rhost= field with no "from"/"by" keyword and no "port", so neither
 	// reSshdFromIP nor reSshdByIP catches it. Every attacker IP otherwise
 	// produces a unique line. (v0.56: SSH brute-force cache-miss fix.)

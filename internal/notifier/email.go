@@ -19,7 +19,7 @@ type EmailNotifier struct {
 
 func NewEmailNotifier(cfg EmailConfig) *EmailNotifier {
 	if cfg.From == "" {
-		// Resend's pre-verified sandbox sender — works without domain
+		// Resend's pre-verified sandbox sender - works without domain
 		// verification, so first-time installs send successfully out of
 		// the box. Users override via ALERT_EMAIL_FROM once they verify
 		// their own domain in their Resend account.
@@ -79,7 +79,7 @@ func (e *EmailNotifier) Send(ctx context.Context, alert Alert) error {
 // into the HTML email body MUST pass through this function to prevent injection.
 //
 // v0.52 P0 fix: prior to this fix, all dynamic
-// fields were interpolated via raw fmt.Sprintf %s — an attacker sending
+// fields were interpolated via raw fmt.Sprintf %s - an attacker sending
 // GET /<script>alert(1)</script> would render executable HTML in the
 // operator's email client. Ironic for a security product.
 func esc(s string) string {
@@ -97,7 +97,7 @@ func formatEmailHTML(alert Alert) string {
 		severityColor = "#3b82f6"
 	}
 
-	// Build evidence section (REC enrichment — may or may not be available)
+	// Build evidence section (REC enrichment - may or may not be available)
 	evidenceHTML := ""
 	if alert.Evidence != nil && alert.Evidence.HasEvidence() {
 		t := alert.Evidence.Transport
@@ -155,7 +155,7 @@ func formatEmailHTML(alert Alert) string {
         </table>
       </div>`
 	} else if alert.Evidence != nil {
-		// Evidence was attempted but unavailable — show why
+		// Evidence was attempted but unavailable - show why
 		evidenceHTML = fmt.Sprintf(`
       <div style="margin-top:16px;padding:8px 12px;background:#f3f4f6;border-radius:6px;font-size:12px;color:#9ca3af;">
         Response Evidence: %s
@@ -230,11 +230,11 @@ func formatEmailHTML(alert Alert) string {
 		esc(alert.ContainerID[:minInt(12, len(alert.ContainerID))]), // hex but escape defensively
 		esc(alert.Reason),                          // LLM-GENERATED
 		esc(alert.MatchedVia),                      // internal but escape defensively
-		alert.Timestamp.Format(time.RFC3339),       // time.Format — safe
-		esc(truncateStr(alert.LogLine, 1000)),      // ATTACKER-CONTROLLED — raw log line
+		alert.Timestamp.Format(time.RFC3339),       // time.Format - safe
+		esc(truncateStr(alert.LogLine, 1000)),      // ATTACKER-CONTROLLED - raw log line
 		evidenceHTML,                               // already escaped field-by-field above
-		esc(alert.EventID),                         // UUID — safe but escape defensively
-		esc(truncateStr(alert.NormalizedHash, 16)), // hex — safe but escape defensively
+		esc(alert.EventID),                         // UUID - safe but escape defensively
+		esc(truncateStr(alert.NormalizedHash, 16)), // hex - safe but escape defensively
 	)
 }
 

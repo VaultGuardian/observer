@@ -4,7 +4,7 @@ package main
 import "github.com/vaultguardian/observer/internal/patternstore"
 
 // maliciousSeeds defines curated attack indicators seeded into the global malicious list.
-// These are manually chosen, not learned — they apply to all sources.
+// These are manually chosen, not learned - they apply to all sources.
 // The pattern store uses substring matching for seeded patterns.
 //
 // DESIGN DECISION (v0.15, 2026-03-24):
@@ -22,7 +22,7 @@ import "github.com/vaultguardian/observer/internal/patternstore"
 //
 //	Added data exfiltration CONTENT seeds. The original v0.15 decision removed
 //	REQUEST PATH seeds (/etc/passwd, .env) because scanners spam those paths and
-//	the probe usually fails. That was correct — the PATH is recon. But the FILE
+//	the probe usually fails. That was correct - the PATH is recon. But the FILE
 //	CONTENTS appearing in any log stream is ALWAYS confirmed exploitation.
 //	"root:x:0:0:root" in a web app container's output means the attacker already
 //	won. No LLM needed.
@@ -30,11 +30,11 @@ var maliciousSeeds = []struct {
 	Pattern string
 	Reason  string
 }{
-	// ── Reverse shells — presence in a log means active exploitation ──
+	// ── Reverse shells - presence in a log means active exploitation ──
 	{"bash -i >& /dev/tcp", "Bash reverse shell"},
 	{"nc -e /bin/sh", "Netcat reverse shell"},
 
-	// ── Encoded/remote execution — download-and-execute chains ──
+	// ── Encoded/remote execution - download-and-execute chains ──
 	{"base64 -d | bash", "Encoded command execution"},
 	{"curl | sh", "Remote code execution via curl pipe"},
 	{"wget | sh", "Remote code execution via wget pipe"},
@@ -42,7 +42,7 @@ var maliciousSeeds = []struct {
 	// ── Destructive filesystem commands ──
 	{"rm -rf /", "Destructive filesystem command"},
 
-	// ── Data exfiltration CONTENT — file contents, not paths ──
+	// ── Data exfiltration CONTENT - file contents, not paths ──
 	// If these strings appear in ANY log (Docker, nginx, journald), the
 	// attacker has already achieved code execution and is dumping data.
 	// The path "/etc/passwd" in a URL is recon (might 404).

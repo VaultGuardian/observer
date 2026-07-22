@@ -13,7 +13,7 @@ import (
 //
 // TODO(rec): the end-to-end emit-latency behavior ("a complete Content-Length
 // response lands in the buffer within ~IdleTimeout of the last packet, and a
-// still-streaming response is not truncated") is not asserted here — it needs a
+// still-streaming response is not truncated") is not asserted here - it needs a
 // packet-injection harness to drive the gopacket assembler + flushLoop
 // deterministically. That harness is also the prerequisite for testing the
 // eager-emit hardening noted in sniffer.go's flushLoop TODO.
@@ -37,7 +37,7 @@ func TestRECReassemblyIdleTimeoutEnvOverride(t *testing.T) {
 }
 
 // SLOW_RESPONSE_THRESHOLD_MS must accept explicit zero/negative (= gate
-// disabled) — getEnvInt rejects non-positive values, so this field is
+// disabled) - getEnvInt rejects non-positive values, so this field is
 // resolved by a dedicated block like REC_LEARNED_PORT_CAP.
 func TestSlowResponseThresholdMs(t *testing.T) {
 	cases := []struct {

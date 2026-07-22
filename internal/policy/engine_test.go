@@ -85,7 +85,7 @@ func TestEvaluate_KernelUnitFilter(t *testing.T) {
 		{"legit ssh.service", "ssh.service", true},
 		{"legit sshd.service", "sshd.service", true},
 		{"sshd per-connection unit", "sshd@1.2.3.4-22.service", true},
-		{"container spoofing — different unit", "docker-abc123.scope", false},
+		{"container spoofing - different unit", "docker-abc123.scope", false},
 		{"no unit (non-journald event)", "", false},
 		{"nginx unit", "nginx.service", false},
 	}
@@ -94,7 +94,7 @@ func TestEvaluate_KernelUnitFilter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			evt := &event.Event{
 				SourceType: "journal",
-				SourceName: "sshd", // spoofable — set the same in every case
+				SourceName: "sshd", // spoofable - set the same in every case
 				Line:       "Accepted password for root from 1.2.3.4 port 22 ssh2",
 				Metadata:   map[string]string{"unit": tt.unit},
 			}

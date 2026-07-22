@@ -20,7 +20,7 @@ const (
 	VerdictMalicious Verdict = "malicious" // Known-bad, alert with high severity
 	VerdictAlert     Verdict = "alert"     // Suspicious, alert with lower severity, exact-hash memoized
 	VerdictSuppress  Verdict = "suppress"  // Known-noise, don't alert, don't send to LLM
-	VerdictUnknown   Verdict = "unknown"   // No match — forward to LLM
+	VerdictUnknown   Verdict = "unknown"   // No match - forward to LLM
 )
 
 // PatternType controls which matching tier a learned pattern uses.
@@ -47,7 +47,7 @@ const (
 //   - "human", "human_validated", and "seeded" patterns are NEVER capped or
 //     rejected. Operator intent always wins.
 //   - When the cap is hit, new auto-learned hashes are rejected (logged once
-//     per minute per bucket). Eviction is deferred to post-v1 — reject is
+//     per minute per bucket). Eviction is deferred to post-v1 - reject is
 //     simpler, and a cap of 100K per bucket × 4 buckets × N scopes is plenty
 //     of headroom for legitimate operation.
 const (
@@ -63,8 +63,8 @@ const (
 // blinds the analyzer for that scope. Human/seeded sources may use anything.
 //
 // Matching semantics (v0.47, code review): the candidate prefix is
-// "stripped" — whitespace and normalizer placeholders (anything inside <...>
-// like <TS>, <NUM>, <PID>, <UUID>) are removed — and the result is compared
+// "stripped" - whitespace and normalizer placeholders (anything inside <...>
+// like <TS>, <NUM>, <PID>, <UUID>) are removed - and the result is compared
 // case-insensitively for EQUALITY against each blocklist entry.
 //
 // This means:
@@ -76,7 +76,7 @@ const (
 //	"ERROR opening database conn"   → allowed (stripped has real content)
 //	"Failed password for "          → allowed (no entry matches "Failedpasswordfor")
 //
-// "Failed" and "Exception" intentionally NOT listed — the Tier-1 prompt
+// "Failed" and "Exception" intentionally NOT listed - the Tier-1 prompt
 // recommends prefixes like "Failed password for " for SSH brute-force
 // suppression. Length+must-prefix-original kills the bare-word case.
 var genericPrefixBlocklist = []string{
@@ -99,7 +99,7 @@ var genericPrefixBlocklist = []string{
 }
 
 // rePlaceholder matches normalizer placeholders like <TS>, <NUM>, <UUID>,
-// <PID:1234>, etc. — any angle-bracketed token. Used to "strip" prefixes
+// <PID:1234>, etc. - any angle-bracketed token. Used to "strip" prefixes
 // down to their meaningful structural content for blocklist comparison.
 var rePlaceholder = regexp.MustCompile(`<[^>]*>`)
 
@@ -159,7 +159,7 @@ type LearnedPattern struct {
 	RevokedBy string     `json:"revoked_by,omitempty"`
 
 	// compiled is the pre-compiled regex (only for PatternRegex).
-	// Not serialized — rebuilt on load.
+	// Not serialized - rebuilt on load.
 	compiled *regexp.Regexp
 }
 
@@ -220,7 +220,7 @@ type Stats struct {
 	Misses        atomic.Int64
 	PatternCount  atomic.Int64
 
-	// v0.47 — auto-learning safety caps
+	// v0.47 - auto-learning safety caps
 	AutoLearnRejected atomic.Int64 // bumped when cap hit or validation rejects auto pattern
 	AutoLearnCapped   atomic.Int64 // bumped specifically on bucket-size cap (subset of Rejected)
 }
@@ -351,13 +351,13 @@ func (s *Store) getBucket(scope *ScopeEntry, v Verdict) *PatternBucket {
 		// v0.52: Unknown verdicts must NOT silently land in the allow bucket.
 		// Prior to this fix, the default case returned &scope.Allow, so an
 		// invalid LLM output could become a permanent allow pattern.
-		log.Printf("[patternstore] BUG: getBucket called with unknown verdict %q — returning nil", v)
+		log.Printf("[patternstore] BUG: getBucket called with unknown verdict %q - returning nil", v)
 		return nil
 	}
 }
 
 // matchTiers runs through the matching tiers in priority order.
-// Revoked patterns are skipped — they remain in the store for audit trail
+// Revoked patterns are skipped - they remain in the store for audit trail
 // but do not participate in matching. Future events matching a revoked
 // pattern will fall through to fresh LLM classification.
 func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *MatchResult {
@@ -383,7 +383,7 @@ func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *Match
 		}
 	}
 
-	// Tier 4: Contains (guarded, rare — checked last)
+	// Tier 4: Contains (guarded, rare - checked last)
 	for _, p := range b.Contains {
 		if p.RevokedAt == nil && strings.Contains(normalizedLine, p.Value) {
 			return &MatchResult{Verdict: v, Pattern: p, Tier: PatternContains}
@@ -417,14 +417,14 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 	scope := s.getOrCreateScope(scopeKey)
 	bucket := s.getBucket(scope, verdict)
 	if bucket == nil {
-		return fmt.Errorf("unknown verdict %q — refusing to learn", verdict)
+		return fmt.Errorf("unknown verdict %q - refusing to learn", verdict)
 	}
 
 	// Dedup (slice tiers): if an active pattern with this exact value is
 	// already present in the target tier, the learn is a no-op. Prevents the
 	// prefix/regex/contains slices from accumulating identical entries when
 	// the same line is classified repeatedly before its pattern propagates
-	// (e.g. under retry-queue backlog — this is what produced the duplicate
+	// (e.g. under retry-queue backlog - this is what produced the duplicate
 	// fwupd / "Reached target" entries observed in patternstore.json). The
 	// hash tier is a map keyed by value and dedups inherently. Revoked entries
 	// are intentionally NOT treated as duplicates, so the existing "re-learn
@@ -433,7 +433,7 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 		return nil
 	}
 
-	// Cap check — only applies to non-human, non-seeded sources.
+	// Cap check - only applies to non-human, non-seeded sources.
 	// Operator-curated patterns are never capped.
 	if !isHumanOrSeededSource(pattern.Source) {
 		if reason, capped := s.bucketAtCap(bucket, pattern.Type); capped {
@@ -526,7 +526,7 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 //
 // Rules differ by source (v0.47, F3):
 //
-//   - human / human_validated / seeded sources are permissive — operator
+//   - human / human_validated / seeded sources are permissive - operator
 //     intent always wins. Minimum lengths still apply (defends against
 //     accidental empty values).
 //
@@ -545,7 +545,7 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 //
 //   - contains is forbidden (only human/seeded may use contains)
 //
-// The point of a strict validator is that "no" means no — there is no
+// The point of a strict validator is that "no" means no - there is no
 // fallback to a softer pattern type. Callers that previously relied on a
 // regex-fallback-to-prefix path (analyzer v0.19.1) must now learn the
 // exact-hash only and return.
@@ -577,12 +577,12 @@ func (s *Store) validatePattern(p *LearnedPattern) error {
 			}
 		}
 
-		// Generic-token blocklist (auto only). The prefix is "stripped" —
-		// whitespace and <...> placeholders removed — and compared case-
+		// Generic-token blocklist (auto only). The prefix is "stripped" -
+		// whitespace and <...> placeholders removed - and compared case-
 		// insensitively for equality against each blocked token. This catches
 		// "ERROR <TS> <PID>" (stripped to "ERROR") but allows specific
 		// extensions like "ERROR opening database connection at" (stripped
-		// to "ERRORopeningdatabaseconnectionat" — no match).
+		// to "ERRORopeningdatabaseconnectionat" - no match).
 		if !human {
 			stripped := stripPrefixForBlocklist(p.Value)
 			lowerStripped := strings.ToLower(stripped)
@@ -620,7 +620,7 @@ func (s *Store) validatePattern(p *LearnedPattern) error {
 			// Reject patterns that begin with "^.*" (effectively unanchored)
 			// or that are too short to carry useful structure.
 			if strings.HasPrefix(p.Value, "^.*") {
-				return fmt.Errorf("auto-learned regex begins with ^.* — effectively unanchored")
+				return fmt.Errorf("auto-learned regex begins with ^.* - effectively unanchored")
 			}
 			if len(p.Value) < 10 {
 				return fmt.Errorf("auto-learned regex too short (%d chars), minimum 10", len(p.Value))
@@ -628,7 +628,7 @@ func (s *Store) validatePattern(p *LearnedPattern) error {
 		}
 
 	case PatternContains:
-		// Contains is the most dangerous type — substring match anywhere in
+		// Contains is the most dangerous type - substring match anywhere in
 		// the line. LLM auto-learning is FORBIDDEN from creating these.
 		// Human/seeded sources may create contains patterns (used by the
 		// curated malicious seeds in seeds.go).
@@ -997,7 +997,7 @@ func (s *Store) Persist() error {
 	// the entire pattern store down with it.
 	//
 	// 0600 because patterns include normalized payload prefixes, hashes, and
-	// learned attack signatures — sensitive security state, not world-readable.
+	// learned attack signatures - sensitive security state, not world-readable.
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, jsonBytes, 0600); err != nil {
 		return fmt.Errorf("writing pattern store tmp: %w", err)

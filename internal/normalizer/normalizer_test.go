@@ -205,7 +205,7 @@ func TestNginxErrorLogStability(t *testing.T) {
 // app containers that run nginx but lack "nginx" in their name (e.g.
 // srv-captain--api) route through DockerNormalizer -> GenericNormalizer, which
 // must strip the bare nginx error-log timestamp "2026/05/25 16:45:24".
-// SourceName is deliberately NOT "demo-nginx" — that would reach NginxNormalizer
+// SourceName is deliberately NOT "demo-nginx" - that would reach NginxNormalizer
 // and pass for the wrong reason.
 func TestGenericBareNginxErrorTimestampStability(t *testing.T) {
 	reg := NewRegistry()
@@ -257,7 +257,7 @@ func TestGenericBareNginxErrorTimestampStability(t *testing.T) {
 
 // TestNginxWorkerProcessNormalization verifies that nginx startup logs like
 // "start worker process 31" and "start worker process 32" hash the same.
-// This was a known issue — the generic normalizer only strips 4+ digit numbers.
+// This was a known issue - the generic normalizer only strips 4+ digit numbers.
 func TestNginxWorkerProcessNormalization(t *testing.T) {
 	reg := NewRegistry()
 
@@ -318,7 +318,7 @@ func TestDockerTimestampPlusNginxAccess(t *testing.T) {
 	}
 }
 
-// TestDockerTimestampPlusNginxError — same test for error logs.
+// TestDockerTimestampPlusNginxError - same test for error logs.
 func TestDockerTimestampPlusNginxError(t *testing.T) {
 	reg := NewRegistry()
 
@@ -539,7 +539,7 @@ func TestSshdNormalizer_InvalidUser(t *testing.T) {
 			want: "Invalid user <USER> from <IP> port <PORT>",
 		},
 		{
-			name: "invalid user with another username — same normalized output",
+			name: "invalid user with another username - same normalized output",
 			in:   "Invalid user liugt from 64.89.163.173 port 46416",
 			want: "Invalid user <USER> from <IP> port <PORT>",
 		},
@@ -549,17 +549,17 @@ func TestSshdNormalizer_InvalidUser(t *testing.T) {
 			want: "Invalid user <USER> from <IP> port <PORT>",
 		},
 		{
-			name: "failed password for real account — username preserved",
+			name: "failed password for real account - username preserved",
 			in:   "Failed password for root from 10.0.0.1 port 55123 ssh2",
 			want: "Failed password for root from <IP> port <PORT> ssh2",
 		},
 		{
-			name: "failed password for invalid user — username normalized",
+			name: "failed password for invalid user - username normalized",
 			in:   "Failed password for invalid user badname from 1.2.3.4 port 1234 ssh2",
 			want: "Failed password for invalid user <USER> from <IP> port <PORT> ssh2",
 		},
 		{
-			name: "accepted password — username preserved",
+			name: "accepted password - username preserved",
 			in:   "Accepted password for drew from 192.168.1.50 port 54321 ssh2",
 			want: "Accepted password for drew from <IP> port <PORT> ssh2",
 		},
