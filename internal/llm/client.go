@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+const (
+	// maxResponseBodyBytes caps success-path inference response bodies (8MB).
+	maxResponseBodyBytes int64 = 8 << 20
+	// maxErrorBodyBytes caps error-path response bodies (64KB).
+	maxErrorBodyBytes int64 = 64 << 10
+)
+
 // Verdict is the LLM's assessment of a log line, now with pattern learning
 // and normalization hints.
 type Verdict struct {
@@ -383,11 +390,11 @@ CRITICAL JSON RULES:
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return nil, fmt.Errorf("LLM returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	rawBody, _ := io.ReadAll(resp.Body)
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 
 	// Parse OpenAI-compatible response
 	var chatResp struct {
@@ -740,11 +747,11 @@ Based on this response evidence, did the attack succeed or did the server ignore
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return nil, fmt.Errorf("reclassify returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	rawBody, _ := io.ReadAll(resp.Body)
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 
 	var chatResp struct {
 		Choices []struct {
