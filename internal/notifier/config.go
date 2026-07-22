@@ -186,6 +186,10 @@ func LoadConfig(dataDir string) (*Config, error) {
 		applyDefaults(cfg)
 	}
 
+	if cfg.QuietHours != nil {
+		log.Printf("[notifier] quiet_hours is configured but not yet enforced - alerts will still be delivered during the configured window")
+	}
+
 	return cfg, nil
 }
 
