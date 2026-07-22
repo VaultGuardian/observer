@@ -478,31 +478,68 @@ SERVICE="observer"
 
 # download_binary <version> - fetches observer to ./observer
 # version: "latest" or a tag like "v0.53.0"
+# Also fetches the published observer.sha256 from the same release location
+# (best-effort - older releases may lack it) and sets GOT_SHA=true on success.
 download_binary() {
     local version="$1"
-    local url
+    local url sha_url
     if [ "$version" = "latest" ]; then
         url="https://github.com/${REPO}/releases/latest/download/observer"
+        sha_url="https://github.com/${REPO}/releases/latest/download/observer.sha256"
     else
         url="https://github.com/${REPO}/releases/download/${version}/observer"
+        sha_url="https://github.com/${REPO}/releases/download/${version}/observer.sha256"
     fi
 
+    GOT_SHA=false
     if command -v curl >/dev/null 2>&1; then
         if curl -fsSL --retry 3 -o observer "$url"; then
+            if curl -fsSL --retry 3 -o observer.sha256 "$sha_url" 2>/dev/null; then
+                GOT_SHA=true
+            fi
             return 0
         fi
     fi
     # Fall back to gh CLI for private/pre-release/auth-gated cases.
     if command -v gh >/dev/null 2>&1; then
         if [ "$version" = "latest" ]; then
-            gh release download --repo "$REPO" --pattern "observer"
+            gh release download --repo "$REPO" --pattern "observer" || return $?
+            gh release download --repo "$REPO" --pattern "observer.sha256" 2>/dev/null && GOT_SHA=true || true
         else
-            gh release download "$version" --repo "$REPO" --pattern "observer"
+            gh release download "$version" --repo "$REPO" --pattern "observer" || return $?
+            gh release download "$version" --repo "$REPO" --pattern "observer.sha256" 2>/dev/null && GOT_SHA=true || true
         fi
-        return $?
+        return 0
     fi
     echo "[vaultguardian] No download method available. Install curl (preferred) or gh CLI."
     return 1
+}
+
+# verify_binary - checks ./observer against ./observer.sha256 when GOT_SHA=true.
+# Same logic as the installer: a mismatch means the download was corrupted or
+# tampered with, so refuse to deploy; a missing published checksum warns and
+# proceeds.
+verify_binary() {
+    local expected actual
+    if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
+        expected=$(awk '{print $1}' observer.sha256)
+        actual=$(sha256sum observer | awk '{print $1}')
+        if [ "$expected" = "$actual" ]; then
+            echo "[vaultguardian] SHA256 verified: $actual"
+        else
+            rm -f observer observer.sha256
+            echo "[vaultguardian] SHA256 MISMATCH - refusing to update."
+            echo "[vaultguardian]   expected: $expected"
+            echo "[vaultguardian]   actual:   $actual"
+            echo "[vaultguardian] The download may be corrupted or tampered with. Aborting."
+            return 1
+        fi
+        rm -f observer.sha256
+    else
+        echo "[vaultguardian] No published checksum found for this release - skipping verification."
+        echo "[vaultguardian] (Releases from v0.55.4+ publish observer.sha256 alongside the binary.)"
+    fi
+    return 0
 }
 
 case "$1" in
@@ -510,8 +547,11 @@ case "$1" in
     VERSION="${2:-latest}"
     echo "[vaultguardian] Updating Observer to ${VERSION}..."
     cd /tmp
-    rm -f observer
+    rm -f observer observer.sha256
     if ! download_binary "$VERSION"; then
+        exit 1
+    fi
+    if ! verify_binary; then
         exit 1
     fi
 
