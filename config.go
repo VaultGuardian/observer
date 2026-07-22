@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -251,10 +252,17 @@ func LoadConfig() Config {
 	// The sniffer learns additional ports at runtime from payload
 	// prefixes, so this list is a seed/hint - getting it exactly
 	// right is not required for correctness.
+	//
+	// Duplicates are collapsed and the result sorted: the list seeds a
+	// set (the port registry dedupes internally, so capture behavior
+	// never depended on this), but it is also printed verbatim by the
+	// override log below and the collector startup line, where a
+	// repeated entry (REC_PORTS=80,80) rendered as [80 80].
 	cfg.RECPorts = []int{80, 8080}
 	if raw := getEnv("REC_PORTS", ""); raw != "" {
 		var parsed []int
 		var bad []string
+		seen := make(map[int]bool)
 		for _, p := range strings.Split(raw, ",") {
 			p = strings.TrimSpace(p)
 			if p == "" {
@@ -265,9 +273,14 @@ func LoadConfig() Config {
 				bad = append(bad, p)
 				continue
 			}
+			if seen[n] {
+				continue
+			}
+			seen[n] = true
 			parsed = append(parsed, n)
 		}
 		if len(parsed) > 0 {
+			sort.Ints(parsed)
 			cfg.RECPorts = parsed
 			log.Printf("[observer] REC_PORTS override: %v", cfg.RECPorts)
 		}

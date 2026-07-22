@@ -2,6 +2,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -57,6 +58,35 @@ func TestSlowResponseThresholdMs(t *testing.T) {
 			cfg := LoadConfig()
 			if cfg.SlowResponseThresholdMs != tc.want {
 				t.Errorf("SLOW_RESPONSE_THRESHOLD_MS=%q → %d; want %d", tc.env, cfg.SlowResponseThresholdMs, tc.want)
+			}
+		})
+	}
+}
+
+// REC_PORTS parsing must collapse duplicates and sort: the parsed list seeds a
+// set (the sniffer's port registry dedupes internally, so capture behavior was
+// never affected), but it is printed verbatim by the override log and the
+// collector startup line, where REC_PORTS=80,80 rendered as [80 80].
+func TestRECPortsDedupeAndSort(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want []int
+	}{
+		{"default", "", []int{80, 8080}},
+		{"duplicate_collapses", "80,80", []int{80}},
+		{"duplicate_with_spaces", "80, 80", []int{80}},
+		{"distinct_sorted", "8080,80,3000", []int{80, 3000, 8080}},
+		{"duplicate_among_distinct", "80,3000,80", []int{80, 3000}},
+		{"invalid_entries_skipped", "80,abc,80", []int{80}},
+		{"all_invalid_falls_back", "abc,-1", []int{80, 8080}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("REC_PORTS", tc.env)
+			cfg := LoadConfig()
+			if !slices.Equal(cfg.RECPorts, tc.want) {
+				t.Errorf("REC_PORTS=%q → %v; want %v", tc.env, cfg.RECPorts, tc.want)
 			}
 		})
 	}

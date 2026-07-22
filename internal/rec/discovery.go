@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -239,7 +240,8 @@ func logInventory(inv discoveryInventory) {
 // ports REC sees from inside the namespace (e.g. captain-captain's 80, not host 3000).
 // Duplicates are dropped (Docker lists one Port entry per host binding, so a
 // container published on both IPv4 and IPv6 yields two entries with the same
-// PrivatePort), preserving first-seen order.
+// PrivatePort) and the result is sorted ascending, so the lists surfaced by
+// Coverage() are deterministic regardless of Docker's binding order.
 func privatePorts(ports []tcpPublish) []int {
 	seen := make(map[int]bool, len(ports))
 	out := make([]int, 0, len(ports))
@@ -249,6 +251,7 @@ func privatePorts(ports []tcpPublish) []int {
 			out = append(out, p.PrivatePort)
 		}
 	}
+	sort.Ints(out)
 	return out
 }
 
