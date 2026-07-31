@@ -303,6 +303,10 @@ type liveCollector struct {
 	onVIPMatch  func(correlationKey string) // push callback → coordinator
 	vipMatches  int64                       // telemetry counter
 
+	// VIP pressure counters (atomic, same pattern as vipMatches).
+	vipCapacityEvictions int64 // entries deleted by enforceVIPCapLocked
+	vipExpirations       int64 // pins + evidence removed by the TTL sweep
+
 	// Session 7: runtime namespace reconciliation lifecycle. Set ONLY in
 	// auto-detect mode by Start() (nil/zero in legacy NSContainer mode, so no
 	// manager goroutines run there). mgrCancel + mgrWG own the events listener,
@@ -892,6 +896,17 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.BufferEvictionsBytes = bs.EvictionsBytes
 	}
 	stats.VIPMatches = atomic.LoadInt64(&lc.vipMatches)
+
+	// VIP lane pressure. Stats holds exactly one lock at a time, strictly
+	// sequentially: capMu was released above and vipMu is taken fresh here,
+	// never nested with capMu or any other lock.
+	lc.vipMu.Lock()
+	stats.VIPPins = len(lc.vipPins)
+	stats.VIPEvidence = len(lc.vipEvidence)
+	lc.vipMu.Unlock()
+	stats.VIPCapacityEvictions = atomic.LoadInt64(&lc.vipCapacityEvictions)
+	stats.VIPExpirations = atomic.LoadInt64(&lc.vipExpirations)
+	stats.VIPMaxEntries = vipMaxEntries
 	return stats
 }
 
@@ -1040,8 +1055,10 @@ func (lc *liveCollector) enforceVIPCapLocked() {
 
 		if oldestKind == "pin" {
 			delete(lc.vipPins, oldestID)
+			atomic.AddInt64(&lc.vipCapacityEvictions, 1)
 		} else {
 			delete(lc.vipEvidence, oldestID)
+			atomic.AddInt64(&lc.vipCapacityEvictions, 1)
 		}
 	}
 }
@@ -1268,19 +1285,28 @@ func (lc *liveCollector) vipCleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lc.vipMu.Lock()
-			cutoff := time.Now().Add(-vipTTL)
-			for id, pin := range lc.vipPins {
-				if pin.createdAt.Before(cutoff) {
-					delete(lc.vipPins, id)
-				}
-			}
-			for id, resp := range lc.vipEvidence {
-				if resp.Timestamp.Before(cutoff) {
-					delete(lc.vipEvidence, id)
-				}
-			}
-			lc.vipMu.Unlock()
+			lc.cleanupExpiredVIP(time.Now())
+		}
+	}
+}
+
+// cleanupExpiredVIP sweeps VIP pins and evidence older than vipTTL relative
+// to now. Extracted from vipCleanupLoop so tests can drive it with injected
+// times instead of waiting on the ticker. Takes vipMu internally.
+func (lc *liveCollector) cleanupExpiredVIP(now time.Time) {
+	lc.vipMu.Lock()
+	defer lc.vipMu.Unlock()
+	cutoff := now.Add(-vipTTL)
+	for id, pin := range lc.vipPins {
+		if pin.createdAt.Before(cutoff) {
+			delete(lc.vipPins, id)
+			atomic.AddInt64(&lc.vipExpirations, 1)
+		}
+	}
+	for id, resp := range lc.vipEvidence {
+		if resp.Timestamp.Before(cutoff) {
+			delete(lc.vipEvidence, id)
+			atomic.AddInt64(&lc.vipExpirations, 1)
 		}
 	}
 }

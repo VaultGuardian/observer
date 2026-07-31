@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -342,5 +343,36 @@ func TestNoDoubleDispatchUnderConcurrentVIP(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := fd.count(); got != 1 {
 		t.Fatalf("expected exactly one dispatch under concurrent VIP pushes, got %d", got)
+	}
+}
+
+// =============================================================================
+// Capacity-eviction telemetry (pipeline_health)
+// =============================================================================
+
+// TestHealthStats_CapacityEviction fills the pending map to its cap and adds
+// one more investigation: the oldest is evicted, the eviction counter records
+// it, and HealthStats reports (pending, capacity, evictions) = (100, 100, 1).
+func TestHealthStats_CapacityEviction(t *testing.T) {
+	// Hour-long windows keep every investigation pending for the whole test.
+	c, _, cancel := newTestCoordinator(t, (&gatedEvidence{}).check, time.Hour, 2*time.Hour, time.Hour)
+	defer cancel()
+
+	for i := 0; i < maxPendingInvestigations; i++ {
+		c.Process(fmt.Sprintf("host-%03d|GET|/api/.env|200", i), suspiciousAlert())
+	}
+
+	pending, capacity, evictions := c.HealthStats()
+	if pending != maxPendingInvestigations || capacity != maxPendingInvestigations || evictions != 0 {
+		t.Fatalf("HealthStats at cap = (%d, %d, %d), want (%d, %d, 0)",
+			pending, capacity, evictions, maxPendingInvestigations, maxPendingInvestigations)
+	}
+
+	c.Process("host-overflow|GET|/api/.env|200", suspiciousAlert())
+
+	pending, capacity, evictions = c.HealthStats()
+	if pending != maxPendingInvestigations || capacity != maxPendingInvestigations || evictions != 1 {
+		t.Errorf("HealthStats after eviction = (%d, %d, %d), want (%d, %d, 1)",
+			pending, capacity, evictions, maxPendingInvestigations, maxPendingInvestigations)
 	}
 }

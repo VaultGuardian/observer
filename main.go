@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/vaultguardian/observer/internal/api"
 	"github.com/vaultguardian/observer/internal/coordinator"
 	"github.com/vaultguardian/observer/internal/event"
+	"github.com/vaultguardian/observer/internal/health"
 	"github.com/vaultguardian/observer/internal/llm"
 	"github.com/vaultguardian/observer/internal/normalizer"
 	"github.com/vaultguardian/observer/internal/notifier"
@@ -45,7 +45,6 @@ func main() {
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
-	var pipelineDrops atomic.Int64
 	log.Println("[observer] VaultGuardian Observer starting...")
 
 	// --- pprof (debug only) ---
@@ -361,7 +360,10 @@ func main() {
 
 	const retryQueueSize = 500
 	retryQueue := make(chan *retryEvent, retryQueueSize)
-	var retryQueueDrops atomic.Int64
+
+	// Pipeline-health telemetry: process-run identity plus capacity and loss
+	// counters for /api/stats. Read-only observability.
+	healthStats := health.NewStats(pipelineBufferSize, retryQueueSize)
 
 	router := &resultRouter{
 		cfg:              cfg,
@@ -371,7 +373,7 @@ func main() {
 		dispatch:         dispatch,
 	}
 
-	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, &retryQueueDrops, policyEngine, dispatch)
+	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, healthStats, policyEngine, dispatch)
 
 	numWorkers := cfg.MaxConcurrentLLM * 2
 	if numWorkers < 4 {
@@ -389,17 +391,42 @@ func main() {
 	for i := 0; i < numRetryWorkers; i++ {
 		go func() {
 			for item := range retryQueue {
+				// Retry-channel residence only; the blocking LLM-slot wait
+				// inside AnalyzeRetry is not part of this measurement.
+				healthStats.RecordRetryWait(time.Since(item.enqueuedAt))
 				result := a.AnalyzeRetry(ctx, item.evt)
 				router.Route(item.evt, &result, item.line, "classify_retry")
 			}
 		}()
 	}
 
+	// Install the health telemetry sources on the API server. The server has
+	// been serving since before the pipeline existed; the setter stores one
+	// atomic pointer, so installing after Start() is race-safe and startup
+	// order stays unchanged.
+	if apiServer != nil {
+		apiServer.SetHealthTelemetry(healthStats, func() health.RuntimeSnapshot {
+			schedTotal, schedDropped := llmScheduler.Stats()
+			coordPending, coordCapacity, coordEvictions := alertCoordinator.HealthStats()
+			return health.RuntimeSnapshot{
+				PipelineDepth:                len(pipeline),
+				RetryDepth:                   len(retryQueue),
+				SchedulerInUse:               llmScheduler.InUse(),
+				SchedulerCapacity:            llmScheduler.Capacity(),
+				SchedulerCalls:               schedTotal,
+				SchedulerDeferred:            schedDropped,
+				CoordinatorPending:           coordPending,
+				CoordinatorCapacity:          coordCapacity,
+				CoordinatorCapacityEvictions: coordEvictions,
+			}
+		})
+	}
+
 	log.Printf("[observer] Pipeline ready: buffer=%d workers=%d retry_queue=%d retry_workers=%d llm_slots=%d",
 		pipelineBufferSize, numWorkers, retryQueueSize, numRetryWorkers, cfg.MaxConcurrentLLM)
 
 	// ------- Periodic persistence + stats -------
-	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, &pipelineDrops, &retryQueueDrops, dispatch)
+	go runPeriodicStats(ctx, a, patterns, collector, db, alertCoordinator, llmScheduler, policyEngine, healthStats, dispatch)
 
 	// ------- Fix 4: Evidence reconciler goroutine -------
 	go runReconciler(ctx, db)
@@ -408,8 +435,9 @@ func main() {
 	ingestionHandler := func(line watcher.LogLine) {
 		select {
 		case pipeline <- line:
+			healthStats.ObservePipelineDepth(len(pipeline))
 		default:
-			pipelineDrops.Add(1)
+			healthStats.RecordPipelineDrop()
 			log.Println("[observer] WARNING: pipeline full - dropping log line")
 		}
 	}
@@ -1562,8 +1590,9 @@ func routePolicyOutcome(evt *event.Event, pr policy.Result, dispatch *notifier.D
 // =============================================================================
 
 type retryEvent struct {
-	evt  *event.Event
-	line watcher.LogLine
+	evt        *event.Event
+	line       watcher.LogLine
+	enqueuedAt time.Time
 }
 
 func makeLogHandler(
@@ -1574,7 +1603,7 @@ func makeLogHandler(
 	db *store.Store,
 	router *resultRouter,
 	retryQueue chan *retryEvent,
-	retryQueueDrops *atomic.Int64,
+	healthStats *health.Stats,
 	policyEngine *policy.Engine,
 	dispatch *notifier.Dispatcher,
 ) watcher.LogHandler {
@@ -1619,10 +1648,13 @@ func makeLogHandler(
 
 		if result.Source == "backpressure" {
 			select {
-			case retryQueue <- &retryEvent{evt: evt, line: line}:
+			case retryQueue <- &retryEvent{evt: evt, line: line, enqueuedAt: time.Now()}:
+				// Counted only on a successful enqueue: this is the sole
+				// site for the per-scope backpressure_deferred_events counter.
+				a.RecordRetryEnqueued(evt.ScopeKey())
 				log.Printf("[observer] Deferred to retry queue: %s %s", evt.ScopeKey(), truncate(evt.NormalizedLine, 80))
 			default:
-				retryQueueDrops.Add(1)
+				healthStats.RecordRetryDrop()
 				log.Println("[observer] WARNING: retry queue full - truly dropping unknown event")
 			}
 			return
@@ -1694,7 +1726,7 @@ func runReconciler(ctx context.Context, db *store.Store) {
 // Periodic Stats
 // =============================================================================
 
-func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, pipelineDrops *atomic.Int64, retryQueueDrops *atomic.Int64, dispatch *notifier.Dispatcher) {
+func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, healthStats *health.Stats, dispatch *notifier.Dispatcher) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -1714,8 +1746,8 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			aStats := a.GetStats()
 			pStats := patterns.GetStats()
 			llmTotal, llmDropped := scheduler.Stats()
-			drops := pipelineDrops.Load()
-			retryDrops := retryQueueDrops.Load()
+			drops := healthStats.PipelineDrops()
+			retryDrops := healthStats.RetryDrops()
 			asyncDrops := db.AsyncWriterStats() // Fix 3: async writer drops
 			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d async_drops=%d",
 				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned,

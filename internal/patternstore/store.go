@@ -393,6 +393,22 @@ func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *Match
 	return nil
 }
 
+// LearnResult classifies the outcome of a learn attempt for telemetry.
+// Visibility only: the result never changes what the store does.
+type LearnResult int
+
+const (
+	// LearnInserted means a new pattern entry was created.
+	LearnInserted LearnResult = iota
+	// LearnDuplicate means the pattern value already existed: a slice-tier
+	// no-op, or a hash-tier overwrite (which still refreshes
+	// reason/lineage/timestamp, as before).
+	LearnDuplicate
+	// LearnRejected means validation, verdict lookup, the auto-learn cap,
+	// or an unknown pattern type refused the learn.
+	LearnRejected
+)
+
 // Learn adds a new pattern to the store.
 // The pattern is validated before insertion:
 //   - regex patterns must compile
@@ -403,12 +419,20 @@ func matchTiers(b *PatternBucket, hash, normalizedLine string, v Verdict) *Match
 // v0.47: per-bucket caps prevent unbounded auto-hash growth.
 // Human and seeded patterns bypass caps; only "auto"/"llm" sources are capped.
 func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) error {
+	_, err := s.learnWithResult(scopeKey, verdict, pattern)
+	return err
+}
+
+// learnWithResult is the single lock-owning insertion path. It preserves the
+// pre-LearnResult statement order and side effects exactly; the result value
+// is additive telemetry.
+func (s *Store) learnWithResult(scopeKey string, verdict Verdict, pattern LearnedPattern) (LearnResult, error) {
 	// Validate (uses pattern.Source to apply LLM-stricter rules)
 	if err := s.validatePattern(&pattern); err != nil {
 		if !isHumanOrSeededSource(pattern.Source) {
 			s.stats.AutoLearnRejected.Add(1)
 		}
-		return fmt.Errorf("invalid pattern: %w", err)
+		return LearnRejected, fmt.Errorf("invalid pattern: %w", err)
 	}
 
 	s.mu.Lock()
@@ -417,7 +441,7 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 	scope := s.getOrCreateScope(scopeKey)
 	bucket := s.getBucket(scope, verdict)
 	if bucket == nil {
-		return fmt.Errorf("unknown verdict %q - refusing to learn", verdict)
+		return LearnRejected, fmt.Errorf("unknown verdict %q - refusing to learn", verdict)
 	}
 
 	// Dedup (slice tiers): if an active pattern with this exact value is
@@ -430,7 +454,7 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 	// are intentionally NOT treated as duplicates, so the existing "re-learn
 	// after operator revoke" behavior is preserved.
 	if bucketHasActivePattern(bucket, pattern.Type, pattern.Value) {
-		return nil
+		return LearnDuplicate, nil
 	}
 
 	// Cap check - only applies to non-human, non-seeded sources.
@@ -439,12 +463,18 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 		if reason, capped := s.bucketAtCap(bucket, pattern.Type); capped {
 			s.stats.AutoLearnRejected.Add(1)
 			s.stats.AutoLearnCapped.Add(1)
-			return fmt.Errorf("auto-learn cap reached for %s/%s: %s", scopeKey, verdict, reason)
+			return LearnRejected, fmt.Errorf("auto-learn cap reached for %s/%s: %s", scopeKey, verdict, reason)
 		}
 	}
 
+	result := LearnInserted
 	switch pattern.Type {
 	case PatternHash:
+		// The overwrite is unconditional as before (reason/lineage/timestamp
+		// refresh on re-learn); existed only classifies the result.
+		if _, existed := bucket.Hashes[pattern.Value]; existed {
+			result = LearnDuplicate
+		}
 		bucket.Hashes[pattern.Value] = &pattern
 	case PatternPrefix:
 		bucket.Prefixes = append(bucket.Prefixes, &pattern)
@@ -453,11 +483,11 @@ func (s *Store) Learn(scopeKey string, verdict Verdict, pattern LearnedPattern) 
 	case PatternContains:
 		bucket.Contains = append(bucket.Contains, &pattern)
 	default:
-		return fmt.Errorf("unknown pattern type: %s", pattern.Type)
+		return LearnRejected, fmt.Errorf("unknown pattern type: %s", pattern.Type)
 	}
 
 	s.stats.PatternCount.Add(1)
-	return nil
+	return result, nil
 }
 
 // bucketHasActivePattern reports whether a non-revoked pattern with the given
@@ -509,9 +539,11 @@ func (s *Store) bucketAtCap(bucket *PatternBucket, pt PatternType) (string, bool
 	return "", false
 }
 
-// LearnHash is a convenience method for adding an exact hash match.
-func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, originalLine, eventID string) {
-	_ = s.Learn(scopeKey, verdict, LearnedPattern{
+// LearnHash is a convenience method for adding an exact hash match. It
+// returns the LearnResult for telemetry (LearnRejected on error); the error
+// itself is swallowed, as before.
+func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, originalLine, eventID string) LearnResult {
+	result, _ := s.learnWithResult(scopeKey, verdict, LearnedPattern{
 		Type:               PatternHash,
 		Value:              hash,
 		Source:             "auto",
@@ -520,6 +552,7 @@ func (s *Store) LearnHash(scopeKey string, verdict Verdict, hash, reason, origin
 		CreatedAt:          time.Now(),
 		CreatedFromEventID: eventID,
 	})
+	return result
 }
 
 // validatePattern enforces structural and safety rules on patterns.

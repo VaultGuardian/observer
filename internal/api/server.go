@@ -14,10 +14,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vaultguardian/observer/internal/analyzer"
 	"github.com/vaultguardian/observer/internal/coordinator"
+	"github.com/vaultguardian/observer/internal/health"
 	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/rec"
 	"github.com/vaultguardian/observer/internal/store"
@@ -102,6 +104,31 @@ type Server struct {
 	// queue was full, the cumulative count of alerts suppressed by the
 	// rate limiter, and the number of active notification channels.
 	getNotifierStats func() (dropped, rateLimited int64, channels int)
+
+	// health holds the pipeline-health telemetry sources, installed by main
+	// AFTER the server has started serving (the pipeline and coordinator do
+	// not exist yet at Start() time). One atomic pointer carries both the
+	// counter struct and the runtime-snapshot provider so they install
+	// together; handleStats only ever Load()s and nil-checks, so the
+	// install-after-start race is safe without reordering startup.
+	health atomic.Pointer[healthTelemetry]
+}
+
+// healthTelemetry bundles the main-owned health counters with the closure
+// that samples live runtime state (channel depths, scheduler, coordinator).
+type healthTelemetry struct {
+	stats   *health.Stats
+	runtime func() health.RuntimeSnapshot
+}
+
+// SetHealthTelemetry installs the pipeline-health sources. Called from main
+// after the pipeline, scheduler, and coordinator are constructed. No-op if
+// either argument is nil.
+func (s *Server) SetHealthTelemetry(stats *health.Stats, runtime func() health.RuntimeSnapshot) {
+	if stats == nil || runtime == nil {
+		return
+	}
+	s.health.Store(&healthTelemetry{stats: stats, runtime: runtime})
 }
 
 // NewServer creates the API server and loads (or generates) the auth token.
@@ -462,8 +489,13 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Collector stats are gathered exactly once per request and reused by
+	// both the existing top-level rec block and pipeline_health.rec. The
+	// no-op collector returns a zero struct, so the unconditional call is
+	// safe when REC is disabled.
+	rStats := s.collector.Stats()
+
 	if s.collector.Enabled() {
-		rStats := s.collector.Stats()
 		result["rec"] = map[string]interface{}{
 			"packets":             rStats.PacketsSeen,
 			"http_requests":       rStats.HTTPRequests,
@@ -488,6 +520,81 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"flow_evictions_live": rStats.FlowEvictionsLive,
 		}
 	}
+
+	// Pipeline-health telemetry: capacity and loss counters so the dashboard
+	// can distinguish healthy from degraded operation. Read-only.
+	scopeStats := s.analyzer.ScopeStats()
+	pipelineHealth := map[string]interface{}{
+		"snapshot_at": time.Now().UTC().Format(time.RFC3339Nano),
+		// writer.dropped is loss telemetry only: it counts dropped
+		// recon/noise findings. Critical findings block instead of
+		// dropping, and writer depth/capacity are not exposed in this
+		// patch, so this is NOT complete writer-pressure telemetry.
+		"writer": map[string]interface{}{
+			"dropped": s.store.AsyncWriterStats(),
+		},
+		// Zeros when REC is disabled (no-op collector returns the zero
+		// struct, including vip_capacity: 0).
+		"rec": map[string]interface{}{
+			"buffer_evictions_total":    rStats.BufferEvictionsTotal,
+			"buffer_evictions_capacity": rStats.BufferEvictionsCapacity,
+			"buffer_evictions_age":      rStats.BufferEvictionsAge,
+			"buffer_evictions_bytes":    rStats.BufferEvictionsBytes,
+			"vip_pins":                  rStats.VIPPins,
+			"vip_evidence":              rStats.VIPEvidence,
+			"vip_capacity":              rStats.VIPMaxEntries,
+			"vip_capacity_evictions":    rStats.VIPCapacityEvictions,
+			"vip_expirations":           rStats.VIPExpirations,
+			"reassembly_stream_drops":   rStats.ReassemblyStreamDrops,
+			"flow_evictions_live":       rStats.FlowEvictionsLive,
+		},
+		"normalizer": map[string]interface{}{
+			"scopes_created_total": scopeStats.ScopesCreatedTotal,
+			"tracked_scopes":       scopeStats.TrackedScopes,
+			"overflow_events":      scopeStats.OverflowEvents,
+			"scopes":               scopeStats.Scopes,
+		},
+	}
+
+	// Runtime portions render only once main installs the telemetry sources
+	// (after pipeline/scheduler/coordinator construction). Before that the
+	// keys are simply omitted.
+	if ht := s.health.Load(); ht != nil {
+		snap := ht.stats.Snapshot()
+		runtime := ht.runtime()
+		pipelineHealth["stats_epoch"] = snap.StatsEpoch
+		pipelineHealth["started_at"] = snap.StartedAt.UTC().Format(time.RFC3339)
+		pipelineHealth["pipeline"] = map[string]interface{}{
+			"depth":      runtime.PipelineDepth,
+			"capacity":   snap.PipelineCapacity,
+			"high_water": snap.PipelineHighWater,
+			"dropped":    snap.PipelineDropped,
+		}
+		pipelineHealth["retry"] = map[string]interface{}{
+			"depth":              runtime.RetryDepth,
+			"capacity":           snap.RetryCapacity,
+			"last_queue_wait_ms": snap.RetryLastQueueWaitMs,
+			"max_queue_wait_ms":  snap.RetryMaxQueueWaitMs,
+			"dropped":            snap.RetryDropped,
+		}
+		// calls counts all successful slot acquisitions (T1, T2, catch-all
+		// verification); deferred_flights counts T1 singleflight leader
+		// TryAcquire failures, not events entering the retry queue. The
+		// per-scope normalizer.llm_calls counter is T1 leaders' model calls
+		// only, so these numbers are not expected to match.
+		pipelineHealth["llm_scheduler"] = map[string]interface{}{
+			"in_use":           runtime.SchedulerInUse,
+			"capacity":         runtime.SchedulerCapacity,
+			"calls":            runtime.SchedulerCalls,
+			"deferred_flights": runtime.SchedulerDeferred,
+		}
+		pipelineHealth["coordinator"] = map[string]interface{}{
+			"pending":            runtime.CoordinatorPending,
+			"capacity":           runtime.CoordinatorCapacity,
+			"capacity_evictions": runtime.CoordinatorCapacityEvictions,
+		}
+	}
+	result["pipeline_health"] = pipelineHealth
 
 	jsonOK(w, result)
 }

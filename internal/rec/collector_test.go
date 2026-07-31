@@ -210,3 +210,92 @@ func TestLookupVIPEvidenceLegacyScanWhenNoEventID(t *testing.T) {
 		t.Fatalf("legacy scan should consume exactly one entry, %d remain", len(lc.vipEvidence))
 	}
 }
+
+// =============================================================================
+// VIP pressure telemetry (pipeline_health)
+// =============================================================================
+
+// TestEnforceVIPCap_CountsEvictions: each entry deleted by the cap enforcement
+// increments the capacity-eviction counter, and Stats() reports the gauges and
+// the configured cap.
+func TestEnforceVIPCap_CountsEvictions(t *testing.T) {
+	lc := &liveCollector{
+		vipPins:     make(map[string]*vipPin),
+		vipEvidence: make(map[string]CapturedResponse),
+	}
+
+	base := time.Now()
+	for i := 0; i < vipMaxEntries; i++ {
+		id := "evt-" + string(rune('a'+i%26)) + "-" + time.Duration(i).String()
+		lc.vipPins[id] = &vipPin{eventID: id, createdAt: base.Add(time.Duration(i) * time.Millisecond)}
+	}
+
+	lc.vipMu.Lock()
+	lc.enforceVIPCapLocked()
+	lc.vipMu.Unlock()
+
+	stats := lc.Stats()
+	if stats.VIPCapacityEvictions != 1 {
+		t.Errorf("vip capacity evictions = %d, want 1 (map at cap evicts exactly one)", stats.VIPCapacityEvictions)
+	}
+	if stats.VIPPins != vipMaxEntries-1 {
+		t.Errorf("vip pins gauge = %d, want %d", stats.VIPPins, vipMaxEntries-1)
+	}
+	if stats.VIPMaxEntries != vipMaxEntries {
+		t.Errorf("vip max entries = %d, want %d", stats.VIPMaxEntries, vipMaxEntries)
+	}
+}
+
+// TestCleanupExpiredVIP_InjectedTime drives the extracted TTL sweep directly
+// with injected times - no ticker waits - and asserts one expiration count per
+// removed pin or evidence entry.
+func TestCleanupExpiredVIP_InjectedTime(t *testing.T) {
+	lc := &liveCollector{
+		vipPins:     make(map[string]*vipPin),
+		vipEvidence: make(map[string]CapturedResponse),
+	}
+
+	now := time.Now()
+	lc.vipPins["evt-old-pin"] = &vipPin{eventID: "evt-old-pin", createdAt: now.Add(-2 * vipTTL)}
+	lc.vipPins["evt-fresh-pin"] = &vipPin{eventID: "evt-fresh-pin", createdAt: now}
+	lc.vipEvidence["evt-old-ev"] = CapturedResponse{Timestamp: now.Add(-2 * vipTTL)}
+	lc.vipEvidence["evt-fresh-ev"] = CapturedResponse{Timestamp: now}
+
+	lc.cleanupExpiredVIP(now)
+
+	if _, ok := lc.vipPins["evt-old-pin"]; ok {
+		t.Error("expired pin survived the sweep")
+	}
+	if _, ok := lc.vipPins["evt-fresh-pin"]; !ok {
+		t.Error("fresh pin was swept")
+	}
+	if _, ok := lc.vipEvidence["evt-old-ev"]; ok {
+		t.Error("expired evidence survived the sweep")
+	}
+	if _, ok := lc.vipEvidence["evt-fresh-ev"]; !ok {
+		t.Error("fresh evidence was swept")
+	}
+
+	stats := lc.Stats()
+	if stats.VIPExpirations != 2 {
+		t.Errorf("vip expirations = %d, want 2 (one pin, one evidence entry)", stats.VIPExpirations)
+	}
+	if stats.VIPPins != 1 || stats.VIPEvidence != 1 {
+		t.Errorf("gauges = (pins %d, evidence %d), want (1, 1)", stats.VIPPins, stats.VIPEvidence)
+	}
+
+	// A second sweep at the same instant removes nothing more.
+	lc.cleanupExpiredVIP(now)
+	if got := lc.Stats().VIPExpirations; got != 2 {
+		t.Errorf("vip expirations after idempotent sweep = %d, want 2", got)
+	}
+}
+
+// TestNoOpCollector_VIPZeroStruct: with REC disabled the zero RECStats must
+// report VIPMaxEntries 0 so the API renders vip_capacity: 0.
+func TestNoOpCollector_VIPZeroStruct(t *testing.T) {
+	stats := NewCollector(CollectorConfig{Enabled: false}).Stats()
+	if stats.VIPMaxEntries != 0 || stats.VIPPins != 0 || stats.VIPCapacityEvictions != 0 || stats.VIPExpirations != 0 {
+		t.Errorf("disabled collector VIP stats not zero: %+v", stats)
+	}
+}

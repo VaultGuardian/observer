@@ -242,6 +242,11 @@ type Coordinator struct {
 	// = backend logs are losing host attribution and we should look at
 	// the parser/normalizer pipeline.
 	hostlessKeys atomic.Int64
+
+	// capacityEvictions counts investigations force-dispatched because the
+	// pending map hit maxPendingInvestigations. Read-only telemetry for
+	// /api/stats pipeline_health.coordinator.
+	capacityEvictions atomic.Int64
 }
 
 // Config holds coordinator settings.
@@ -396,6 +401,7 @@ func (c *Coordinator) Process(key string, alert *PendingAlert) {
 			old := c.pending[oldestKey]
 			delete(c.pending, oldestKey)
 			c.recordFinalized(oldestKey, "evicted", "too many pending", old.EventCount, false)
+			c.capacityEvictions.Add(1)
 			go c.forceDispatch(old, "evicted from coordinator (too many pending)")
 		}
 	}
@@ -916,6 +922,15 @@ func (c *Coordinator) Stats() (pending int, graveyard int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.pending), len(c.graveyard)
+}
+
+// HealthStats returns pending depth, the pending capacity, and the lifetime
+// count of capacity evictions for /api/stats pipeline_health.coordinator.
+func (c *Coordinator) HealthStats() (pending, capacity int, capacityEvictions int64) {
+	c.mu.Lock()
+	pending = len(c.pending)
+	c.mu.Unlock()
+	return pending, maxPendingInvestigations, c.capacityEvictions.Load()
 }
 
 // CatchAllStats returns catch-all tracker state for telemetry.

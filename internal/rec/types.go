@@ -204,6 +204,16 @@ type RECStats struct {
 	FeedHTTP   int64
 	VIPMatches int64
 
+	// VIP lane pressure telemetry. Gauges (VIPPins, VIPEvidence) are read
+	// under vipMu at snapshot time; counters are collector-wide atomics.
+	// VIPMaxEntries is 0 in the disabled zero struct, which the API renders
+	// as vip_capacity: 0.
+	VIPPins              int   // current pending pins (gauge)
+	VIPEvidence          int   // current protected evidence entries (gauge)
+	VIPCapacityEvictions int64 // entries deleted by the pin-cap enforcement
+	VIPExpirations       int64 // pins and evidence entries removed by TTL sweep
+	VIPMaxEntries        int   // configured cap on pending pins
+
 	// Port registry telemetry (v0.47.1).
 	// Useful for debugging "why isn't REC seeing this port?" - operator
 	// can confirm the port made it into the configured set, or watch

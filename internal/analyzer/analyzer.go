@@ -87,6 +87,9 @@ type Analyzer struct {
 
 	// stats uses atomic counters - safe for concurrent goroutines.
 	stats Stats
+
+	// scopes holds per-scope classification-flow telemetry (see scopestats.go).
+	scopes scopeRegistry
 }
 
 // classifyFlightResult is the shared outcome of one coalesced classification.
@@ -159,13 +162,15 @@ type StatsSnapshot struct {
 // New creates an Analyzer with the given components.
 // The scheduler controls global LLM concurrency across all tiers.
 func New(normalizers *normalizer.Registry, patterns *patternstore.Store, llmClient *llm.Client, scheduler LLMScheduler) *Analyzer {
-	return &Analyzer{
+	a := &Analyzer{
 		normalizers:  normalizers,
 		patterns:     patterns,
 		llmClient:    llmClient,
 		hints:        normalizer.NewHintCollector(),
 		llmScheduler: scheduler,
 	}
+	a.scopes.scopes = make(map[string]*scopeStats)
+	return a
 }
 
 // Analyze runs the full pipeline on an event:
@@ -182,6 +187,16 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 
 	// --- Step 1: Normalize ---
 	a.normalizers.NormalizeEvent(evt)
+
+	// Per-scope telemetry: resolve the bucket once and increment through the
+	// pointer. events_total counts here only, never in AnalyzeRetry (a retried
+	// event was already counted on its first pass). overflow_events is bumped
+	// only at this site so it equals the other bucket's events_total.
+	ss, ssIsOther := a.scopes.resolve(evt.ScopeKey())
+	ss.eventsTotal.Add(1)
+	if ssIsOther {
+		a.scopes.overflowEvents.Add(1)
+	}
 
 	// --- Step 1.4: High-risk disclosure guard (v0.47, review of F5) ---
 	//
@@ -215,6 +230,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// (Remix stack trace classified as "alert" → 25 emails overnight).
 	if !hasDisclosure && isOperationalNoise(evt.Line) {
 		a.stats.NoiseSuppressed.Add(1)
+		ss.deterministicResolved.Add(1)
 		return AnalysisResult{
 			Event:   evt,
 			Verdict: patternstore.VerdictSuppress,
@@ -238,6 +254,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	if !hasDisclosure {
 		if reason, ok := isFailedProbe(evt.NormalizedLine); ok {
 			a.stats.NoiseSuppressed.Add(1)
+			ss.deterministicResolved.Add(1)
 			return AnalysisResult{
 				Event:   evt,
 				Verdict: patternstore.VerdictSuppress,
@@ -276,6 +293,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 			// Fall through to LLM classification (do not increment PatternHits).
 		} else {
 			a.stats.PatternHits.Add(1)
+			ss.initialPatternHits.Add(1)
 			return AnalysisResult{
 				Event:         evt,
 				Verdict:       result.Verdict,
@@ -289,6 +307,11 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 			}
 		}
 	}
+
+	// Initial-pattern miss: reached when Match returned nil OR a cached
+	// suppress/allow hit was disclosure-overridden above (an overridden hit
+	// counts as a miss - the event proceeds to the LLM path either way).
+	ss.initialPatternMisses.Add(1)
 
 	// --- Step 3: Unknown → consult LLM (with backpressure) ---
 
@@ -305,7 +328,7 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// attaches to one in-flight LLM call (non-blocking acquire); only the leader
 	// touches the scheduler and the pattern store. Each event still resolves to
 	// its own AnalysisResult.
-	return a.classifyDeduped(ctx, evt, hasDisclosure, false)
+	return a.classifyDeduped(ctx, evt, ss, hasDisclosure, false)
 }
 
 // AnalyzeRetry is called by retry workers for events deferred due to LLM backpressure.
@@ -317,6 +340,10 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 // line must not be honored. Falls through to blocking LLM classification.
 func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisResult {
 	a.stats.Retried.Add(1)
+
+	// Per-scope telemetry: resolve only, no events_total increment - the
+	// event was counted in Analyze before it was deferred.
+	ss, _ := a.scopes.resolve(evt.ScopeKey())
 
 	hasDisclosure := containsHighRiskDisclosure(evt.Line) ||
 		containsHighRiskDisclosure(evt.NormalizedLine)
@@ -332,6 +359,7 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 		} else {
 			a.stats.PatternHits.Add(1)
 			a.stats.RetriedPatternHit.Add(1)
+			ss.retryPatternHits.Add(1)
 			return AnalysisResult{
 				Event:         evt,
 				Verdict:       result.Verdict,
@@ -349,7 +377,7 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 	// Coalesce concurrent retries of the same line into one blocking
 	// classification. The in-flight re-check inside the flight closes the race
 	// where a peer learned the pattern while we waited for a slot.
-	return a.classifyDeduped(ctx, evt, hasDisclosure, true)
+	return a.classifyDeduped(ctx, evt, ss, hasDisclosure, true)
 }
 
 // classifyDeduped coalesces concurrent classifications of the same event shape
@@ -369,22 +397,22 @@ func (a *Analyzer) AnalyzeRetry(ctx context.Context, evt *event.Event) AnalysisR
 // leader is identified by LeaderEventID == evt.ID (NOT singleflight's shared
 // bool - the leader can also observe shared==true). Each caller then builds its
 // own per-event AnalysisResult.
-func (a *Analyzer) classifyDeduped(ctx context.Context, evt *event.Event, hasDisclosure, retry bool) AnalysisResult {
+func (a *Analyzer) classifyDeduped(ctx context.Context, evt *event.Event, ss *scopeStats, hasDisclosure, retry bool) AnalysisResult {
 	key := evt.ScopeKey() + "\x00" + evt.Hash + "\x00disc=" + strconv.FormatBool(hasDisclosure)
 
 	res, _, _ := a.classifyGroup.Do(key, func() (interface{}, error) {
-		return a.runClassifyFlight(ctx, evt, hasDisclosure, retry), nil
+		return a.runClassifyFlight(ctx, evt, ss, hasDisclosure, retry), nil
 	})
 
 	fr := res.(*classifyFlightResult)
-	return a.buildResult(evt, fr, retry, fr.LeaderEventID == evt.ID)
+	return a.buildResult(evt, ss, fr, retry, fr.LeaderEventID == evt.ID)
 }
 
 // runClassifyFlight is the leader-only body of a coalesced classification: it
 // holds a single scheduler slot, re-checks the pattern store, calls the LLM
 // once, and learns once. It returns a small shared result that every follower
 // reads. It must only be invoked inside classifyGroup.Do.
-func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasDisclosure, retry bool) *classifyFlightResult {
+func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, ss *scopeStats, hasDisclosure, retry bool) *classifyFlightResult {
 	fr := &classifyFlightResult{LeaderEventID: evt.ID}
 
 	// Acquire one slot for the whole coalesced group. Because a single shared
@@ -427,6 +455,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 			a.stats.PatternHits.Add(1)
 			if retry {
 				a.stats.RetriedPatternHit.Add(1)
+				ss.retryPatternHits.Add(1)
 			}
 			fr.Source = "pattern"
 			fr.Match = result
@@ -435,6 +464,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 	}
 
 	a.stats.LLMCalls.Add(1)
+	ss.llmCalls.Add(1)
 
 	verdict, err := a.llmClient.AnalyzeLog(
 		ctx,
@@ -490,7 +520,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 	}
 
 	// --- Step 4: Learn from the LLM's response (leader-only) ---
-	fr.PatternLearned = a.learnFromVerdict(evt, verdict, effectiveAction)
+	fr.PatternLearned = a.learnFromVerdict(evt, ss, verdict, effectiveAction)
 	fr.Source = "llm"
 	fr.Verdict = verdict
 	return fr
@@ -502,7 +532,7 @@ func (a *Analyzer) runClassifyFlight(ctx context.Context, evt *event.Event, hasD
 // followers from writing duplicate llm_decisions audit rows (resultRouter gates
 // the audit row on Source=="llm" && LLMVerdict != nil), so the audit count
 // reflects real LLM calls, not coalesced events.
-func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry, isLeader bool) AnalysisResult {
+func (a *Analyzer) buildResult(evt *event.Event, ss *scopeStats, fr *classifyFlightResult, retry, isLeader bool) AnalysisResult {
 	switch fr.Source {
 	case "pattern":
 		source := fr.Match.Pattern.Source
@@ -546,6 +576,9 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 		}
 
 	default: // "llm"
+		// Once per event resolved by a shared LLM verdict, leader and each
+		// follower alike (every caller reaches here individually).
+		ss.llmResolvedEvents.Add(1)
 		v := mapActionToVerdict(fr.Verdict.Action)
 		if fr.ClampedToAlert {
 			// Applied verdict only - fr.Verdict stays the immutable original.
@@ -593,7 +626,7 @@ func (a *Analyzer) buildResult(evt *event.Event, fr *classifyFlightResult, retry
 // original the audit trail records, and a divergent copy invites accidental
 // sharing. Learning follows the APPLIED action so the hash lands in the
 // bucket future events will actually be routed by.
-func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effectiveAction string) bool {
+func (a *Analyzer) learnFromVerdict(evt *event.Event, ss *scopeStats, verdict *llm.Verdict, effectiveAction string) bool {
 	scopeKey := evt.ScopeKey()
 	v := mapActionToVerdict(effectiveAction)
 
@@ -651,7 +684,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 
 	// Always learn the exact hash for allow/suppress (fast path for exact repeats)
 	if v == patternstore.VerdictAllow || v == patternstore.VerdictSuppress {
-		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
+		ss.recordHashLearn(a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID))
 	}
 
 	// For malicious, learn the hash but NOT patterns (conservative trust model).
@@ -659,7 +692,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// because malicious classification on identical normalized lines should
 	// continue to fire fast.
 	if v == patternstore.VerdictMalicious {
-		a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
+		ss.recordHashLearn(a.patterns.LearnHash(scopeKey, v, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID))
 		return false
 	}
 
@@ -668,7 +701,7 @@ func (a *Analyzer) learnFromVerdict(evt *event.Event, verdict *llm.Verdict, effe
 	// distinct from VerdictMalicious (suspicious vs confirmed-bad). Hash-only, no patterns,
 	// no generalization. The conservative trust model is preserved.
 	if effectiveAction == "alert" {
-		a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID)
+		ss.recordHashLearn(a.patterns.LearnHash(scopeKey, patternstore.VerdictAlert, evt.Hash, verdict.Reason, evt.NormalizedLine, evt.ID))
 		return false
 	}
 

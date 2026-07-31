@@ -74,6 +74,25 @@ func (s *LLMScheduler) TryAcquire() (release func(), ok bool) {
 }
 
 // Stats returns scheduler metrics.
+//
+// Exposed in /api/stats pipeline_health.llm_scheduler as "calls" and
+// "deferred_flights". calls counts all successful slot acquisitions across
+// all tiers (T1 classification, T2 reclassification, catch-all
+// verification). deferred_flights counts T1 singleflight leader TryAcquire
+// failures, one per deferred flight, not events entering the retry queue.
+// The per-scope normalizer.llm_calls counter tracks T1 leaders' actual
+// model calls only, so these numbers are not expected to match.
 func (s *LLMScheduler) Stats() (total, dropped int64) {
 	return s.total.Load(), s.dropped.Load()
+}
+
+// InUse returns the number of slots currently held.
+func (s *LLMScheduler) InUse() int {
+	return len(s.sem)
+}
+
+// Capacity returns the scheduler's concurrency limit as clamped by the
+// constructor. Always read capacity from here, never from raw config.
+func (s *LLMScheduler) Capacity() int {
+	return cap(s.sem)
 }
