@@ -91,9 +91,18 @@ func (w *Watcher) Run(ctx context.Context) error {
 	return w.watchEvents(ctx)
 }
 
+// listContainers queries the Docker daemon for running containers.
+//
+// The request URLs in this file are unversioned (no /v1.43 prefix). Docker 29
+// (shipping in Ubuntu 24.04's docker.io package) enforces a minimum API version
+// of 1.44 and rejects the old hardcoded /v1.43 path with a JSON error object,
+// which the array decode then fails to unmarshal. Omitting the version lets the
+// daemon negotiate its own default, mirroring what internal/rec/discovery.go
+// already does on /containers/json. The fields we decode have been stable since
+// API 1.24.
 func (w *Watcher) listContainers(ctx context.Context) ([]Container, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://docker/v1.43/containers/json?filters={\"status\":[\"running\"]}", nil)
+		"http://docker/containers/json?filters={\"status\":[\"running\"]}", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +113,10 @@ func (w *Watcher) listContainers(ctx context.Context) ([]Container, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, dockerAPIError(resp)
+	}
+
 	var containers []Container
 	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
 		return nil, err
@@ -112,12 +125,28 @@ func (w *Watcher) listContainers(ctx context.Context) ([]Container, error) {
 	return containers, nil
 }
 
+// dockerAPIError renders a non-200 Docker response as an error carrying the
+// daemon's own text. Docker reports problems (like a too-old client API version)
+// as a JSON object {"message": "..."} rather than the array/stream we asked for,
+// so surface that message instead of letting a downstream decode fail with a
+// confusing "cannot unmarshal object" error.
+func dockerAPIError(resp *http.Response) error {
+	body, _ := io.ReadAll(resp.Body)
+	var msg struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &msg); err == nil && msg.Message != "" {
+		return fmt.Errorf("docker API %d: %s", resp.StatusCode, msg.Message)
+	}
+	return fmt.Errorf("docker API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
 func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 	name := cleanName(c.Names)
 	log.Printf("[watcher] Streaming logs for %s (%s)", name, shortID(c.ID))
 
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		fmt.Sprintf("http://docker/v1.43/containers/%s/logs?follow=true&stdout=true&stderr=true&since=%d&timestamps=true",
+		fmt.Sprintf("http://docker/containers/%s/logs?follow=true&stdout=true&stderr=true&since=%d&timestamps=true",
 			c.ID, time.Now().Unix()), nil)
 	if err != nil {
 		log.Printf("[watcher] Error creating request for %s: %v", name, err)
@@ -215,7 +244,7 @@ func (w *Watcher) streamLogs(ctx context.Context, c Container) {
 
 func (w *Watcher) watchEvents(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://docker/v1.43/events?filters={\"event\":[\"start\"],\"type\":[\"container\"]}", nil)
+		"http://docker/events?filters={\"event\":[\"start\"],\"type\":[\"container\"]}", nil)
 	if err != nil {
 		return err
 	}
@@ -225,6 +254,10 @@ func (w *Watcher) watchEvents(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return dockerAPIError(resp)
+	}
 
 	decoder := json.NewDecoder(resp.Body)
 	for {
