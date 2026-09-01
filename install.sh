@@ -10,6 +10,11 @@ CLI="/usr/local/bin/vaultguardian"
 SERVICE_FILE="/etc/systemd/system/observer.service"
 DATA_DIR="/var/lib/observer"
 CONFIG_DIR="/etc/vaultguardian"
+KEY_FILE="$CONFIG_DIR/dashboard.key"
+DASHBOARD_URL="https://vaultguardian.io/dashboard"
+
+# How long the post-start checks wait for Observer to report ready.
+STARTUP_TIMEOUT=15
 
 # -------------------------------------------------------------------
 # Colors
@@ -122,6 +127,15 @@ PRESERVE_ENV=false
 if [ "$EXISTING_INSTALL" = true ] && [ -f "$CONFIG_DIR/observer.env" ]; then
     PRESERVE_ENV=true
 fi
+
+# Defaults for values the configuration prompts normally set. On the
+# preserve path they are re-read from the existing env file further down.
+HOSTED_DASHBOARD=false
+DASHBOARD_BIND_ADDR=127.0.0.1
+DASHBOARD_PORT=9090
+SERVER_NICK="$(hostname)"
+REC_ENABLED=""
+ALERT_EMAIL=""
 
 # -------------------------------------------------------------------
 # Detect environment
@@ -478,6 +492,23 @@ EOF
     ok "Environment file written (chmod 0600)"
 fi
 
+# On the preserve path the prompts were skipped, so pull the values the
+# startup checks and closing block need straight from the existing env
+# file. Plain grep/cut, no sourcing: some values contain spaces.
+env_value() {
+    grep "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+if [ "$PRESERVE_ENV" = true ]; then
+    v=$(env_value DASHBOARD_PORT);      DASHBOARD_PORT="${v:-9090}"
+    v=$(env_value DASHBOARD_BIND_ADDR); DASHBOARD_BIND_ADDR="${v:-127.0.0.1}"
+    v=$(env_value HOSTNAME);            SERVER_NICK="${v:-$(hostname)}"
+    v=$(env_value REC_ENABLED);         REC_ENABLED="${v:-}"
+    if [ "$DASHBOARD_BIND_ADDR" = "0.0.0.0" ]; then
+        HOSTED_DASHBOARD=true
+    fi
+fi
+
 # -------------------------------------------------------------------
 # Install CLI tool
 # -------------------------------------------------------------------
@@ -688,6 +719,175 @@ chmod +x "$CLI"
 ok "CLI tool installed at $CLI"
 
 # -------------------------------------------------------------------
+# Startup checks and closing walkthrough (helpers)
+# -------------------------------------------------------------------
+
+# journal_snapshot - the current service invocation's log, timestamps
+# stripped, so an upgrade does not match markers from the previous run.
+journal_snapshot() {
+    local inv
+    inv=$(systemctl show -p InvocationID --value observer 2>/dev/null || true)
+    if [ -n "$inv" ]; then
+        journalctl -u observer "_SYSTEMD_INVOCATION_ID=$inv" --no-pager -o cat 2>/dev/null || true
+    else
+        journalctl -u observer --since "-2min" --no-pager -o cat 2>/dev/null || true
+    fi
+}
+
+# api_listening - true when the dashboard API socket is bound on the
+# address and port the env file asked for.
+api_listening() {
+    local pat addr
+    if [ "$DASHBOARD_BIND_ADDR" = "0.0.0.0" ]; then
+        pat="(0\.0\.0\.0|\*|\[::\]):${DASHBOARD_PORT}[[:space:]]"
+    else
+        addr=$(printf '%s' "$DASHBOARD_BIND_ADDR" | sed 's/\./\\./g')
+        pat="$addr:${DASHBOARD_PORT}[[:space:]]"
+    fi
+    ss -ltn 2>/dev/null | grep -qE "$pat"
+}
+
+# run_startup_checks - poll the journal for up to STARTUP_TIMEOUT seconds
+# and report each readiness marker as it appears. Never dumps raw log
+# lines; anything unconfirmed points at 'vaultguardian logs'.
+run_startup_checks() {
+    local deadline=$((SECONDS + STARTUP_TIMEOUT))
+    local snap n
+    local c_pipeline=false c_docker=false c_rec=false c_journal=false
+    local c_llm=false c_api=false c_key=false
+
+    # Checks that do not apply on this box start out as done.
+    [ "$DOCKER_FOUND" = true ]    || c_docker=true
+    [ "$REC_ENABLED" = true ]     || c_rec=true
+    [ "$JOURNALD_FOUND" = true ]  || c_journal=true
+    command -v ss >/dev/null 2>&1 || c_api=true
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        snap=$(journal_snapshot)
+
+        if [ "$c_pipeline" = false ] && grep -q "Pipeline ready" <<<"$snap"; then
+            ok "Pipeline ready"
+            c_pipeline=true
+        fi
+
+        if [ "$c_docker" = false ]; then
+            if grep -q "Found [0-9]* running containers" <<<"$snap"; then
+                n=$(grep -o "Found [0-9]* running containers" <<<"$snap" | tail -1 | grep -o "[0-9]*" || true)
+                ok "Docker: ${n:-?} containers streaming"
+                c_docker=true
+            elif grep -q "Docker watcher error" <<<"$snap"; then
+                warn "Docker: $(grep "Docker watcher error" <<<"$snap" | tail -1)"
+                c_docker=true
+            fi
+        fi
+
+        if [ "$c_rec" = false ] && grep -q "Response Evidence Capture started" <<<"$snap"; then
+            ok "Evidence capture: active"
+            c_rec=true
+        fi
+
+        if [ "$c_journal" = false ] && grep -q "Streaming journal entries" <<<"$snap"; then
+            ok "Host OS: journald streaming"
+            c_journal=true
+        fi
+
+        if [ "$c_llm" = false ]; then
+            if grep -q "LLM inference server connected" <<<"$snap"; then
+                ok "LLM: connected"
+                c_llm=true
+            elif grep -qE "LLM not ready|LLM_ERROR" <<<"$snap"; then
+                warn "LLM: not reachable yet (check LLM_URL / API key)"
+                c_llm=true
+            fi
+        fi
+
+        if [ "$c_api" = false ] && api_listening; then
+            ok "Dashboard API: listening on $DASHBOARD_BIND_ADDR:$DASHBOARD_PORT"
+            c_api=true
+        fi
+
+        if [ "$c_key" = false ] && [ -s "$KEY_FILE" ]; then
+            ok "Dashboard token: ready"
+            c_key=true
+        fi
+
+        if [ "$c_pipeline" = true ] && [ "$c_docker" = true ] && [ "$c_rec" = true ] \
+            && [ "$c_journal" = true ] && [ "$c_llm" = true ] && [ "$c_api" = true ] \
+            && [ "$c_key" = true ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    local hint="not confirmed in ${STARTUP_TIMEOUT}s, check 'vaultguardian logs'"
+    [ "$c_pipeline" = true ] || warn "Pipeline ready: $hint"
+    [ "$c_docker" = true ]   || warn "Docker: $hint"
+    [ "$c_rec" = true ]      || warn "Evidence capture: $hint"
+    [ "$c_journal" = true ]  || warn "Host OS journald: $hint"
+    [ "$c_llm" = true ]      || warn "LLM: $hint"
+    [ "$c_key" = true ]      || warn "Dashboard token: not written yet, check 'vaultguardian logs'"
+    if [ "$c_api" = false ]; then
+        if [ "$HOSTED_DASHBOARD" = true ]; then
+            warn "Dashboard API: not listening on 0.0.0.0:$DASHBOARD_PORT after ${STARTUP_TIMEOUT}s. The hosted dashboard cannot reach it. Check 'vaultguardian logs'"
+        else
+            warn "Dashboard API: not listening on $DASHBOARD_BIND_ADDR:$DASHBOARD_PORT after ${STARTUP_TIMEOUT}s. Check 'vaultguardian logs'"
+        fi
+    fi
+}
+
+# firewall_hint - warn when ufw is active and the API port is not allowed.
+# Cloud security groups cannot be detected from inside the box, so the
+# walkthrough always mentions them too.
+firewall_hint() {
+    local status
+    command -v ufw >/dev/null 2>&1 || return 0
+    status=$(ufw status 2>/dev/null || true)
+    if grep -q "^Status: active" <<<"$status" \
+        && ! grep -qE "^$DASHBOARD_PORT(/tcp)?[[:space:]]+ALLOW" <<<"$status"; then
+        warn "ufw is active and port $DASHBOARD_PORT is not open. Run: ufw allow $DASHBOARD_PORT/tcp"
+    fi
+}
+
+# print_connect_steps - the final screen for hosted-dashboard installs.
+# Everything the Add Instance form asks for, ready to copy.
+print_connect_steps() {
+    local token public_ip
+    token=$(cat "$KEY_FILE" 2>/dev/null || true)
+    public_ip=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
+    if [ -z "$public_ip" ]; then
+        public_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+    public_ip="${public_ip:-<this-server-public-ip>}"
+
+    echo ""
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+    info "Next step: connect this server to your dashboard"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  1. Open $DASHBOARD_URL and click Add Instance"
+    echo ""
+    echo "  2. Enter these values:"
+    echo ""
+    echo -e "       Name:     ${GREEN}$SERVER_NICK${NC}"
+    echo -e "       API URL:  ${GREEN}http://$public_ip:$DASHBOARD_PORT${NC}"
+    if [ -n "$token" ]; then
+        echo -e "       Token:    ${GREEN}$token${NC}"
+    else
+        echo "       Token:    (not written yet) get it with: sudo cat $KEY_FILE"
+    fi
+    echo ""
+    echo "  3. Click Connect. $SERVER_NICK should show as online within a few seconds."
+    echo ""
+    echo "  Not connecting? Allow inbound TCP $DASHBOARD_PORT in your firewall and in"
+    echo "  your cloud provider's security group, then try again."
+    echo ""
+    echo "  The token is this server's API password. It is stored root-only at"
+    echo "  $KEY_FILE and you can print it again with: sudo cat $KEY_FILE"
+    firewall_hint
+    echo ""
+}
+
+# -------------------------------------------------------------------
 # Start Observer
 # -------------------------------------------------------------------
 info "Starting Observer..."
@@ -702,6 +902,8 @@ sleep 2
 # -------------------------------------------------------------------
 # Verify
 # -------------------------------------------------------------------
+# Order matters here: the hosted-dashboard walkthrough is the last thing
+# printed so it is on screen when the script exits. No raw log dump.
 echo ""
 if systemctl is-active --quiet observer; then
     echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
@@ -713,35 +915,18 @@ if systemctl is-active --quiet observer; then
     echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
     echo ""
 
+    info "Startup checks (up to ${STARTUP_TIMEOUT}s):"
+    run_startup_checks
+    echo ""
+
     if [ "$PRESERVE_ENV" = true ]; then
-        # Upgrade with preserved config - keep the banner minimal. The
+        # Upgrade with preserved config - keep the summary minimal. The
         # user already knows their config; we'd have to source the env
         # file (which has spaces in some values like ALERT_EMAIL_FROM)
         # to recap it, and that's more risk than value.
         ok "Configuration preserved: $ENV_FILE"
         info "Inspect with: sudo cat $ENV_FILE   (root-only)"
     else
-        # Dashboard URL depends on whether the operator connected this box to
-        # the hosted dashboard. When they did, the API binds to 0.0.0.0 and we
-        # advertise the public IPv4 plus how to add the instance. When they did
-        # not, we bind to 127.0.0.1 (May 4 hardening) and show the loopback +
-        # SSH tunnel path, so we never advertise an address that won't accept
-        # connections, plus how to opt in to the hosted dashboard later.
-        if [ "$HOSTED_DASHBOARD" = true ]; then
-            PUBLIC_IP=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
-            ok "Dashboard API: http://$PUBLIC_IP:$DASHBOARD_PORT (all interfaces, bearer token required)"
-            echo ""
-            info "Connect it to the hosted dashboard:"
-            echo "  1. Copy your token:   sudo cat /etc/vaultguardian/dashboard.key"
-            echo "  2. Open https://vaultguardian.io/dashboard and click Add Instance"
-            echo "  3. API URL: http://$PUBLIC_IP:$DASHBOARD_PORT"
-            echo "  If a firewall or cloud security group is active, allow inbound TCP $DASHBOARD_PORT."
-        else
-            ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
-            info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
-            info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
-            info "To connect the hosted dashboard later: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at https://vaultguardian.io/dashboard"
-        fi
         case "$PROVIDER_CHOICE" in
             [cC]*) ok "LLM: cloud ($LLM_URL, model $LLM_MODEL)" ;;
             *)     ok "LLM: local ($LLM_URL, model $LLM_MODEL)" ;;
@@ -758,9 +943,29 @@ if systemctl is-active --quiet observer; then
     echo "  vaultguardian status    - Check health"
     echo "  vaultguardian stats     - Pipeline statistics"
     echo "  vaultguardian update    - Update to latest version"
-    echo ""
-    info "First 20 log lines:"
-    journalctl -u observer -n 20 --no-pager
+
+    # Dashboard block, always last.
+    if [ "$PRESERVE_ENV" = true ]; then
+        echo ""
+        if [ "$HOSTED_DASHBOARD" = true ]; then
+            info "Hosted dashboard: this server is set up for it (DASHBOARD_BIND_ADDR=0.0.0.0)."
+            info "Token for $DASHBOARD_URL: sudo cat $KEY_FILE"
+        else
+            info "To connect the hosted dashboard: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at $DASHBOARD_URL"
+        fi
+    elif [ "$HOSTED_DASHBOARD" = true ]; then
+        print_connect_steps
+    else
+        # Bound to 127.0.0.1 (May 4 hardening): show the loopback + SSH
+        # tunnel path so we never advertise an address that won't accept
+        # connections, plus how to opt in to the hosted dashboard later.
+        echo ""
+        ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
+        info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
+        info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
+        info "To connect the hosted dashboard later: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at $DASHBOARD_URL"
+        echo ""
+    fi
 else
     fail "Observer failed to start. Check: journalctl -u observer -n 50 --no-pager"
 fi
