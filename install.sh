@@ -293,6 +293,21 @@ case "$REC_CHOICE" in
     *) REC_ENABLED=true ;;
 esac
 
+# Hosted dashboard connectivity. The hosted dashboard at vaultguardian.io
+# reaches this box's API over the internet, which only works when the API
+# listens on all interfaces (0.0.0.0) rather than loopback. Default Y; when
+# declined, the bind address stays 127.0.0.1 and behavior is unchanged.
+echo ""
+echo "  The hosted dashboard at vaultguardian.io connects to this server's API"
+echo "  over the internet. That requires the API to listen on all interfaces"
+echo "  (0.0.0.0) on port $DASHBOARD_PORT, protected by the bearer token. If you skip this"
+echo "  you can still use the API locally or over an SSH tunnel."
+ask "  Connect this server to the hosted dashboard? [Y/n]: " HOSTED_CHOICE
+case "$HOSTED_CHOICE" in
+    [nN]|[nN][oO]) HOSTED_DASHBOARD=false; DASHBOARD_BIND_ADDR=127.0.0.1 ;;
+    *) HOSTED_DASHBOARD=true; DASHBOARD_BIND_ADDR=0.0.0.0 ;;
+esac
+
 echo ""
 
 fi  # end of PRESERVE_ENV check (was opened above "Configuration")
@@ -427,8 +442,8 @@ HOSTNAME=$SERVER_NICK
 
 # Dashboard binding.
 #   127.0.0.1 = localhost only (default, safest - for self-hosted setups)
-#   0.0.0.0   = all interfaces (for hosted dashboards via proxy/VPN; firewall the port)
-DASHBOARD_BIND_ADDR=127.0.0.1
+#   0.0.0.0   = all interfaces (required for the hosted dashboard; API is bearer-token protected)
+DASHBOARD_BIND_ADDR=$DASHBOARD_BIND_ADDR
 
 # Dashboard CORS allowlist (comma-separated origins). Empty = no CORS headers.
 # Set this if a browser-side dashboard hits Observer directly.
@@ -706,15 +721,27 @@ if systemctl is-active --quiet observer; then
         ok "Configuration preserved: $ENV_FILE"
         info "Inspect with: sudo cat $ENV_FILE   (root-only)"
     else
-        # Dashboard URL - show the actual bind address, not the box's external IP.
-        # By default we bind to 127.0.0.1 (May 4 hardening), so advertising
-        # `http://<hostname -I>:9090` would tell the user to visit an address
-        # that won't accept connections. Show 127.0.0.1 + an SSH tunnel hint;
-        # users who set DASHBOARD_BIND_ADDR=0.0.0.0 (after firewalling the
-        # port) will know their LAN address already.
-        ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
-        info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
-        info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
+        # Dashboard URL depends on whether the operator connected this box to
+        # the hosted dashboard. When they did, the API binds to 0.0.0.0 and we
+        # advertise the public IPv4 plus how to add the instance. When they did
+        # not, we bind to 127.0.0.1 (May 4 hardening) and show the loopback +
+        # SSH tunnel path, so we never advertise an address that won't accept
+        # connections, plus how to opt in to the hosted dashboard later.
+        if [ "$HOSTED_DASHBOARD" = true ]; then
+            PUBLIC_IP=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+            ok "Dashboard API: http://$PUBLIC_IP:$DASHBOARD_PORT (all interfaces, bearer token required)"
+            echo ""
+            info "Connect it to the hosted dashboard:"
+            echo "  1. Copy your token:   sudo cat /etc/vaultguardian/dashboard.key"
+            echo "  2. Open https://vaultguardian.io/dashboard and click Add Instance"
+            echo "  3. API URL: http://$PUBLIC_IP:$DASHBOARD_PORT"
+            echo "  If a firewall or cloud security group is active, allow inbound TCP $DASHBOARD_PORT."
+        else
+            ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
+            info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
+            info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
+            info "To connect the hosted dashboard later: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at https://vaultguardian.io/dashboard"
+        fi
         case "$PROVIDER_CHOICE" in
             [cC]*) ok "LLM: cloud ($LLM_URL, model $LLM_MODEL)" ;;
             *)     ok "LLM: local ($LLM_URL, model $LLM_MODEL)" ;;
