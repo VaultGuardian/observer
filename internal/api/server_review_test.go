@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/store"
 )
 
@@ -158,5 +159,65 @@ func TestDecisionReviewWithoutLinkedFinding(t *testing.T) {
 
 	if w := postReview(t, srv, id, "ignored"); w.Code != http.StatusOK {
 		t.Fatalf("review returned %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestConfirmCorrectionResolvesFinding: "the AI got it right" is still a
+// triage decision - confirm must resolve the finding so it leaves the review
+// queue and stops being eligible for the reconciler timeout path. The verdict
+// is the one the human agreed with, so it must survive untouched.
+func TestConfirmCorrectionResolvesFinding(t *testing.T) {
+	ctx := context.Background()
+	_, st := newReviewTestServer(t)
+	const eventID = "evt_confirm1"
+
+	// handleConfirmCorrection touches s.patterns unconditionally, so this
+	// path needs a real pattern store rather than the store-only server.
+	patterns, err := patternstore.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new pattern store: %v", err)
+	}
+	srv := &Server{store: st, patterns: patterns}
+
+	recordPendingFinding(t, st, eventID)
+	id := recordDecision(t, st, eventID)
+
+	finding, err := st.GetFindingByEventID(ctx, eventID)
+	if err != nil {
+		t.Fatalf("get finding: %v", err)
+	}
+	decision, err := st.GetLLMDecision(ctx, id)
+	if err != nil {
+		t.Fatalf("get decision: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	srv.handleConfirmCorrection(w, ctx, finding, decision, "nginx:docker:test")
+	if w.Code != http.StatusOK {
+		t.Fatalf("confirm returned %d: %s", w.Code, w.Body.String())
+	}
+
+	f, err := st.GetFindingByEventID(ctx, eventID)
+	if err != nil {
+		t.Fatalf("re-get finding: %v", err)
+	}
+	if f.ResolutionStatus != "resolved" {
+		t.Fatalf("resolution_status = %q; want resolved", f.ResolutionStatus)
+	}
+	if f.Verdict != "malicious" {
+		t.Fatalf("verdict = %q; want malicious (confirm must not change verdicts)", f.Verdict)
+	}
+
+	d, err := st.GetLLMDecision(ctx, id)
+	if err != nil {
+		t.Fatalf("re-get decision: %v", err)
+	}
+	if d.ReviewStatus != "confirmed" {
+		t.Fatalf("review_status = %q; want confirmed", d.ReviewStatus)
+	}
+
+	// Terminal state: the reconciler timeout path must not clobber the row.
+	if err := st.UpdateFindingResolution(ctx, eventID, "evidence_unavailable", "timeout", ""); err == nil {
+		t.Fatalf("expected resolved finding to reject the timeout reconciler")
 	}
 }

@@ -1547,6 +1547,15 @@ func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Cont
 		}
 	}
 
+	// Resolve the finding (best-effort). Confirm is a triage decision and
+	// closes the loop on the finding the same way the other correction
+	// handlers and handleDecisionReview do. The verdict is left untouched:
+	// the human agreed with it. An already-resolved or missing finding is a
+	// silent no-op; the confirm itself succeeded.
+	if err := s.store.UpdateFindingResolution(ctx, finding.EventID, "resolved", "human_review", ""); err != nil {
+		log.Printf("[correction] Warning: finding resolution for %s skipped: %v", finding.EventID, err)
+	}
+
 	log.Printf("[correction:confirm] scope=%s hash=%.16s event=%s decision=%d",
 		sourceScope, finding.NormalizedHash, finding.EventID, func() int64 {
 			if decision != nil {
