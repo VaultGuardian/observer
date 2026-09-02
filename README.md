@@ -236,13 +236,25 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now observer
 ```
 
-The one-liner above is the convenience path. It does the same steps and checks the published SHA256 before installing:
+The one-liner above is the convenience path. It does the same steps and verifies the published SHA256 before installing:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
 ```
 
-The SHA256 check is a best-effort download-integrity check: the checksum is fetched from the same release as the binary, so it catches a truncated or corrupted download, not a tampered release. Anyone who can replace the binary can replace the checksum alongside it. Release signing, which would make this tamper-evident, is planned.
+The SHA256 check is fail-closed. A mismatch aborts the install, and so does a *missing* checksum: if no `observer.sha256` can be fetched for the release, the installer refuses to proceed rather than dropping an unverified binary into a root-run systemd service. Releases from v0.55.4+ publish `observer.sha256` alongside the binary. To install an older, pre-checksum release (or your own dev build), opt out explicitly:
+
+```bash
+# from a downloaded copy
+sudo OBSERVER_ALLOW_UNVERIFIED=1 bash install.sh
+
+# or with the one-liner
+curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo OBSERVER_ALLOW_UNVERIFIED=1 bash
+```
+
+`vaultguardian update` applies the same rule, with the same opt-out.
+
+The honest caveat: this is a download-integrity check, not a trust check. The checksum is fetched from the same release as the binary, so it catches a truncated or corrupted download, not a tampered release. Anyone who can replace the binary can replace the checksum alongside it. Release signing, which would make this tamper-evident, is planned.
 
 The `vaultguardian` CLI is optional and only installed by the script. Manual installs operate the service directly with `systemctl` and `journalctl`, for example `systemctl status observer` and `journalctl -u observer -f`.
 

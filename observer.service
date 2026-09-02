@@ -17,5 +17,57 @@ RestartSec=5
 # to local users on the box).
 EnvironmentFile=/etc/vaultguardian/observer.env
 
+# -------------------------------------------------------------------
+# Sandboxing
+# -------------------------------------------------------------------
+# Observer runs as root on purpose: REC enters other containers' network
+# namespaces with setns(2), which an unprivileged user cannot do. Root
+# stays. Everything below is about shrinking what that root process can
+# reach, not about dropping it, so do not add User= or DynamicUser=.
+#
+# ReadWritePaths, one entry at a time (ProtectSystem=strict makes the
+# rest of the filesystem read-only):
+#   /var/lib/observer     SQLite database and its WAL.
+#   /etc/vaultguardian    read-write, NOT read-only: the API server
+#                         generates dashboard.key here on first boot
+#                         (internal/api/server.go: loadOrGenerateToken),
+#                         so a read-only /etc breaks a fresh install.
+#   /var/run/docker.sock  needs write, not just read: every Docker API
+#                         call is a write to the socket.
+#   "-" prefix = ignore when absent, for Docker-less (journald-only) hosts.
+#
+# Capabilities kept, and why each is load-bearing:
+#   CAP_SYS_ADMIN        setns(2) into container network namespaces.
+#   CAP_NET_RAW          AF_PACKET sockets for the packet capture.
+#   CAP_NET_ADMIN        promiscuous mode on the captured interface.
+#   CAP_SYS_PTRACE       reading /proc/<pid>/ns/* of other processes.
+#   CAP_DAC_OVERRIDE     root-only config, the key file, Docker socket.
+#   CAP_DAC_READ_SEARCH  traversing /proc and container filesystems.
+#
+# Deliberately ABSENT, do not add:
+#   RestrictNamespaces   blocks the setns(2) call REC depends on, which
+#                        silently turns evidence capture into a blind
+#                        spot rather than a startup error.
+#   SystemCallFilter     a syscall allowlist for the capture path would
+#                        be guesswork until there is adversarial test
+#                        coverage proving which syscalls it needs.
+#                        Deferred on purpose, not forgotten.
+#   PrivateNetwork       Observer watches the host's network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/observer /etc/vaultguardian -/var/run/docker.sock
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+
 [Install]
 WantedBy=multi-user.target

@@ -359,8 +359,12 @@ else
     fail "Could not download Observer binary. Check network connectivity, or install + authenticate gh CLI for private/pre-release access."
 fi
 
-# Verify the binary against the published SHA256 when available. A mismatch
-# means the download was corrupted or tampered with - refuse to install.
+# Verify the binary against the published SHA256. Fail-closed on both
+# failure modes: a mismatch means the download was corrupted or tampered
+# with, and a MISSING checksum means there is nothing to verify against.
+# Neither one gets installed to /usr/local/bin and started as root on a
+# shrug. OBSERVER_ALLOW_UNVERIFIED=1 is the deliberate opt-out for
+# pre-checksum releases and local dev builds.
 if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
     EXPECTED=$(awk '{print $1}' observer.sha256)
     ACTUAL=$(sha256sum observer | awk '{print $1}')
@@ -374,9 +378,24 @@ if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
        The download may be corrupted or tampered with. Aborting."
     fi
     rm -f observer.sha256
+elif [ "${OBSERVER_ALLOW_UNVERIFIED:-}" = "1" ]; then
+    rm -f observer.sha256
+    warn "*** OBSERVER_ALLOW_UNVERIFIED=1 - installing an UNVERIFIED binary ***"
+    warn "No published checksum was found for this release and the override is set,"
+    warn "so this install proceeds without integrity verification. Only do this for"
+    warn "pre-checksum releases or your own dev builds, on a host you trust."
 else
-    warn "No published checksum found for this release - skipping verification."
-    warn "(Releases from v0.55.4+ publish observer.sha256 alongside the binary.)"
+    rm -f observer observer.sha256
+    fail "No published checksum found for this release - refusing to install.
+       Observer installs a root-run systemd service, so an unverified binary
+       is not installed silently.
+       Releases from v0.55.4+ publish observer.sha256 alongside the binary,
+       so this usually means an older release, an interrupted download, or a
+       network path that could not reach the checksum asset.
+       To install anyway (old releases, dev builds), re-run with:
+         sudo OBSERVER_ALLOW_UNVERIFIED=1 bash install.sh
+       Or for the curl one-liner:
+         curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo OBSERVER_ALLOW_UNVERIFIED=1 bash"
 fi
 
 mv observer "$BIN"
@@ -414,6 +433,58 @@ RestartSec=5
 # (systemd unit files are typically world-readable, which would expose API keys
 # to local users on the box).
 EnvironmentFile=$CONFIG_DIR/observer.env
+
+# -------------------------------------------------------------------
+# Sandboxing
+# -------------------------------------------------------------------
+# Observer runs as root on purpose: REC enters other containers' network
+# namespaces with setns(2), which an unprivileged user cannot do. Root
+# stays. Everything below is about shrinking what that root process can
+# reach, not about dropping it, so do not add User= or DynamicUser=.
+#
+# ReadWritePaths, one entry at a time (ProtectSystem=strict makes the
+# rest of the filesystem read-only):
+#   /var/lib/observer     SQLite database and its WAL.
+#   /etc/vaultguardian    read-write, NOT read-only: the API server
+#                         generates dashboard.key here on first boot
+#                         (internal/api/server.go: loadOrGenerateToken),
+#                         so a read-only /etc breaks a fresh install.
+#   /var/run/docker.sock  needs write, not just read: every Docker API
+#                         call is a write to the socket.
+#   "-" prefix = ignore when absent, for Docker-less (journald-only) hosts.
+#
+# Capabilities kept, and why each is load-bearing:
+#   CAP_SYS_ADMIN        setns(2) into container network namespaces.
+#   CAP_NET_RAW          AF_PACKET sockets for the packet capture.
+#   CAP_NET_ADMIN        promiscuous mode on the captured interface.
+#   CAP_SYS_PTRACE       reading /proc/<pid>/ns/* of other processes.
+#   CAP_DAC_OVERRIDE     root-only config, the key file, Docker socket.
+#   CAP_DAC_READ_SEARCH  traversing /proc and container filesystems.
+#
+# Deliberately ABSENT, do not add:
+#   RestrictNamespaces   blocks the setns(2) call REC depends on, which
+#                        silently turns evidence capture into a blind
+#                        spot rather than a startup error.
+#   SystemCallFilter     a syscall allowlist for the capture path would
+#                        be guesswork until there is adversarial test
+#                        coverage proving which syscalls it needs.
+#                        Deferred on purpose, not forgotten.
+#   PrivateNetwork       Observer watches the host's network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=$DATA_DIR $CONFIG_DIR -/var/run/docker.sock
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 EOF
 
 # Add Install section
@@ -525,7 +596,10 @@ SERVICE="observer"
 # download_binary <version> - fetches observer to ./observer
 # version: "latest" or a tag like "v0.53.0"
 # Also fetches the published observer.sha256 from the same release location
-# (best-effort - older releases may lack it) and sets GOT_SHA=true on success.
+# and sets GOT_SHA=true on success. Both branches below (latest and pinned)
+# fetch the checksum from their own release URL, and both hand the result to
+# the same fail-closed verify_binary gate: a release with no observer.sha256
+# leaves GOT_SHA=false and the update is refused.
 download_binary() {
     local version="$1"
     local url sha_url
@@ -561,12 +635,16 @@ download_binary() {
     return 1
 }
 
-# verify_binary - checks ./observer against ./observer.sha256 when GOT_SHA=true.
-# Same logic as the installer: a mismatch means the download was corrupted or
-# tampered with, so refuse to deploy; a missing published checksum warns and
-# proceeds.
+# verify_binary <version> - checks ./observer against ./observer.sha256.
+# Fail-closed, identical to the installer and identical for both the latest
+# and pinned download branches, since both route through here:
+#   checksum matches  -> proceed
+#   checksum mismatch -> refuse (corrupted or tampered download)
+#   no checksum       -> refuse (nothing to verify an update against)
+# OBSERVER_ALLOW_UNVERIFIED=1 in the environment is the deliberate opt-out
+# for pre-checksum releases and local dev builds.
 verify_binary() {
-    local expected actual
+    local version="$1" expected actual
     if [ "$GOT_SHA" = true ] && [ -s observer.sha256 ]; then
         expected=$(awk '{print $1}' observer.sha256)
         actual=$(sha256sum observer | awk '{print $1}')
@@ -581,11 +659,27 @@ verify_binary() {
             return 1
         fi
         rm -f observer.sha256
-    else
-        echo "[vaultguardian] No published checksum found for this release - skipping verification."
-        echo "[vaultguardian] (Releases from v0.55.4+ publish observer.sha256 alongside the binary.)"
+        return 0
     fi
-    return 0
+
+    rm -f observer.sha256
+    if [ "${OBSERVER_ALLOW_UNVERIFIED:-}" = "1" ]; then
+        echo "[vaultguardian] *** OBSERVER_ALLOW_UNVERIFIED=1 - deploying an UNVERIFIED binary ***"
+        echo "[vaultguardian] No published checksum was found for ${version} and the override"
+        echo "[vaultguardian] is set, so this update proceeds without integrity verification."
+        return 0
+    fi
+
+    rm -f observer
+    echo "[vaultguardian] No published checksum found for ${version} - refusing to update."
+    echo "[vaultguardian] Observer runs as a root systemd service, so an unverified binary"
+    echo "[vaultguardian] is not deployed silently."
+    echo "[vaultguardian] Releases from v0.55.4+ publish observer.sha256 alongside the binary,"
+    echo "[vaultguardian] so this usually means an older release, an interrupted download, or"
+    echo "[vaultguardian] a network path that could not reach the checksum asset."
+    echo "[vaultguardian] To update anyway (old releases, dev builds), re-run with:"
+    echo "[vaultguardian]   OBSERVER_ALLOW_UNVERIFIED=1 vaultguardian update ${version}"
+    return 1
 }
 
 case "$1" in
@@ -597,7 +691,7 @@ case "$1" in
     if ! download_binary "$VERSION"; then
         exit 1
     fi
-    if ! verify_binary; then
+    if ! verify_binary "$VERSION"; then
         exit 1
     fi
 
