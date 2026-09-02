@@ -223,18 +223,7 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 	//   - The noOp collector returns Evidence with nil Disclosure, so the
 	//     predicate is false and disabled deployments are unaffected.
 	if result.Source != "llm" && isHTTP && statusCodeRejectsAttack(statusCode) {
-		ev := r.collector.Lookup(rec.LookupRequest{
-			EventID:         evt.ID,
-			Method:          method,
-			Path:            rawPath, // raw wire path - REC captures literal paths
-			Host:            host,
-			SourceContainer: evt.SourceName,
-			StatusCode:      statusCode,
-			Timestamp:       evt.Timestamp,
-			Window:          10 * time.Second, // mirrors the evidence callback's lookup window
-			ExpectedBytes:   respBytes,        // orphan-response disambiguation gate
-		})
-		if disclosing, why := deterministicDisclosure(ev); disclosing {
+		if disclosing, why := recDeterministicDisclosureForEvent(r.collector, evt, method, rawPath, host, statusCode, respBytes); disclosing {
 			log.Printf("[RECON:STATUS] Shortcut overridden: EventID=%s Source=%s Status=%d - %s - routing to coordinator",
 				evt.ID, evt.ScopeKey(), statusCode, why)
 			// Fall through to the coordinator/evidence routing below. The

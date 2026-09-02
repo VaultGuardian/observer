@@ -77,6 +77,15 @@ type Analyzer struct {
 	// Optional - nil means no pre-pinning (REC disabled or not wired).
 	prePinEvidence func(evt *event.Event)
 
+	// recDisclosureCheck asks REC whether it already captured a response body
+	// with a deterministically disclosing format (passwd/dotenv/PEM) for this
+	// event. Used by the step 1.6 failed-probe suppression: access logs never
+	// carry response bodies, so a 4xx log line alone cannot prove nothing was
+	// disclosed. Mirrors the status-shortcut guard in resultrouter.go.
+	// Optional - nil means no REC guard (REC disabled or not wired), and
+	// step 1.6 suppresses on status exactly as it did before the guard.
+	recDisclosureCheck func(evt *event.Event) (bool, string)
+
 	// classifyGroup coalesces concurrent Tier-1 classifications for the same
 	// scope + normalized-line + disclosure-bit into a single in-flight LLM
 	// call. A burst of identical events that all miss the pattern cache before
@@ -112,6 +121,14 @@ type classifyFlightResult struct {
 // parses HTTP identity from the event and calls collector.PrePin().
 func (a *Analyzer) SetPrePinFunc(fn func(evt *event.Event)) {
 	a.prePinEvidence = fn
+}
+
+// SetRECDisclosureCheck registers the REC deterministic-disclosure callback
+// used by the step 1.6 failed-probe guard. Called from main.go after the
+// collector is created. The callback parses HTTP identity from the event and
+// does a one-shot REC lookup. Leaving it nil disables the guard.
+func (a *Analyzer) SetRECDisclosureCheck(fn func(evt *event.Event) (bool, string)) {
+	a.recDisclosureCheck = fn
 }
 
 // Stats tracks pipeline performance metrics.
@@ -251,15 +268,40 @@ func (a *Analyzer) Analyze(ctx context.Context, evt *event.Event) AnalysisResult
 	// failed probe regardless of what was probed; see isFailedProbe). Only
 	// high-risk disclosures bypass it, via the guard above - those are
 	// actual data leakage in the line, not scanner intent.
+	//
+	// DISCLOSURE OVERRIDE (mirrors the Jul 2026 P0 fix on the status shortcut
+	// in resultrouter.go): the status match above trusts a log line, and
+	// access logs never contain response bodies. Before suppressing, ask REC
+	// whether it already captured a deterministically disclosing body
+	// (passwd/dotenv/PEM) for this request. If so, skip the suppression return
+	// and fall through to normal analysis (pattern store, then T1, then
+	// routing) - the verdict is not decided here.
+	// Caveats, deliberate:
+	//   - Best-effort one-shot lookup: REC reassembly can lag ~2s behind the
+	//     log line, so a body landing moments later is missed. A miss means
+	//     suppression proceeds - exactly today's behavior, never a hold.
+	//   - The noOp collector returns Evidence with nil Disclosure, so the
+	//     predicate is false and disabled deployments are unaffected. A nil
+	//     callback (REC off or not wired) behaves identically.
 	if !hasDisclosure {
 		if reason, ok := isFailedProbe(evt.NormalizedLine); ok {
-			a.stats.NoiseSuppressed.Add(1)
-			ss.deterministicResolved.Add(1)
-			return AnalysisResult{
-				Event:   evt,
-				Verdict: patternstore.VerdictSuppress,
-				Reason:  reason,
-				Source:  "noise_filter",
+			overridden := false
+			if a.recDisclosureCheck != nil {
+				if disclosing, why := a.recDisclosureCheck(evt); disclosing {
+					log.Printf("[NOISE:STATUS] Suppression overridden: EventID=%s Source=%s - %s - continuing to full analysis",
+						evt.ID, evt.ScopeKey(), why)
+					overridden = true
+				}
+			}
+			if !overridden {
+				a.stats.NoiseSuppressed.Add(1)
+				ss.deterministicResolved.Add(1)
+				return AnalysisResult{
+					Event:   evt,
+					Verdict: patternstore.VerdictSuppress,
+					Reason:  reason,
+					Source:  "noise_filter",
+				}
 			}
 		}
 	}
@@ -1415,6 +1457,6 @@ func isFailedProbe(normalizedLine string) (string, bool) {
 		return "", false
 	}
 
-	reason := fmt.Sprintf("Deterministic: HTTP %s - failed probe, no exfiltration possible", statusCode)
+	reason := fmt.Sprintf("Deterministic: HTTP %s - no HTTP-visible impact observed", statusCode)
 	return reason, true
 }

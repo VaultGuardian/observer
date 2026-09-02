@@ -202,6 +202,41 @@ func main() {
 		})
 	})
 
+	// Wire the REC deterministic-disclosure guard into the analyzer's step 1.6
+	// failed-probe suppression. Access logs never carry response bodies, so a
+	// 4xx status alone cannot prove nothing was disclosed - this asks REC
+	// whether it already captured a passwd/dotenv/PEM body for the request.
+	// Parses HTTP identity exactly like the pre-pin callback above.
+	//
+	// Wired unconditionally: the noOp collector returns Evidence with a nil
+	// Disclosure, so the predicate is false and disabled deployments keep
+	// today's suppression behavior.
+	a.SetRECDisclosureCheck(func(evt *event.Event) (bool, string) {
+		nMethod, nPath, nHost, nStatus := parseNormalizedLine(evt.NormalizedLine)
+		rMethod, rPath, _, rStatus := parseRawHTTPLine(evt.Line)
+
+		method := rMethod
+		if method == "" {
+			method = nMethod
+		}
+
+		rawPath := rPath
+		if rawPath == "" {
+			rawPath = nPath
+		}
+
+		statusCode := rStatus
+		if statusCode == 0 {
+			statusCode = nStatus
+		}
+
+		if method == "" || rawPath == "" {
+			return false, "" // non-HTTP event, no REC evidence to look up
+		}
+
+		return recDeterministicDisclosureForEvent(collector, evt, method, rawPath, nHost, statusCode, extractResponseBytes(evt.Line))
+	})
+
 	// ------- Context with graceful shutdown -------
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

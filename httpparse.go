@@ -6,7 +6,9 @@ import (
 	"net"
 	"regexp"
 	"strconv"
+	"time"
 
+	"github.com/vaultguardian/observer/internal/event"
 	"github.com/vaultguardian/observer/internal/rec"
 )
 
@@ -268,6 +270,36 @@ func deterministicDisclosure(ev *rec.Evidence) (bool, string) {
 			ev.Disclosure.DisclosureSummary, ev.Disclosure.SensitiveRedactions)
 	}
 	return false, ""
+}
+
+// recDeterministicDisclosureForEvent performs the one-shot REC lookup behind
+// the disclosure gate (P0 fix, Jul 2026) and reports whether the captured
+// response body deterministically discloses sensitive data.
+//
+// Shared by BOTH suppression paths that would otherwise trust a log-line
+// status: the cache-hit status shortcut in resultrouter.go (routeAlert) and
+// the analyzer's step 1.6 failed-probe suppression (wired from main.go). One
+// helper so the two gates build the same LookupRequest and cannot drift.
+//
+// Caveats, deliberate (identical on both call sites):
+//   - Best-effort: REC reassembly can lag ~2s behind the log line, so this
+//     one-shot lookup can miss a body that lands moments later. A miss means
+//     suppression proceeds - exactly today's behavior, never a hold.
+//   - The noOp collector returns Evidence with nil Disclosure, so the
+//     predicate is false and disabled deployments are unaffected.
+func recDeterministicDisclosureForEvent(collector rec.EvidenceCollector, evt *event.Event, method, rawPath, host string, statusCode int, respBytes int64) (bool, string) {
+	ev := collector.Lookup(rec.LookupRequest{
+		EventID:         evt.ID,
+		Method:          method,
+		Path:            rawPath, // raw wire path - REC captures literal paths
+		Host:            host,
+		SourceContainer: evt.SourceName,
+		StatusCode:      statusCode,
+		Timestamp:       evt.Timestamp,
+		Window:          10 * time.Second, // mirrors the evidence callback's lookup window
+		ExpectedBytes:   respBytes,        // orphan-response disambiguation gate
+	})
+	return deterministicDisclosure(ev)
 }
 
 // isBareIP returns true if the host string is an IP address rather than a
