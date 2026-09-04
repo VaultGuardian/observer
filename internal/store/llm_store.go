@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 )
 
@@ -352,7 +353,16 @@ func (s *Store) GetLLMDecision(ctx context.Context, id int64) (*LLMDecision, err
 // UpdateLLMDecisionReview updates the human review fields on a decision.
 // The LLM response fields remain immutable.
 func (s *Store) UpdateLLMDecisionReview(ctx context.Context, id int64, review LLMReview) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE llm_decisions SET
+	// Phase 2 sync: the UPDATE and its dirty-journal row commit together, so
+	// a crash between them cannot leave the hosted mirror showing an
+	// unreviewed decision forever.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("update review: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE llm_decisions SET
 		review_status = ?,
 		reviewed_by = ?,
 		reviewed_at = ?,
@@ -375,7 +385,16 @@ func (s *Store) UpdateLLMDecisionReview(ctx context.Context, id int64, review LL
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
+		// No row changed: nothing to mirror, existing error contract kept.
 		return fmt.Errorf("llm_decision %d not found", id)
+	}
+	if s.SyncJournalEnabled() {
+		if err := journalSyncDirtyTx(ctx, tx, SyncKindDecision, strconv.FormatInt(id, 10)); err != nil {
+			return fmt.Errorf("update review: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update review: commit: %w", err)
 	}
 	return nil
 }

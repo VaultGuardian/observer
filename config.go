@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -118,6 +121,21 @@ type Config struct {
 	DashboardKeyFile        string
 	DashboardBindAddr       string
 	DashboardAllowedOrigins []string
+
+	// Hosted sync (Phase 2).
+	//
+	// Ships dark: with SYNC_URL/SYNC_TOKEN unset, SyncEnabled is false and no
+	// sync code runs at all - no goroutines, no journal writes, no schema use
+	// beyond the (inert) v15 tables. Self-hosters never set these.
+	//
+	// SyncEnabled is the single authority: it is true only when BOTH SYNC_URL
+	// and SYNC_TOKEN are set AND the URL passed the transport check below.
+	SyncURL               string
+	SyncToken             string
+	SyncEnabled           bool
+	SyncInterval          time.Duration
+	SyncSnapshotInterval  time.Duration
+	SyncHeartbeatInterval time.Duration
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -154,6 +172,13 @@ func LoadConfig() Config {
 		DashboardPort:           9090,
 		DashboardKeyFile:        getEnv("DASHBOARD_KEY_FILE", "/etc/vaultguardian/dashboard.key"),
 		DashboardBindAddr:       getEnv("DASHBOARD_BIND_ADDR", "127.0.0.1"),
+
+		// Hosted sync cadences. Lane A (findings/decisions), lane B
+		// snapshot, lane B heartbeat - three independent clocks so a slow
+		// snapshot can never delay liveness.
+		SyncInterval:          getEnvDuration("SYNC_INTERVAL", 15*time.Second),
+		SyncSnapshotInterval:  getEnvDuration("SYNC_SNAPSHOT_INTERVAL", 5*time.Minute),
+		SyncHeartbeatInterval: getEnvDuration("SYNC_HEARTBEAT_INTERVAL", 60*time.Second),
 
 		// REC reassembly tuning - response-only, bounds are tunable.
 		RECReassemblyMaxBody:   getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
@@ -310,6 +335,27 @@ func LoadConfig() Config {
 		}
 	}
 
+	// ------- Hosted sync enablement -------
+	//
+	// Sync is opt-in and fails CLOSED: any misconfiguration disables it
+	// loudly rather than shipping security telemetry somewhere unintended.
+	cfg.SyncURL = strings.TrimRight(strings.TrimSpace(getEnv("SYNC_URL", "")), "/")
+	cfg.SyncToken = strings.TrimSpace(getEnv("SYNC_TOKEN", ""))
+	switch {
+	case cfg.SyncURL == "" && cfg.SyncToken == "":
+		// Not configured - the overwhelmingly common self-hosted case.
+		// Deliberately silent.
+	case cfg.SyncURL == "" || cfg.SyncToken == "":
+		log.Printf("[sync] SYNC_URL and SYNC_TOKEN must both be set - sync disabled " +
+			"(one of them is missing)")
+	default:
+		if err := validateSyncURL(cfg.SyncURL); err != nil {
+			log.Printf("[sync] SYNC_URL rejected: %v - sync disabled", err)
+		} else {
+			cfg.SyncEnabled = true
+		}
+	}
+
 	// Journald watcher
 	cfg.JournaldEnabled = getEnv("JOURNALD_ENABLED", "") == "true"
 	cfg.ExcludeUnits = make(map[string]bool)
@@ -365,4 +411,40 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// validateSyncURL enforces [A11]: the ingest endpoint carries a bearer token
+// and the full security telemetry of a host, so it must be HTTPS. Plain HTTP
+// is allowed only against a loopback host, which is how the test suite and
+// local development point Observer at a fake ingest server.
+func validateSyncURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("not a valid URL (%q): %w", raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("missing host in %q", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("plain http is only allowed for loopback hosts, got %q", u.Host)
+	default:
+		return fmt.Errorf("scheme must be https, got %q", u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether a URL hostname refers to this machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }

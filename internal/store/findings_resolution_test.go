@@ -306,9 +306,14 @@ func TestMigration14RepairsMislabeledFindings(t *testing.T) {
 	// (c) human decision -> untouched.
 	insertFinalized(t, s, "evt_keep_human", "resolved", "human_override", "available_high_confidence")
 
-	// Re-run the migration by removing its schema_version row and calling
-	// migrate() again; this exercises the real migration SQL.
-	if _, err := s.DB().Exec(`DELETE FROM schema_version WHERE version = 14`); err != nil {
+	// Re-run the migration by rewinding schema_version and calling migrate()
+	// again; this exercises the real migration SQL.
+	//
+	// The rewind must clear every version at or above 14, not just 14: the
+	// runner skips anything <= MAX(version), so leaving a later migration's
+	// row in place would silently skip the one under test. Migrations above
+	// 14 are idempotent (CREATE ... IF NOT EXISTS) and simply re-apply.
+	if _, err := s.DB().Exec(`DELETE FROM schema_version WHERE version >= 14`); err != nil {
 		t.Fatalf("reset schema_version: %v", err)
 	}
 	if err := s.migrate(); err != nil {

@@ -91,3 +91,76 @@ func TestRECPortsDedupeAndSort(t *testing.T) {
 		})
 	}
 }
+
+// [A11] SYNC_URL must be HTTPS. The ingest endpoint carries a bearer token and
+// this host's entire security telemetry, so plain HTTP is refused - except
+// against loopback, which is how tests and local development point Observer at
+// a fake ingest server. A rejected URL disables sync; it never downgrades to
+// sending anyway.
+func TestSyncURLTransportEnforcement(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		token   string
+		enabled bool
+	}{
+		{"https_allowed", "https://vaultguardian.io", "tok", true},
+		{"https_with_path", "https://vaultguardian.io/observer", "tok", true},
+		{"plain_http_rejected", "http://example.com", "tok", false},
+		{"plain_http_ip_rejected", "http://198.51.100.10", "tok", false},
+		{"loopback_ip_allowed", "http://127.0.0.1:9999", "tok", true},
+		{"loopback_name_allowed", "http://localhost:3000", "tok", true},
+		{"loopback_v6_allowed", "http://[::1]:3000", "tok", true},
+		{"other_scheme_rejected", "ftp://example.com", "tok", false},
+		{"garbage_rejected", "not a url", "tok", false},
+		{"url_without_token_disabled", "https://vaultguardian.io", "", false},
+		{"token_without_url_disabled", "", "tok", false},
+		{"neither_disabled", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SYNC_URL", tc.url)
+			t.Setenv("SYNC_TOKEN", tc.token)
+
+			cfg := LoadConfig()
+			if cfg.SyncEnabled != tc.enabled {
+				t.Errorf("SYNC_URL=%q SYNC_TOKEN=%q → SyncEnabled=%t; want %t",
+					tc.url, tc.token, cfg.SyncEnabled, tc.enabled)
+			}
+		})
+	}
+}
+
+// A trailing slash on SYNC_URL must not produce "//api/ingest/..." paths.
+func TestSyncURLTrailingSlashTrimmed(t *testing.T) {
+	t.Setenv("SYNC_URL", "https://vaultguardian.io/")
+	t.Setenv("SYNC_TOKEN", "tok")
+
+	cfg := LoadConfig()
+	if cfg.SyncURL != "https://vaultguardian.io" {
+		t.Errorf("SyncURL = %q; want the trailing slash trimmed", cfg.SyncURL)
+	}
+}
+
+// Sync cadences have defaults and honor overrides.
+func TestSyncIntervalDefaults(t *testing.T) {
+	t.Setenv("SYNC_INTERVAL", "")
+	t.Setenv("SYNC_SNAPSHOT_INTERVAL", "")
+	t.Setenv("SYNC_HEARTBEAT_INTERVAL", "")
+
+	cfg := LoadConfig()
+	if cfg.SyncInterval != 15*time.Second {
+		t.Errorf("SyncInterval = %s; want 15s", cfg.SyncInterval)
+	}
+	if cfg.SyncSnapshotInterval != 5*time.Minute {
+		t.Errorf("SyncSnapshotInterval = %s; want 5m", cfg.SyncSnapshotInterval)
+	}
+	if cfg.SyncHeartbeatInterval != 60*time.Second {
+		t.Errorf("SyncHeartbeatInterval = %s; want 60s", cfg.SyncHeartbeatInterval)
+	}
+
+	t.Setenv("SYNC_INTERVAL", "45s")
+	if got := LoadConfig().SyncInterval; got != 45*time.Second {
+		t.Errorf("SYNC_INTERVAL=45s → %s; want 45s", got)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/vaultguardian/observer/internal/policy"
 	"github.com/vaultguardian/observer/internal/rec"
 	"github.com/vaultguardian/observer/internal/store"
+	syncengine "github.com/vaultguardian/observer/internal/sync"
 	"github.com/vaultguardian/observer/internal/watcher"
 )
 
@@ -255,7 +257,15 @@ func main() {
 	}
 
 	// ------- Fix 3: Start async findings writer -------
-	db.StartAsyncWriter(ctx, 5000)
+	//
+	// [A7] Deliberately NOT tied to the root context. On SIGTERM the root
+	// cancel fires while pipeline workers are still draining; Run's ctx.Done
+	// arm would then exit the writer immediately, leaving later
+	// SubmitFinding calls with no consumer and making Store.Close's Stop() a
+	// no-op (done is already closed) - findings written during shutdown were
+	// silently lost. The writer now exits only via Stop(), which the ordered
+	// shutdown below calls after every producer has quiesced.
+	db.StartAsyncWriter(context.Background(), 5000)
 
 	// ------- Start Dashboard API -------
 	apiServer, err := api.NewServer(
@@ -276,6 +286,43 @@ func main() {
 				log.Printf("[observer] Dashboard API error: %v", err)
 			}
 		}()
+	}
+
+	// ------- Hosted sync engine (Phase 2) -------
+	//
+	// Ships dark. With SYNC_URL/SYNC_TOKEN unset nothing below runs: no sync
+	// goroutines, no journal writes, no behavior change anywhere in the
+	// verdict path. Started after the API server because lane B reads the
+	// local dashboard API (it tolerates the API not being up yet).
+	var syncEngine *syncengine.Engine
+	if cfg.SyncEnabled {
+		engine, serr := syncengine.New(ctx, db, syncengine.Config{
+			BaseURL:           cfg.SyncURL,
+			Token:             cfg.SyncToken,
+			Interval:          cfg.SyncInterval,
+			SnapshotInterval:  cfg.SyncSnapshotInterval,
+			HeartbeatInterval: cfg.SyncHeartbeatInterval,
+			LocalBaseURL:      syncengine.LocalBaseURL(cfg.DashboardBindAddr, cfg.DashboardPort),
+			LocalKeyFile:      cfg.DashboardKeyFile,
+		})
+		if serr != nil {
+			// Fail closed. The journal stays off and no sync goroutine runs,
+			// so an unsafe pairing degrades to "no mirror", never to a
+			// corrupted one.
+			log.Printf("[sync] disabled: %v", serr)
+		} else {
+			// Order matters: journaling must be on before the engine can be
+			// expected to observe mutations, and only after New confirmed
+			// this database is safe to mirror.
+			db.EnableSyncJournal()
+			// Not the root context: the ordered shutdown stops the engine
+			// explicitly (step 4) so it winds down after the pipeline has
+			// quiesced rather than racing it on the signal.
+			engine.Start(context.Background())
+			syncEngine = engine
+		}
+	} else if nerr := syncengine.NoteDisabled(ctx, db); nerr != nil {
+		log.Printf("[sync] could not record unpaired boot: %v", nerr)
 	}
 
 	// ------- LLM health check -------
@@ -414,8 +461,14 @@ func main() {
 	if numWorkers < 4 {
 		numWorkers = 4
 	}
+	// [A7] Both worker pools are tracked so shutdown can prove no goroutine
+	// that could still call SubmitFinding is alive before the findings writer
+	// is drained.
+	var pipelineWG sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
+		pipelineWG.Add(1)
 		go func() {
+			defer pipelineWG.Done()
 			for line := range pipeline {
 				pipelineHandler(line)
 			}
@@ -423,8 +476,11 @@ func main() {
 	}
 
 	numRetryWorkers := 2
+	var retryWG sync.WaitGroup
 	for i := 0; i < numRetryWorkers; i++ {
+		retryWG.Add(1)
 		go func() {
+			defer retryWG.Done()
 			for item := range retryQueue {
 				// Retry-channel residence only; the blocking LLM-slot wait
 				// inside AnalyzeRetry is not part of this measurement.
@@ -466,8 +522,24 @@ func main() {
 	// ------- Fix 4: Evidence reconciler goroutine -------
 	go runReconciler(ctx, db)
 
-	// Ingestion handler
+	// Ingestion handler.
+	//
+	// [A7] ingestGate makes closing the pipeline channel safe. The Docker
+	// watcher fans out an untracked goroutine per container, so "Run returned"
+	// does not mean every producer is gone - closing the channel on that
+	// signal alone would risk a send-on-closed-channel panic. The read lock is
+	// uncontended in the hot path (the write lock is taken exactly once, at
+	// shutdown); after ingestOpen goes false no send can be in flight or
+	// start, so the close is safe. Log lines still arriving from a watcher
+	// that has not finished unwinding are dropped by design.
+	var ingestGate sync.RWMutex
+	ingestOpen := true
 	ingestionHandler := func(line watcher.LogLine) {
+		ingestGate.RLock()
+		defer ingestGate.RUnlock()
+		if !ingestOpen {
+			return
+		}
 		select {
 		case pipeline <- line:
 			healthStats.ObservePipelineDepth(len(pipeline))
@@ -508,8 +580,15 @@ func main() {
 
 	// ------- Ordered Shutdown -------
 	// v0.52: Proper shutdown ordering prevents data loss and races.
-	// Sequence: stop API (drain in-flight requests) → persist patterns
-	// → close DB (stops async writer, then closes SQLite).
+	//
+	// [A7] The sequence below fixes a pre-existing drop: the root cancel used
+	// to race pipeline workers against the findings writer, so findings
+	// submitted while the pipeline was still draining had no consumer left.
+	// Producers are now quiesced BEFORE the writer is drained:
+	//
+	//   stop API → stop ingestion + drain pipeline/retry workers →
+	//   stop notifier → stop sync engine → persist patterns →
+	//   close DB (drains the findings writer, then closes SQLite)
 	log.Println("[observer] Shutting down...")
 
 	// 1. Stop API server - no new requests accepted, in-flight get 5s to finish.
@@ -521,19 +600,49 @@ func main() {
 		shutdownCancel()
 	}
 
-	// 2. Stop notifier dispatcher - drain queued alerts up to 3s, then drop.
+	// 2. Stop ingestion, then drain the pipeline.
+	//
+	// The gate closes first so no watcher goroutine can be inside a send when
+	// the channel closes; after that, closing the channel lets the workers
+	// finish what is already buffered and exit. Retry workers are producers
+	// too (the pipeline handler feeds them), so they are closed and drained
+	// only once every pipeline worker is gone.
+	ingestGate.Lock()
+	ingestOpen = false
+	close(pipeline)
+	ingestGate.Unlock()
+
+	if waitTimeout(&pipelineWG, 15*time.Second) {
+		close(retryQueue)
+		if !waitTimeout(&retryWG, 15*time.Second) {
+			log.Println("[observer] Retry workers did not finish in time - proceeding")
+		}
+	} else {
+		// A worker is wedged. Leaving retryQueue open is the safe choice:
+		// closing it under a live producer would panic.
+		log.Println("[observer] Pipeline workers did not finish in time - skipping retry queue close")
+	}
+
+	// 3. Stop notifier dispatcher - drain queued alerts up to 3s, then drop.
 	if dispatch != nil {
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		dispatch.Stop(drainCtx)
 		drainCancel()
 	}
 
-	// 3. Persist pattern store to disk.
+	// 4. Stop the sync engine. Nothing needs flushing - cursors and journal
+	// rows only move on a validated ack, so an interrupted cycle replays on
+	// the next boot. In-flight POSTs are bounded by the client timeout.
+	if syncEngine != nil {
+		syncEngine.Stop()
+	}
+
+	// 5. Persist pattern store to disk.
 	if err := a.Persist(); err != nil {
 		log.Printf("[observer] Failed final persist: %v", err)
 	}
 
-	// 4. Close DB - stops async findings writer (drains queue), then closes SQLite.
+	// 6. Close DB - stops async findings writer (drains queue), then closes SQLite.
 	if err := db.Close(); err != nil {
 		log.Printf("[observer] DB close error: %v", err)
 	}
@@ -542,6 +651,22 @@ func main() {
 	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d learned=%d",
 		aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.PatternsLearned)
 	log.Println("[observer] Shutdown complete")
+}
+
+// waitTimeout waits for wg, returning false if d elapses first. Shutdown must
+// stay bounded: a wedged worker should cost a log line, not a hung service.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // =============================================================================

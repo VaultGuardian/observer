@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -26,6 +27,12 @@ type Store struct {
 	db          *sql.DB
 	path        string
 	asyncWriter *FindingsWriter // Fix 3: async writer for high-volume findings
+
+	// syncJournal gates dirty-journal writes inside the three mutation
+	// methods (Phase 2 hosted sync). Off until main.go calls
+	// EnableSyncJournal, which happens only when sync is configured and the
+	// rollback fail-closed check passed. See sync_store.go.
+	syncJournal atomic.Bool
 }
 
 // Init opens (or creates) the SQLite database at dataDir/observer.db,
@@ -86,6 +93,14 @@ func (s *Store) Close() error {
 
 // DB returns the underlying *sql.DB for advanced queries.
 // Use sparingly - prefer the typed methods.
+//
+// FORBIDDEN: raw INSERT/UPDATE/DELETE against findings or llm_decisions
+// through this handle. Such writes bypass the sync dirty journal
+// (sync_store.go), so a hosted mirror would never learn about them and would
+// keep serving the pre-mutation row forever. Route every mutation through
+// UpdateFindingResolution, UpdateFindingVerdict, or UpdateLLMDecisionReview -
+// those commit the UPDATE and its journal row in one transaction. Reads and
+// queries against other tables are fine.
 func (s *Store) DB() *sql.DB {
 	return s.db
 }
@@ -481,6 +496,33 @@ func (s *Store) migrate() error {
 				WHERE resolution_status = 'evidence_unavailable'
 				  AND resolution_method = 'timeout'
 				  AND evidence_status IN ('available_high_confidence', 'available_low_confidence');`,
+		},
+		{
+			// Phase 2: hosted sync state.
+			//
+			// sync_state holds scalars - one cursor per stream plus the
+			// pairing metadata (target fingerprint, journal continuity flag).
+			// sync_dirty is the mutation journal: the cursor lane can only
+			// see new rowids, so an in-place UPDATE to an already-mirrored
+			// row records its key here for the dirty lane to re-send.
+			//
+			// Both tables are inert on an unpaired Observer - nothing writes
+			// to them until main.go calls EnableSyncJournal.
+			version: 15,
+			desc:    "Phase 2 sync: sync_state + sync_dirty",
+			sql: `CREATE TABLE IF NOT EXISTS sync_state (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS sync_dirty (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				kind TEXT NOT NULL,
+				ref TEXT NOT NULL,
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_sync_dirty_kind ON sync_dirty(kind, id);`,
 		},
 	}
 

@@ -88,9 +88,21 @@ func (s *Store) RecordFinding(ctx context.Context, f *Finding) error {
 func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, status string, method string, newVerdict string) error {
 	now := time.Now().Format(time.RFC3339)
 
+	// Phase 2 sync: the current-verdict lookup, the UPDATE, and the dirty
+	// journal insert all commit together. Splitting them would let a crash
+	// between UPDATE and journal leave the hosted mirror permanently stale,
+	// and would let a concurrent writer change the verdict between the
+	// lookup and the UPDATE (previous_verdict would then record a value
+	// that was never the row's verdict at update time).
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("update resolution for %s: begin: %w", eventID, err)
+	}
+	defer tx.Rollback()
+
 	// Get the current verdict before updating (for audit trail)
 	var currentVerdict string
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		"SELECT verdict FROM findings WHERE event_id = ? ORDER BY id DESC LIMIT 1",
 		eventID,
 	).Scan(&currentVerdict)
@@ -105,7 +117,7 @@ func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, sta
 		eligibility = "(resolution_status = '' OR resolution_status = 'pending' OR resolution_status IS NULL OR resolution_status = 'evidence_unavailable')"
 	}
 
-	result, err := s.db.ExecContext(ctx, `UPDATE findings SET
+	result, err := tx.ExecContext(ctx, `UPDATE findings SET
 		resolution_status = ?,
 		resolved_at = ?,
 		resolution_method = ?,
@@ -125,7 +137,17 @@ func (s *Store) UpdateFindingResolution(ctx context.Context, eventID string, sta
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
+		// No row changed: nothing to mirror, and the caller's existing
+		// error contract is unchanged.
 		return fmt.Errorf("finding %s not found or already resolved", eventID)
+	}
+	if s.SyncJournalEnabled() {
+		if err := journalSyncDirtyTx(ctx, tx, SyncKindFinding, eventID); err != nil {
+			return fmt.Errorf("update resolution for %s: %w", eventID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update resolution for %s: commit: %w", eventID, err)
 	}
 	return nil
 }
@@ -632,9 +654,17 @@ func scanFindings(rows interface {
 func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVerdict string, reason string) error {
 	now := time.Now().Format(time.RFC3339)
 
+	// Phase 2 sync: lookup + UPDATE + journal insert in one transaction.
+	// See UpdateFindingResolution for the rationale.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("update verdict for %s: begin: %w", eventID, err)
+	}
+	defer tx.Rollback()
+
 	// Get the current verdict for audit trail
 	var currentVerdict string
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		"SELECT verdict FROM findings WHERE event_id = ? ORDER BY id DESC LIMIT 1",
 		eventID,
 	).Scan(&currentVerdict)
@@ -642,7 +672,7 @@ func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVer
 		return fmt.Errorf("lookup current verdict for %s: %w", eventID, err)
 	}
 
-	_, err = s.db.ExecContext(ctx, `UPDATE findings SET
+	result, err := tx.ExecContext(ctx, `UPDATE findings SET
 		verdict = ?,
 		resolution_status = 'resolved',
 		resolved_at = ?,
@@ -660,6 +690,17 @@ func (s *Store) UpdateFindingVerdict(ctx context.Context, eventID string, newVer
 	)
 	if err != nil {
 		return fmt.Errorf("update verdict for %s: %w", eventID, err)
+	}
+	// Zero matched rows means nothing to mirror. This method has never
+	// returned an error for that case (the lookup above already fails when
+	// the event does not exist), and that contract is preserved.
+	if rows, _ := result.RowsAffected(); rows > 0 && s.SyncJournalEnabled() {
+		if err := journalSyncDirtyTx(ctx, tx, SyncKindFinding, eventID); err != nil {
+			return fmt.Errorf("update verdict for %s: %w", eventID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update verdict for %s: commit: %w", eventID, err)
 	}
 	return nil
 }
