@@ -2,10 +2,47 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
+
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// Trusted-IP error contract. Callers (the dashboard API, and through it the
+// hosted command channel) must be able to tell "this is already true" and
+// "you asked for something invalid" - both terminal, both the caller's answer -
+// apart from "the write failed", which is transient and must be retried.
+// Before these sentinels every failure looked the same, so a locked database
+// surfaced to the API as a 400/404.
+var (
+	// ErrTrustedIPExists means the address or range is already trusted.
+	// [A6] Since the partial UNIQUE indexes landed this is also what a lost
+	// insert race reports, instead of a second row appearing.
+	ErrTrustedIPExists = errors.New("already trusted")
+
+	// ErrTrustedIPNotFound means there is no such row to delete.
+	ErrTrustedIPNotFound = errors.New("trusted IP not found")
+
+	// ErrTrustedIPInvalid means the supplied IP or CIDR does not parse.
+	ErrTrustedIPInvalid = errors.New("invalid trusted IP entry")
+)
+
+// isUniqueViolation reports whether err is SQLite refusing a duplicate.
+// modernc.org/sqlite returns extended result codes; the low byte of a
+// constraint failure is SQLITE_CONSTRAINT.
+func isUniqueViolation(err error) bool {
+	var serr *sqlite.Error
+	if errors.As(err, &serr) {
+		switch serr.Code() {
+		case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT:
+			return true
+		}
+	}
+	return false
+}
 
 // TrustedIP represents an entry in the trusted_ips table.
 type TrustedIP struct {
@@ -74,34 +111,28 @@ func (s *Store) AddTrustedIP(ctx context.Context, ip *TrustedIP) (int64, error) 
 	// Validate CIDR if provided
 	if ip.CIDR != "" {
 		if _, _, err := net.ParseCIDR(ip.CIDR); err != nil {
-			return 0, fmt.Errorf("invalid CIDR %q: %w", ip.CIDR, err)
+			return 0, fmt.Errorf("%w: invalid CIDR %q: %v", ErrTrustedIPInvalid, ip.CIDR, err)
 		}
 	}
 
 	// Validate IP if provided
 	if ip.IPAddress != "" {
 		if net.ParseIP(ip.IPAddress) == nil {
-			return 0, fmt.Errorf("invalid IP address %q", ip.IPAddress)
+			return 0, fmt.Errorf("%w: invalid IP address %q", ErrTrustedIPInvalid, ip.IPAddress)
 		}
 	}
 
-	// Check for duplicates
-	var existing int
-	if ip.IPAddress != "" {
-		s.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM trusted_ips WHERE ip_address = ?", ip.IPAddress).Scan(&existing)
-		if existing > 0 {
-			return 0, fmt.Errorf("IP %s already trusted", ip.IPAddress)
-		}
-	}
-	if ip.CIDR != "" {
-		s.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM trusted_ips WHERE cidr = ?", ip.CIDR).Scan(&existing)
-		if existing > 0 {
-			return 0, fmt.Errorf("CIDR %s already trusted", ip.CIDR)
-		}
-	}
-
+	// [A6] Duplicate rejection is the database's job, not a SELECT's.
+	//
+	// This used to be SELECT-then-INSERT against a table with no UNIQUE
+	// constraint: two dashboard clicks (or, now, two deliveries of the same
+	// hosted command) that interleaved between the SELECT and the INSERT both
+	// saw "not there yet" and both inserted. The result was a duplicate row
+	// that no code path could ever produce a second time, so it was invisible
+	// until somebody counted. Migration v16 adds partial UNIQUE indexes and
+	// the insert simply lets them speak - one writer wins, the loser gets
+	// ErrTrustedIPExists, which is exactly what a serialized second attempt
+	// would have got.
 	result, err := s.db.ExecContext(ctx, `INSERT INTO trusted_ips
 		(ip_address, cidr, description, added_by)
 		VALUES (?, ?, ?, ?)`,
@@ -111,6 +142,15 @@ func (s *Store) AddTrustedIP(ctx context.Context, ip *TrustedIP) (int64, error) 
 		ip.AddedBy,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			what := "IP " + ip.IPAddress
+			if ip.IPAddress == "" {
+				what = "CIDR " + ip.CIDR
+			}
+			// Message shape is unchanged ("IP 1.2.3.4 already trusted") and
+			// carries api.ConvergedTrustedIPExists as a substring.
+			return 0, fmt.Errorf("%s %w", what, ErrTrustedIPExists)
+		}
 		return 0, fmt.Errorf("insert trusted ip: %w", err)
 	}
 
@@ -126,7 +166,7 @@ func (s *Store) RemoveTrustedIP(ctx context.Context, id int64) error {
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("trusted IP with id %d not found", id)
+		return fmt.Errorf("id %d: %w", id, ErrTrustedIPNotFound)
 	}
 	return nil
 }

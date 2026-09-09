@@ -18,6 +18,15 @@
 //	        mirror sees byte-identical payloads to what the local dashboard
 //	        consumed. Handler assembly logic is never reimplemented here.
 //
+//	LANE C  signed commands ← /api/ingest/commands, → .../commands/ack
+//	        The only INBOUND lane. Polls Ed25519-signed commands from the
+//	        hosted dashboard and executes each one against Observer's OWN
+//	        local API - the same handlers, validation, and store methods a
+//	        dashboard click hits. No handler logic is duplicated here, and
+//	        because the mutation methods write the dirty journal themselves,
+//	        an executed command re-syncs through lane A with no extra
+//	        bookkeeping. See lane_c.go for the trust model.
+//
 // Progress is only ever recorded against a fully validated acknowledgement:
 // cursors advance and journal rows are deleted after the hosted mirror has
 // confirmed it accepted exactly what was sent. Anything else is a failure that
@@ -27,6 +36,7 @@ package sync
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -69,9 +79,22 @@ type Config struct {
 	// its token once, so re-reading per cycle would desync on file rotation.
 	LocalBaseURL string
 	LocalKeyFile string
+
+	// Lane C - hosted command channel. The zero value disables the lane
+	// entirely (see commandsEnabled): main.go populates these three only when
+	// the pairing flow has provisioned all of them, so an Observer released
+	// before the hosted side exists runs lanes A/B and nothing else.
+	//
+	// VerifyKey is the Ed25519 PUBLIC key commands are checked against;
+	// Epoch binds a command to the current pairing session; InstanceID is
+	// this box's hosted UUID and is part of every signed tuple.
+	InstanceID      string
+	VerifyKey       ed25519.PublicKey
+	Epoch           string
+	CommandInterval time.Duration
 }
 
-// Engine owns the three sync goroutines and their shared HTTP clients.
+// Engine owns the four sync goroutines and their shared HTTP clients.
 type Engine struct {
 	store *store.Store
 	cfg   Config
@@ -84,17 +107,31 @@ type Engine struct {
 	wg       stdsync.WaitGroup
 	stopOnce stdsync.Once
 
-	// laneBDown / heartbeatDown track lane B health so each goroutine logs
-	// state transitions once instead of a line per cycle forever. Each field
-	// is touched only by its own goroutine.
+	// laneBDown / heartbeatDown / laneCDown track lane health so each
+	// goroutine logs state transitions once instead of a line per cycle
+	// forever. Each field is touched only by its own goroutine.
 	laneBDown     bool
 	heartbeatDown bool
+	laneCDown     bool
+
+	// Nudge channels: lane C pokes lanes A and B after it executes a command
+	// so the dashboard's "pending" banner clears in seconds instead of on the
+	// next scheduled tick.
+	//
+	// Buffered size 1, never closed, sent to with select-default. A nudge is
+	// a hint, not a message: if one is already queued, dropping the second is
+	// exactly right - the pass it triggers will see both commands' effects.
+	// Never closing them means a lane C shutdown can never panic a lane that
+	// is still selecting on them.
+	dirtyNudge    chan struct{}
+	snapshotNudge chan struct{}
 }
 
 const (
 	defaultInterval          = 15 * time.Second
 	defaultSnapshotInterval  = 5 * time.Minute
 	defaultHeartbeatInterval = 60 * time.Second
+	defaultCommandInterval   = 30 * time.Second
 
 	// maxBackoff caps lane A's exponential retry delay.
 	maxBackoff = 5 * time.Minute
@@ -131,12 +168,17 @@ func New(ctx context.Context, st *store.Store, cfg Config) (*Engine, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = defaultHeartbeatInterval
 	}
+	if cfg.CommandInterval <= 0 {
+		cfg.CommandInterval = defaultCommandInterval
+	}
 
 	e := &Engine{
-		store:       st,
-		cfg:         cfg,
-		client:      &http.Client{Timeout: 10 * time.Second},
-		localClient: &http.Client{Timeout: 5 * time.Second},
+		store:         st,
+		cfg:           cfg,
+		client:        &http.Client{Timeout: 10 * time.Second},
+		localClient:   &http.Client{Timeout: 5 * time.Second},
+		dirtyNudge:    make(chan struct{}, 1),
+		snapshotNudge: make(chan struct{}, 1),
 	}
 
 	// [A10] Read the dashboard token exactly once.
@@ -158,8 +200,22 @@ func New(ctx context.Context, st *store.Store, cfg Config) (*Engine, error) {
 	dc, _ := st.GetSyncCursor(ctx, store.SyncStreamDecisions)
 	log.Printf("[sync] enabled target=%s findings_cursor=%d decisions_cursor=%d interval=%s snapshot=%s heartbeat=%s",
 		targetHost(cfg.BaseURL), fc, dc, cfg.Interval, cfg.SnapshotInterval, cfg.HeartbeatInterval)
+	if e.commandsEnabled() {
+		log.Printf("[sync] command channel enabled instance=%s epoch=%s interval=%s",
+			cfg.InstanceID, cfg.Epoch, cfg.CommandInterval)
+	}
 
 	return e, nil
+}
+
+// commandsEnabled reports whether lane C has everything it needs. All three
+// pairing values must be present and the verify key must be a real Ed25519
+// public key - a partially provisioned channel stays off rather than polling
+// commands it could not safely verify.
+func (e *Engine) commandsEnabled() bool {
+	return e.cfg.InstanceID != "" &&
+		e.cfg.Epoch != "" &&
+		len(e.cfg.VerifyKey) == ed25519.PublicKeySize
 }
 
 // prepare runs the [A1] continuity check then the [A6] rollback check.
@@ -268,12 +324,17 @@ func NoteDisabled(ctx context.Context, st *store.Store) error {
 	return st.SetSyncMeta(ctx, store.SyncMetaContinuous, "0")
 }
 
-// Start launches the three sync goroutines. Safe to call once.
+// Start launches the four sync goroutines. Safe to call once.
+//
+// The lane C goroutine is always started and returns immediately when the
+// command channel is not configured, so the lifecycle is identical whether or
+// not this instance is paired for commands: cancellation-only shutdown, one
+// WaitGroup, no conditional teardown.
 func (e *Engine) Start(ctx context.Context) {
 	runCtx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
 
-	e.wg.Add(3)
+	e.wg.Add(4)
 	go func() {
 		defer e.wg.Done()
 		e.runLaneA(runCtx)
@@ -285,6 +346,10 @@ func (e *Engine) Start(ctx context.Context) {
 	go func() {
 		defer e.wg.Done()
 		e.runSnapshot(runCtx)
+	}()
+	go func() {
+		defer e.wg.Done()
+		e.runLaneC(runCtx)
 	}()
 }
 

@@ -2,6 +2,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"slices"
 	"testing"
 	"time"
@@ -162,5 +164,121 @@ func TestSyncIntervalDefaults(t *testing.T) {
 	t.Setenv("SYNC_INTERVAL", "45s")
 	if got := LoadConfig().SyncInterval; got != 45*time.Second {
 		t.Errorf("SYNC_INTERVAL=45s → %s; want 45s", got)
+	}
+}
+
+// =============================================================================
+// Lane C pairing configuration
+// =============================================================================
+//
+// The command channel ships dark twice over: sync must be on AND the pairing
+// flow must have provisioned all three values. Anything less runs lanes A/B
+// exactly as before, which is what lets an Observer release land before the
+// hosted side exists.
+
+func TestSyncCommandChannelEnablement(t *testing.T) {
+	validKey := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+
+	cases := []struct {
+		name        string
+		env         map[string]string
+		wantEnabled bool
+		wantKey     bool
+	}{
+		{
+			name: "fully paired",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_INSTANCE_ID": "inst", "SYNC_VERIFY_KEY": validKey, "SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: true,
+			wantKey:     true,
+		},
+		{
+			name: "sync off - pairing values are moot",
+			env: map[string]string{
+				"SYNC_INSTANCE_ID": "inst", "SYNC_VERIFY_KEY": validKey, "SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: false,
+			wantKey:     true, // parsed, but unused: SyncCommandsEnabled is the authority
+		},
+		{
+			name: "missing instance id",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_VERIFY_KEY": validKey, "SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: false,
+			wantKey:     true,
+		},
+		{
+			name: "missing epoch",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_INSTANCE_ID": "inst", "SYNC_VERIFY_KEY": validKey,
+			},
+			wantEnabled: false,
+			wantKey:     true,
+		},
+		{
+			name: "missing verify key",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_INSTANCE_ID": "inst", "SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: false,
+		},
+		{
+			name: "verify key is not base64",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_INSTANCE_ID": "inst", "SYNC_VERIFY_KEY": "!!!not base64!!!", "SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: false,
+		},
+		{
+			name: "verify key is the wrong length",
+			env: map[string]string{
+				"SYNC_URL": "https://vaultguardian.io", "SYNC_TOKEN": "t",
+				"SYNC_INSTANCE_ID":   "inst",
+				"SYNC_VERIFY_KEY":    base64.StdEncoding.EncodeToString(make([]byte, 16)),
+				"SYNC_COMMAND_EPOCH": "e1",
+			},
+			wantEnabled: false,
+		},
+	}
+
+	keys := []string{"SYNC_URL", "SYNC_TOKEN", "SYNC_INSTANCE_ID", "SYNC_VERIFY_KEY", "SYNC_COMMAND_EPOCH"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range keys {
+				t.Setenv(key, tc.env[key])
+			}
+			cfg := LoadConfig()
+
+			if cfg.SyncCommandsEnabled != tc.wantEnabled {
+				t.Errorf("SyncCommandsEnabled = %v; want %v", cfg.SyncCommandsEnabled, tc.wantEnabled)
+			}
+			if got := len(cfg.SyncVerifyKey) == ed25519.PublicKeySize; got != tc.wantKey {
+				t.Errorf("verify key parsed = %v; want %v (len %d)", got, tc.wantKey, len(cfg.SyncVerifyKey))
+			}
+			// An invalid or partial pairing must never leak into the engine.
+			if !tc.wantEnabled {
+				if commandInstanceID(cfg) != "" || commandEpoch(cfg) != "" || commandVerifyKey(cfg) != nil {
+					t.Error("a disabled command channel must forward zero values to the sync engine")
+				}
+			}
+		})
+	}
+}
+
+func TestSyncCommandIntervalDefault(t *testing.T) {
+	t.Setenv("SYNC_COMMAND_INTERVAL", "")
+	if got := LoadConfig().SyncCommandInterval; got != 30*time.Second {
+		t.Errorf("default SYNC_COMMAND_INTERVAL = %s; want 30s", got)
+	}
+	t.Setenv("SYNC_COMMAND_INTERVAL", "5s")
+	if got := LoadConfig().SyncCommandInterval; got != 5*time.Second {
+		t.Errorf("SYNC_COMMAND_INTERVAL=5s → %s; want 5s", got)
 	}
 }

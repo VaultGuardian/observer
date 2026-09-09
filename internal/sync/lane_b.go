@@ -89,9 +89,10 @@ func (e *Engine) runSnapshot(ctx context.Context) {
 	ticker := time.NewTicker(e.cfg.SnapshotInterval)
 	defer ticker.Stop()
 
-	// [A10] The first cycle deliberately runs before the local API is
-	// guaranteed to be serving (Start is async, and ListenAndServe can fail
-	// late). A failure here logs once and retries next cycle.
+	// [A10] The first cycle can still land before the local API's accept loop
+	// is running - the listener is bound before this engine is constructed
+	// (main.go's listener-ownership gate), but Serve starts asynchronously. A
+	// failure here logs once and retries next cycle.
 	e.sendSnapshot(ctx)
 
 	for {
@@ -99,6 +100,14 @@ func (e *Engine) runSnapshot(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			e.sendSnapshot(ctx)
+		case <-e.snapshotNudge:
+			// Lane C executed a hosted command whose effect shows up in a
+			// snapshot payload (a deleted pattern, a new trusted IP) rather
+			// than in the findings/decisions streams. The five-minute
+			// snapshot clock is far too slow to confirm an operator's click,
+			// so send one now. The ticker is left alone: an extra snapshot is
+			// cheap and idempotent on the hosted side.
 			e.sendSnapshot(ctx)
 		}
 	}

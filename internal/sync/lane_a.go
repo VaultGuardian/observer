@@ -53,6 +53,18 @@ func (e *Engine) runLaneA(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		case <-e.dirtyNudge:
+			// Lane C just executed a hosted command, which mutated findings
+			// or decisions in place and journaled them. Push now instead of
+			// waiting out the rest of the interval - this is what makes the
+			// dashboard's pending banner clear in seconds. The timer is
+			// stopped and drained so the Reset below starts a clean interval.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 
 		for {

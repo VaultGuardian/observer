@@ -3,7 +3,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -42,6 +44,18 @@ func main() {
 	// --- Version flag ---
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Printf("observer %s\n", Version)
+		os.Exit(0)
+	}
+
+	// --- pair subcommand ---
+	//
+	// `vaultguardian pair <code>` claims a pairing code and rewrites
+	// observer.env. It never starts the pipeline; see pair.go.
+	if len(os.Args) > 1 && os.Args[1] == "pair" {
+		if err := runPairCLI(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "pair: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -281,19 +295,44 @@ func main() {
 	if err != nil {
 		log.Printf("[observer] Dashboard API failed to start: %v (continuing without dashboard)", err)
 	} else {
+		// ------- Listener-ownership gate -------
+		//
+		// Bind SYNCHRONOUSLY, and die if the port is taken.
+		//
+		// The dashboard port is Observer's control surface: the sync engine's
+		// lanes B and C authenticate to it with this process's own bearer
+		// token, and lane C EXECUTES hosted commands through it. If something
+		// else already owns the port, that something is either a second
+		// Observer racing this one on the same database, or a squatter -
+		// and in the second case this process would hand the local bearer
+		// token, and every command the control plane sends, to it.
+		//
+		// The old code discovered this asynchronously, minutes into a
+		// perfectly normal-looking startup, and only logged it. Binding
+		// before the sync engine exists turns that into a refusal to start.
+		listener, lerr := apiServer.Listen()
+		if lerr != nil {
+			log.Fatalf("[observer] %v - refusing to start (another Observer, or something else, "+
+				"already owns the dashboard port)", lerr)
+		}
 		go func() {
-			if err := apiServer.Start(); err != nil {
+			// Accept-loop semantics after binding are unchanged: async, and a
+			// graceful Shutdown is not an error.
+			if err := apiServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("[observer] Dashboard API error: %v", err)
 			}
 		}()
 	}
 
-	// ------- Hosted sync engine (Phase 2) -------
+	// ------- Hosted sync engine (Phase 2, lane C added in Phase 4) -------
 	//
 	// Ships dark. With SYNC_URL/SYNC_TOKEN unset nothing below runs: no sync
 	// goroutines, no journal writes, no behavior change anywhere in the
-	// verdict path. Started after the API server because lane B reads the
-	// local dashboard API (it tolerates the API not being up yet).
+	// verdict path.
+	//
+	// Constructed strictly AFTER the API listener is bound (above). Every lane
+	// that talks to the local API - B for snapshots, C for commands - is then
+	// talking to a port this process owns.
 	var syncEngine *syncengine.Engine
 	if cfg.SyncEnabled {
 		engine, serr := syncengine.New(ctx, db, syncengine.Config{
@@ -304,6 +343,13 @@ func main() {
 			HeartbeatInterval: cfg.SyncHeartbeatInterval,
 			LocalBaseURL:      syncengine.LocalBaseURL(cfg.DashboardBindAddr, cfg.DashboardPort),
 			LocalKeyFile:      cfg.DashboardKeyFile,
+
+			// Lane C stays dark unless the pairing flow provisioned all three
+			// values; LoadConfig has already said so in one log line.
+			InstanceID:      commandInstanceID(cfg),
+			VerifyKey:       commandVerifyKey(cfg),
+			Epoch:           commandEpoch(cfg),
+			CommandInterval: cfg.SyncCommandInterval,
 		})
 		if serr != nil {
 			// Fail closed. The journal stays off and no sync goroutine runs,
@@ -651,6 +697,34 @@ func main() {
 	log.Printf("[observer] Final stats: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d learned=%d",
 		aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.PatternsLearned)
 	log.Println("[observer] Shutdown complete")
+}
+
+// commandInstanceID / commandVerifyKey / commandEpoch pass the lane C pairing
+// values to the sync engine ONLY when the whole set is present and valid.
+//
+// Passing them individually would let a half-provisioned pairing look
+// configured to the engine; forwarding the zero value instead keeps
+// "the command channel is off" a single decision, made once in LoadConfig and
+// already logged there.
+func commandInstanceID(cfg Config) string {
+	if !cfg.SyncCommandsEnabled {
+		return ""
+	}
+	return cfg.SyncInstanceID
+}
+
+func commandVerifyKey(cfg Config) ed25519.PublicKey {
+	if !cfg.SyncCommandsEnabled {
+		return nil
+	}
+	return cfg.SyncVerifyKey
+}
+
+func commandEpoch(cfg Config) string {
+	if !cfg.SyncCommandsEnabled {
+		return ""
+	}
+	return cfg.SyncCommandEpoch
 }
 
 // waitTimeout waits for wg, returning false if d elapses first. Shutdown must

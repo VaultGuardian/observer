@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -136,6 +138,28 @@ type Config struct {
 	SyncInterval          time.Duration
 	SyncSnapshotInterval  time.Duration
 	SyncHeartbeatInterval time.Duration
+
+	// Hosted command channel - lane C (Phase 4).
+	//
+	// Ships dark twice over: lane C polls signed commands DOWN from the
+	// hosted dashboard only when sync itself is enabled AND the pairing flow
+	// has provisioned all three of instance id / verify key / epoch. An
+	// Observer released before the hosted side exists simply logs that the
+	// channel is off and runs lanes A/B exactly as before.
+	//
+	// SyncVerifyKey is the Ed25519 PUBLIC key that every command signature is
+	// checked against. The matching private key lives in the hosted control
+	// plane's environment and never touches a database - that is what makes a
+	// database-write attacker unable to mint or mutate commands.
+	//
+	// SyncCommandEpoch binds commands to the current pairing session: it
+	// rotates on re-pair, so commands minted for an older pairing are
+	// rejected rather than executed late.
+	SyncInstanceID      string
+	SyncVerifyKey       ed25519.PublicKey
+	SyncCommandEpoch    string
+	SyncCommandInterval time.Duration
+	SyncCommandsEnabled bool
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -179,6 +203,7 @@ func LoadConfig() Config {
 		SyncInterval:          getEnvDuration("SYNC_INTERVAL", 15*time.Second),
 		SyncSnapshotInterval:  getEnvDuration("SYNC_SNAPSHOT_INTERVAL", 5*time.Minute),
 		SyncHeartbeatInterval: getEnvDuration("SYNC_HEARTBEAT_INTERVAL", 60*time.Second),
+		SyncCommandInterval:   getEnvDuration("SYNC_COMMAND_INTERVAL", 30*time.Second),
 
 		// REC reassembly tuning - response-only, bounds are tunable.
 		RECReassemblyMaxBody:   getEnvInt("REC_REASSEMBLY_MAX_BODY", 2048),
@@ -354,6 +379,50 @@ func LoadConfig() Config {
 		} else {
 			cfg.SyncEnabled = true
 		}
+	}
+
+	// ------- Hosted command channel (lane C) enablement -------
+	//
+	// Same fail-closed shape as sync itself, one level deeper: the channel
+	// executes control-plane commands against the local API, so anything less
+	// than a complete, valid pairing means it stays off entirely.
+	cfg.SyncInstanceID = strings.TrimSpace(getEnv("SYNC_INSTANCE_ID", ""))
+	cfg.SyncCommandEpoch = strings.TrimSpace(getEnv("SYNC_COMMAND_EPOCH", ""))
+	rawVerifyKey := strings.TrimSpace(getEnv("SYNC_VERIFY_KEY", ""))
+
+	var missing []string
+	if cfg.SyncInstanceID == "" {
+		missing = append(missing, "SYNC_INSTANCE_ID")
+	}
+	if cfg.SyncCommandEpoch == "" {
+		missing = append(missing, "SYNC_COMMAND_EPOCH")
+	}
+	switch {
+	case rawVerifyKey == "":
+		missing = append(missing, "SYNC_VERIFY_KEY")
+	default:
+		key, err := base64.StdEncoding.DecodeString(rawVerifyKey)
+		if err != nil {
+			log.Printf("[sync] SYNC_VERIFY_KEY is not valid base64: %v", err)
+			missing = append(missing, "SYNC_VERIFY_KEY (not base64)")
+		} else if len(key) != ed25519.PublicKeySize {
+			log.Printf("[sync] SYNC_VERIFY_KEY decodes to %d bytes; an Ed25519 public key is exactly %d",
+				len(key), ed25519.PublicKeySize)
+			missing = append(missing, "SYNC_VERIFY_KEY (wrong length)")
+		} else {
+			cfg.SyncVerifyKey = ed25519.PublicKey(key)
+		}
+	}
+
+	switch {
+	case !cfg.SyncEnabled:
+		// Sync is off, so the command channel is moot. Saying so again would
+		// just add noise to every self-hosted boot.
+	case len(missing) == 0:
+		cfg.SyncCommandsEnabled = true
+	default:
+		log.Printf("[sync] command channel disabled (pairing incomplete: missing %s)",
+			strings.Join(missing, ", "))
 	}
 
 	// Journald watcher

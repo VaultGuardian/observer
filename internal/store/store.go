@@ -524,6 +524,69 @@ func (s *Store) migrate() error {
 
 			CREATE INDEX IF NOT EXISTS idx_sync_dirty_kind ON sync_dirty(kind, id);`,
 		},
+		{
+			// [A6] Atomic trusted-IP dedupe.
+			//
+			// trusted_ips guarded duplicates with SELECT-then-INSERT and had
+			// no UNIQUE constraint, so two interleaved adds of the same
+			// address both inserted. Existing databases can therefore hold
+			// duplicates, which means the index cannot simply be created -
+			// the migration has to reconcile first:
+			//
+			//   1. normalize legacy empty strings to NULL so "no IP" rows
+			//      (CIDR entries) do not collide with each other,
+			//   2. delete duplicates oldest-wins (MIN(id) survives, keeping
+			//      the original created_at and added_by provenance),
+			//   3. create the partial UNIQUE indexes.
+			//
+			// Partial (not plain) UNIQUE: every row has one of the two
+			// columns NULL by construction, and SQLite treats NULLs as
+			// distinct, but being explicit documents that only real values
+			// are constrained.
+			version: 16,
+			desc:    "[A6] partial UNIQUE indexes on trusted_ips (dedupe oldest-wins first)",
+			sql: `UPDATE trusted_ips SET ip_address = NULL WHERE ip_address = '';
+			UPDATE trusted_ips SET cidr = NULL WHERE cidr = '';
+
+			DELETE FROM trusted_ips WHERE ip_address IS NOT NULL AND id NOT IN (
+				SELECT MIN(id) FROM trusted_ips WHERE ip_address IS NOT NULL GROUP BY ip_address
+			);
+			DELETE FROM trusted_ips WHERE cidr IS NOT NULL AND id NOT IN (
+				SELECT MIN(id) FROM trusted_ips WHERE cidr IS NOT NULL GROUP BY cidr
+			);
+
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_ips_address_unique
+				ON trusted_ips(ip_address) WHERE ip_address IS NOT NULL;
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_ips_cidr_unique
+				ON trusted_ips(cidr) WHERE cidr IS NOT NULL;`,
+		},
+		{
+			// Phase 4 lane C: the local receipt ledger for hosted commands.
+			// See command_receipts.go for the full semantics - in particular
+			// what the ledger does and does not protect against.
+			//
+			// command_id is the hosted-minted UUID and the primary key: the
+			// ledger is what makes a redelivered command a re-ack instead of
+			// a second execution.
+			version: 17,
+			desc:    "Phase 4 lane C: command_receipts ledger",
+			sql: `CREATE TABLE IF NOT EXISTS command_receipts (
+				command_id    TEXT PRIMARY KEY,
+				command_type  TEXT NOT NULL,
+				payload_sha   TEXT NOT NULL,
+				epoch         TEXT NOT NULL,
+				signature     TEXT NOT NULL,
+				expires_at    INTEGER NOT NULL,
+				first_seen_at INTEGER NOT NULL,
+				executed_at   INTEGER,
+				http_status   INTEGER,
+				result        TEXT,
+				outcome       TEXT
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_command_receipts_first_seen
+				ON command_receipts(first_seen_at);`,
+		},
 	}
 
 	for _, m := range migrations {
@@ -575,20 +638,25 @@ func applyMigration(db *sql.DB, version int, desc, migrationSQL string) error {
 //   - recon/downgrade: 90 days (useful for trend analysis)
 //   - malicious/alert/malicious: never auto-pruned (security record)
 //   - pipeline_stats: 90 days
+//   - command_receipts: 90 days (see command_receipts.go - the ledger only
+//     needs to outlive any plausible redelivery window, and the hosted side
+//     stops serving a command long before that)
 func (s *Store) Prune(ctx context.Context) error {
 	cutoff7d := time.Now().AddDate(0, 0, -7).Format(time.RFC3339)
 	cutoff90d := time.Now().AddDate(0, 0, -90).Format(time.RFC3339)
+	cutoff90dMS := time.Now().AddDate(0, 0, -90).UnixMilli()
 
 	queries := []struct {
 		desc string
 		sql  string
-		arg  string
+		arg  any
 	}{
 		{"allow/suppress findings >7d", "DELETE FROM findings WHERE verdict IN ('allow', 'suppress') AND timestamp < ?", cutoff7d},
 		{"recon/downgraded findings >90d", "DELETE FROM findings WHERE (verdict = 'recon' OR downgraded = 1) AND timestamp < ?", cutoff90d},
 		{"scanner sessions >90d", "DELETE FROM scanner_sessions WHERE last_seen < ?", cutoff90d},
 		{"pipeline stats >90d", "DELETE FROM pipeline_stats WHERE timestamp < ?", cutoff90d},
 		{"unreviewed LLM decisions >7d", "DELETE FROM llm_decisions WHERE review_status = 'pending' AND timestamp < ?", cutoff7d},
+		{"command receipts >90d", "DELETE FROM command_receipts WHERE first_seen_at < ?", cutoff90dMS},
 	}
 
 	for _, q := range queries {

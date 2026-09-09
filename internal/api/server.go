@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -201,9 +202,20 @@ func (s *Server) SetCorrectionCallbacks(
 	s.getExpectedEndpointStats = expectedEndpointStats
 }
 
-// Start begins serving the API. Blocks until the server shuts down.
-// Run in a goroutine from main.
-func (s *Server) Start() error {
+// Listen binds the API's TCP port and returns the bound listener.
+//
+// [Phase 4 / listener-ownership gate] Binding is deliberately SYNCHRONOUS and
+// separate from serving. main.go calls Listen before it constructs the sync
+// engine and treats a bind failure as fatal: an occupied dashboard port means
+// either a second Observer is already running against this data directory or
+// something else is squatting the control-plane port. Both are conditions
+// under which this process must not continue - the old async
+// ListenAndServe-in-a-goroutine logged the failure long after startup had
+// moved on, leaving a half-alive Observer whose sync lanes talked to a local
+// API owned by somebody else.
+//
+// Serve(l) runs the accept loop; Shutdown stops it.
+func (s *Server) Listen() (net.Listener, error) {
 	mux := http.NewServeMux()
 
 	// --- Health (no auth) ---
@@ -233,7 +245,7 @@ func (s *Server) Start() error {
 	addr := net.JoinHostPort(bindAddr, strconv.Itoa(s.config.Port))
 
 	// Visible startup state - makes "why doesn't my dashboard connect" debuggable.
-	log.Printf("[api] Dashboard API listening: bind=%s port=%d cors_origins=%d key_file=%s",
+	log.Printf("[api] Dashboard API binding: bind=%s port=%d cors_origins=%d key_file=%s",
 		bindAddr, s.config.Port, len(s.allowedOrigins), s.config.KeyFile)
 
 	// Loud warning when binding to all interfaces. v0.45.0 default is
@@ -258,7 +270,23 @@ func (s *Server) Start() error {
 	}
 
 	s.httpServer = srv
-	return srv.ListenAndServe()
+
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dashboard API cannot bind %s: %w", addr, err)
+	}
+	return l, nil
+}
+
+// Serve runs the accept loop on a listener returned by Listen. It blocks until
+// Shutdown is called (returning http.ErrServerClosed) or the listener fails.
+// Run it in a goroutine from main - the async semantics after binding are
+// unchanged.
+func (s *Server) Serve(l net.Listener) error {
+	if s.httpServer == nil {
+		return fmt.Errorf("dashboard API: Serve called before Listen")
+	}
+	return s.httpServer.Serve(l)
 }
 
 // Shutdown gracefully stops the API server, allowing in-flight requests
@@ -689,13 +717,35 @@ func (s *Server) handleDeletePattern(w http.ResponseWriter, r *http.Request) {
 
 	deleted := s.patterns.DeletePattern(req.Scope, patternstore.Verdict(req.Verdict), req.Value)
 	if !deleted {
-		jsonError(w, "Pattern not found", http.StatusNotFound)
+		// [A7] "Not found" is read as convergence by the hosted command
+		// channel, so it has to mean the pattern is really gone - from disk,
+		// not just from memory. Consider a delete that succeeded in memory and
+		// then failed to persist (500, retried): the retry finds nothing in
+		// memory and would answer 404, which the channel would report as a
+		// completed delete while the pattern sat on disk waiting for the next
+		// restart. Confirming durability here costs one no-op write on a path
+		// that only a human click or a redelivered command ever reaches.
+		if err := s.patterns.Persist(); err != nil {
+			log.Printf("[api] Pattern not found but the store could not be persisted: %v", err)
+			jsonError(w, "pattern not present in memory, but the pattern store could not be "+
+				"persisted, so its absence is not durable: "+err.Error(),
+				http.StatusInternalServerError)
+			return
+		}
+		jsonError(w, ConvergedPatternNotFound, http.StatusNotFound)
 		return
 	}
 
-	// Persist changes to disk
+	// [A7] Persist is part of the delete, not a nicety after it. The pattern
+	// is gone from memory at this point; if the file write fails, the delete
+	// comes back on the next restart. Reporting 2xx there would tell the
+	// caller - a dashboard click or a hosted command - that a durable change
+	// happened when it did not. A 2xx from this API means "durably done".
 	if err := s.patterns.Persist(); err != nil {
-		log.Printf("[api] Warning: pattern deleted but persist failed: %v", err)
+		log.Printf("[api] Pattern deleted in memory but persist failed: %v", err)
+		jsonError(w, "pattern deleted in memory but failed to persist: "+err.Error(),
+			http.StatusInternalServerError)
+		return
 	}
 
 	log.Printf("[api] Pattern deleted: scope=%s verdict=%s value=%.32s", req.Scope, req.Verdict, req.Value)
@@ -957,8 +1007,23 @@ func (s *Server) addTrustedIP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id, err := s.store.AddTrustedIP(r.Context(), entry)
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrTrustedIPExists):
+		// [A6] Already trusted. The message carries the pinned
+		// ConvergedTrustedIPExists substring: to a hosted command this is
+		// "already in the desired state", not a failure.
 		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	case errors.Is(err, store.ErrTrustedIPInvalid):
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	case err != nil:
+		// [A7] A write that failed for any other reason (locked database,
+		// disk error) is a server-side failure, not a bad request. The
+		// distinction is load-bearing for lane C: 4xx is terminal, 5xx is
+		// retried.
+		log.Printf("[api] Trusted IP insert failed: %v", err)
+		jsonError(w, "failed to add trusted IP: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -987,7 +1052,16 @@ func (s *Server) handleDeleteTrustedIP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.store.RemoveTrustedIP(r.Context(), req.ID); err != nil {
-		jsonError(w, err.Error(), http.StatusNotFound)
+		// [A7] Only an actually-absent row is a 404. Every other failure is a
+		// failed delete and must not be reported as one: a DELETE that lost
+		// to a locked database used to come back as 404 "not found", which a
+		// hosted command would read as "already gone" and stop retrying.
+		if errors.Is(err, store.ErrTrustedIPNotFound) {
+			jsonError(w, ConvergedTrustedIPNotFound, http.StatusNotFound)
+			return
+		}
+		log.Printf("[api] Trusted IP delete failed: id=%d: %v", req.ID, err)
+		jsonError(w, "failed to remove trusted IP: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -1445,8 +1519,17 @@ func (s *Server) handleExpectedEndpointCorrection(w http.ResponseWriter, ctx con
 				scope, finding.MatchedPatternBucket, finding.MatchedPatternValue)
 		}
 	}
+	// [A7] A failed persist means the stale Tier-1 pattern comes back on the
+	// next restart and re-escalates the very endpoint the operator just
+	// confirmed. That is exactly the bug Step 1 exists to prevent, so it is a
+	// 500: the caller must know the correction did not durably land. Nothing
+	// has been written to SQLite yet at this point, so the only residue is an
+	// in-memory pattern deletion that the restart undoes.
 	if err := s.patterns.Persist(); err != nil {
-		log.Printf("[correction:expected_endpoint] Warning: pattern store persist failed after delete: %v - stale pattern may return on Observer restart", err)
+		log.Printf("[correction:expected_endpoint] Pattern store persist failed after delete: %v - stale pattern would return on Observer restart", err)
+		jsonError(w, "stale pattern deleted in memory but failed to persist: "+err.Error(),
+			http.StatusInternalServerError)
+		return
 	}
 
 	// Step 2: Persist expected endpoint (UPSERT on full key tuple - idempotent re-click).
@@ -1533,8 +1616,14 @@ func (s *Server) handleConfirmCorrection(w http.ResponseWriter, ctx context.Cont
 		s.patterns.MarkHumanValidated(sourceScope, finding.NormalizedHash)
 	}
 
+	// [A7] The human-validated mark is the entire durable effect of a confirm.
+	// If it cannot be written, the confirm did not happen - say so rather than
+	// returning 2xx over a validation that evaporates on restart.
 	if err := s.patterns.Persist(); err != nil {
-		log.Printf("[correction] Warning: persist failed after confirm: %v", err)
+		log.Printf("[correction:confirm] Pattern store persist failed: %v", err)
+		jsonError(w, "pattern marked validated in memory but failed to persist: "+err.Error(),
+			http.StatusInternalServerError)
+		return
 	}
 
 	// Update the LLM decision review status (fix #6: confirm was a no-op in SQLite)
