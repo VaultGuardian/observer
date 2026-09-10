@@ -11,7 +11,12 @@ SERVICE_FILE="/etc/systemd/system/observer.service"
 DATA_DIR="/var/lib/observer"
 CONFIG_DIR="/etc/vaultguardian"
 KEY_FILE="$CONFIG_DIR/dashboard.key"
-DASHBOARD_URL="https://vaultguardian.io/dashboard"
+# Hosted dashboard. Observer reaches it OUTBOUND only - there is no inbound
+# path and nothing to open a port for. HOSTED_BASE_URL is the API origin
+# `observer pair` claims against (it posts to $HOSTED_BASE_URL/api/pairing/claim,
+# see pair.go); DASHBOARD_URL is the human-facing page.
+HOSTED_BASE_URL="https://vaultguardian.io"
+DASHBOARD_URL="$HOSTED_BASE_URL/dashboard"
 
 # How long the post-start checks wait for Observer to report ready.
 STARTUP_TIMEOUT=15
@@ -92,10 +97,11 @@ fi
 # -------------------------------------------------------------------
 # Track whether this is an upgrade vs a fresh install. When upgrading
 # AND an env file already exists, we preserve operator customizations
-# (DASHBOARD_BIND_ADDR=0.0.0.0, CORS allowlist, REC tuning, manually-
-# added notifier creds, etc) rather than overwriting them with prompt
-# defaults. The user can use 'vaultguardian update' for binary-only
-# upgrades without re-running this script at all.
+# (a LAN/reverse-proxy DASHBOARD_BIND_ADDR override, CORS allowlist, REC
+# tuning, manually-added notifier creds, existing SYNC_* pairing, etc)
+# rather than overwriting them with prompt defaults. The user can use
+# 'vaultguardian update' for binary-only upgrades without re-running
+# this script at all.
 EXISTING_INSTALL=false
 
 if [ -f "$BIN" ]; then
@@ -130,12 +136,17 @@ fi
 
 # Defaults for values the configuration prompts normally set. On the
 # preserve path they are re-read from the existing env file further down.
-HOSTED_DASHBOARD=false
+#
+# The dashboard API is loopback-only. The installer never writes anything
+# else: the hosted dashboard is reached outbound via pairing, so there is
+# no install-time reason to bind a public interface. DASHBOARD_BIND_ADDR
+# remains an env override for the documented LAN / reverse-proxy case.
 DASHBOARD_BIND_ADDR=127.0.0.1
 DASHBOARD_PORT=9090
 SERVER_NICK="$(hostname)"
 REC_ENABLED=""
 ALERT_EMAIL=""
+PAIRING_CODE=""
 
 # -------------------------------------------------------------------
 # Detect environment
@@ -307,24 +318,30 @@ case "$REC_CHOICE" in
     *) REC_ENABLED=true ;;
 esac
 
-# Hosted dashboard connectivity. The hosted dashboard at vaultguardian.io
-# reaches this box's API over the internet, which only works when the API
-# listens on all interfaces (0.0.0.0) rather than loopback. Default Y; when
-# declined, the bind address stays 127.0.0.1 and behavior is unchanged.
-echo ""
-echo "  The hosted dashboard at vaultguardian.io connects to this server's API"
-echo "  over the internet. That requires the API to listen on all interfaces"
-echo "  (0.0.0.0) on port $DASHBOARD_PORT, protected by the bearer token. If you skip this"
-echo "  you can still use the API locally or over an SSH tunnel."
-ask "  Connect this server to the hosted dashboard? [Y/n]: " HOSTED_CHOICE
-case "$HOSTED_CHOICE" in
-    [nN]|[nN][oO]) HOSTED_DASHBOARD=false; DASHBOARD_BIND_ADDR=127.0.0.1 ;;
-    *) HOSTED_DASHBOARD=true; DASHBOARD_BIND_ADDR=0.0.0.0 ;;
-esac
-
 echo ""
 
 fi  # end of PRESERVE_ENV check (was opened above "Configuration")
+
+# -------------------------------------------------------------------
+# Hosted dashboard pairing (optional)
+# -------------------------------------------------------------------
+# Asked on BOTH paths - fresh installs and preserving upgrades. It is not a
+# setting the preserve path is protecting; it is an action, and an operator
+# upgrading from an older inbound-era install is exactly who needs to be
+# told the connection method changed. Blank leaves the box local-only and
+# writes no SYNC_* variables at all.
+#
+# The code is only collected here. It is redeemed after the service is
+# installed and running, because `observer pair` stops the unit, claims the
+# code, rewrites observer.env, and starts the unit again.
+echo ""
+echo "  Observer connects to the hosted dashboard OUTBOUND: it pairs once, then"
+echo "  pushes findings up on its own. No inbound port, no firewall changes."
+echo "  Get a pairing code from $DASHBOARD_URL, or leave this blank to run"
+echo "  local-only (nothing is sent to VaultGuardian)."
+ask "  Pairing code from your vaultguardian.io dashboard (blank = local-only): " PAIRING_CODE
+PAIRING_CODE="$(printf '%s' "$PAIRING_CODE" | tr -d '[:space:]')"
+echo ""
 
 # -------------------------------------------------------------------
 # Download binary
@@ -525,9 +542,10 @@ DASHBOARD_PORT=$DASHBOARD_PORT
 # Server identity (shown in alert emails).
 HOSTNAME=$SERVER_NICK
 
-# Dashboard binding.
-#   127.0.0.1 = localhost only (default, safest - for self-hosted setups)
-#   0.0.0.0   = all interfaces (required for the hosted dashboard; API is bearer-token protected)
+# Dashboard binding. Loopback only, and the hosted dashboard does NOT need
+# this changed - it is reached outbound via pairing (SYNC_* below), not by
+# connecting in. Override only to serve the API to your own LAN or a local
+# reverse proxy, and put TLS and auth in front of it if you do.
 DASHBOARD_BIND_ADDR=$DASHBOARD_BIND_ADDR
 
 # Dashboard CORS allowlist (comma-separated origins). Empty = no CORS headers.
@@ -575,9 +593,6 @@ if [ "$PRESERVE_ENV" = true ]; then
     v=$(env_value DASHBOARD_BIND_ADDR); DASHBOARD_BIND_ADDR="${v:-127.0.0.1}"
     v=$(env_value HOSTNAME);            SERVER_NICK="${v:-$(hostname)}"
     v=$(env_value REC_ENABLED);         REC_ENABLED="${v:-}"
-    if [ "$DASHBOARD_BIND_ADDR" = "0.0.0.0" ]; then
-        HOSTED_DASHBOARD=true
-    fi
 fi
 
 # -------------------------------------------------------------------
@@ -701,6 +716,18 @@ case "$1" in
     echo "[vaultguardian] Observer updated and restarted"
     sudo journalctl -u "$SERVICE" -n 20 --no-pager
     ;;
+  pair)
+    # Passthrough to the binary's own `pair` subcommand. Everything after
+    # `pair` is forwarded verbatim, in order: the Go flag package stops
+    # parsing at the first non-flag argument, so any flags have to precede
+    # the code (`vaultguardian pair --url https://... CODE`) - keeping the
+    # user's own argument order is what makes that work.
+    #
+    # sudo because pairing rewrites the root-only observer.env and stops and
+    # starts the systemd unit.
+    shift
+    sudo "$BIN" pair "$@"
+    ;;
   logs)
     sudo journalctl -u "$SERVICE" -f
     ;;
@@ -798,6 +825,7 @@ case "$1" in
     echo "Usage: vaultguardian <command> [args]"
     echo ""
     echo "  update [version]  Download and deploy (default: latest)"
+    echo "  pair <code>       Connect to the hosted dashboard with a pairing code"
     echo "  logs              Tail observer logs"
     echo "  status            Service status + recent logs"
     echo "  stats             Latest pipeline stats"
@@ -829,7 +857,9 @@ journal_snapshot() {
 }
 
 # api_listening - true when the dashboard API socket is bound on the
-# address and port the env file asked for.
+# address and port the env file asked for. The wildcard arm is still here
+# because a preserved env file may carry the documented LAN / reverse-proxy
+# override; the installer itself never writes anything but 127.0.0.1.
 api_listening() {
     local pat addr
     if [ "$DASHBOARD_BIND_ADDR" = "0.0.0.0" ]; then
@@ -920,65 +950,45 @@ run_startup_checks() {
     [ "$c_journal" = true ]  || warn "Host OS journald: $hint"
     [ "$c_llm" = true ]      || warn "LLM: $hint"
     [ "$c_key" = true ]      || warn "Dashboard token: not written yet, check 'vaultguardian logs'"
-    if [ "$c_api" = false ]; then
-        if [ "$HOSTED_DASHBOARD" = true ]; then
-            warn "Dashboard API: not listening on 0.0.0.0:$DASHBOARD_PORT after ${STARTUP_TIMEOUT}s. The hosted dashboard cannot reach it. Check 'vaultguardian logs'"
-        else
-            warn "Dashboard API: not listening on $DASHBOARD_BIND_ADDR:$DASHBOARD_PORT after ${STARTUP_TIMEOUT}s. Check 'vaultguardian logs'"
-        fi
-    fi
+    [ "$c_api" = true ] || warn "Dashboard API: not listening on $DASHBOARD_BIND_ADDR:$DASHBOARD_PORT after ${STARTUP_TIMEOUT}s. Check 'vaultguardian logs'"
 }
 
-# firewall_hint - warn when ufw is active and the API port is not allowed.
-# Cloud security groups cannot be detected from inside the box, so the
-# walkthrough always mentions them too.
-firewall_hint() {
-    local status
-    command -v ufw >/dev/null 2>&1 || return 0
-    status=$(ufw status 2>/dev/null || true)
-    if grep -q "^Status: active" <<<"$status" \
-        && ! grep -qE "^$DASHBOARD_PORT(/tcp)?[[:space:]]+ALLOW" <<<"$status"; then
-        warn "ufw is active and port $DASHBOARD_PORT is not open. Run: ufw allow $DASHBOARD_PORT/tcp"
-    fi
-}
-
-# print_connect_steps - the final screen for hosted-dashboard installs.
-# Everything the Add Instance form asks for, ready to copy.
-print_connect_steps() {
-    local token public_ip
-    token=$(cat "$KEY_FILE" 2>/dev/null || true)
-    public_ip=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
-    if [ -z "$public_ip" ]; then
-        public_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-    fi
-    public_ip="${public_ip:-<this-server-public-ip>}"
+# run_pairing - redeem the pairing code collected earlier, if there was one.
+#
+# `observer pair` owns the whole sequence: it stops the unit, claims the code,
+# rewrites observer.env, and starts the unit again. That is why this runs here,
+# after the service is installed and started, rather than at prompt time.
+#
+# A bad code NEVER fails the install. It does, however, leave the unit stopped:
+# pair.go stops the daemon before claiming so it can never keep running under a
+# stale pairing, and a claim that is refused returns without restarting it. So
+# the failure path starts Observer back up before reporting local-only - the
+# alternative is telling the operator it is "running local-only" while the box
+# is in fact monitoring nothing.
+run_pairing() {
+    [ -n "$PAIRING_CODE" ] || return 0
 
     echo ""
-    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
-    info "Next step: connect this server to your dashboard"
-    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+    info "Pairing with the hosted dashboard..."
+    if "$BIN" pair --url "$HOSTED_BASE_URL" "$PAIRING_CODE"; then
+        echo ""
+        ok "Paired. Findings sync outbound to $DASHBOARD_URL"
+        return 0
+    fi
+
     echo ""
-    echo "  1. Open $DASHBOARD_URL and click Add Instance"
-    echo ""
-    echo "  2. Enter these values:"
-    echo ""
-    echo -e "       Name:     ${GREEN}$SERVER_NICK${NC}"
-    echo -e "       API URL:  ${GREEN}http://$public_ip:$DASHBOARD_PORT${NC}"
-    if [ -n "$token" ]; then
-        echo -e "       Token:    ${GREEN}$token${NC}"
+    warn "Pairing failed - the code may be wrong, already used, or expired."
+    if ! systemctl is-active --quiet observer; then
+        info "Restarting Observer..."
+        systemctl start observer || true
+    fi
+    if systemctl is-active --quiet observer; then
+        ok "Observer is running local-only. Nothing is sent to VaultGuardian."
     else
-        echo "       Token:    (not written yet) get it with: sudo cat $KEY_FILE"
+        warn "Observer is NOT running. Check: journalctl -u observer -n 50 --no-pager"
     fi
-    echo ""
-    echo "  3. Click Connect. $SERVER_NICK should show as online within a few seconds."
-    echo ""
-    echo "  Not connecting? Allow inbound TCP $DASHBOARD_PORT in your firewall and in"
-    echo "  your cloud provider's security group, then try again."
-    echo ""
-    echo "  The token is this server's API password. It is stored root-only at"
-    echo "  $KEY_FILE and you can print it again with: sudo cat $KEY_FILE"
-    firewall_hint
-    echo ""
+    info "Retry any time with a fresh code: vaultguardian pair <code>"
+    return 0
 }
 
 # -------------------------------------------------------------------
@@ -1011,6 +1021,8 @@ if systemctl is-active --quiet observer; then
 
     info "Startup checks (up to ${STARTUP_TIMEOUT}s):"
     run_startup_checks
+
+    run_pairing
     echo ""
 
     if [ "$PRESERVE_ENV" = true ]; then
@@ -1037,29 +1049,21 @@ if systemctl is-active --quiet observer; then
     echo "  vaultguardian status    - Check health"
     echo "  vaultguardian stats     - Pipeline statistics"
     echo "  vaultguardian update    - Update to latest version"
+    echo "  vaultguardian pair      - Connect to the hosted dashboard"
 
-    # Dashboard block, always last.
-    if [ "$PRESERVE_ENV" = true ]; then
-        echo ""
-        if [ "$HOSTED_DASHBOARD" = true ]; then
-            info "Hosted dashboard: this server is set up for it (DASHBOARD_BIND_ADDR=0.0.0.0)."
-            info "Token for $DASHBOARD_URL: sudo cat $KEY_FILE"
-        else
-            info "To connect the hosted dashboard: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at $DASHBOARD_URL"
-        fi
-    elif [ "$HOSTED_DASHBOARD" = true ]; then
-        print_connect_steps
+    # Dashboard block, always last. The local API is loopback-only and stays
+    # that way; the hosted dashboard is a pairing away, not a port away.
+    echo ""
+    ok "Dashboard API: http://$DASHBOARD_BIND_ADDR:$DASHBOARD_PORT (local only)"
+    info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
+    # Only nudge a box that is actually unpaired. On the preserve path a blank
+    # code means "keep the pairing I already have", not "never paired".
+    if [ -z "$(env_value SYNC_URL)" ]; then
+        info "Hosted dashboard: get a pairing code at $DASHBOARD_URL, then run 'vaultguardian pair <code>'"
     else
-        # Bound to 127.0.0.1 (May 4 hardening): show the loopback + SSH
-        # tunnel path so we never advertise an address that won't accept
-        # connections, plus how to opt in to the hosted dashboard later.
-        echo ""
-        ok "Dashboard API: http://127.0.0.1:$DASHBOARD_PORT (loopback only)"
-        info "From another machine: ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT $(whoami)@$(hostname)"
-        info "To expose on LAN: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE and firewall the port"
-        info "To connect the hosted dashboard later: set DASHBOARD_BIND_ADDR=0.0.0.0 in $ENV_FILE, run 'vaultguardian restart', then add the server at $DASHBOARD_URL"
-        echo ""
+        ok "Hosted dashboard: paired (syncing outbound to $DASHBOARD_URL)"
     fi
+    echo ""
 else
     fail "Observer failed to start. Check: journalctl -u observer -n 50 --no-pager"
 fi

@@ -107,7 +107,9 @@ func runPairCLI(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: vaultguardian pair <code> [--url https://...] [--env %s]", defaultEnvPath)
+		// Flags first, then the code: flag.Parse stops at the first
+		// non-flag argument, so the reverse order lands right back here.
+		return fmt.Errorf("usage: vaultguardian pair [--url https://...] [--env %s] <code>", defaultEnvPath)
 	}
 
 	unit := *service

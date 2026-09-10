@@ -265,8 +265,9 @@ The installer prompts for:
 - Dashboard API port (default `9090`)
 - Resend API key, alert destination address, and sender ("From") address (optional). The From address defaults to Resend's pre-verified sandbox sender (`onboarding@resend.dev`), so email works out of the box before you've verified your own domain.
 - Whether to enable Response Evidence Capture (REC)
+- A hosted dashboard pairing code (optional; blank keeps the server local-only, and you can pair later with `vaultguardian pair <code>`)
 
-Re-running the installer over an existing install detects your `/etc/vaultguardian/observer.env` and **preserves it**: your settings (bind address, CORS allowlist, REC tuning, notifier config) are kept, the configuration prompts are skipped, and only the binary and systemd unit are refreshed. To change settings, edit the env file directly and `systemctl restart observer`; to reconfigure from scratch, remove the env file first. For binary-only upgrades, prefer `vaultguardian update`.
+Re-running the installer over an existing install detects your `/etc/vaultguardian/observer.env` and **preserves it**: your settings (CORS allowlist, REC tuning, notifier config, any existing pairing) are kept, the configuration prompts are skipped, and only the binary and systemd unit are refreshed. To change settings, edit the env file directly and `systemctl restart observer`; to reconfigure from scratch, remove the env file first. For binary-only upgrades, prefer `vaultguardian update`.
 
 Docker containers are monitored automatically if Docker is present. If not, Observer watches everything via journald. The policy engine, classification, and email alerts all work on a bare-metal server with nothing but `sshd`.
 
@@ -277,6 +278,7 @@ vaultguardian status          # Service status + recent logs
 vaultguardian logs            # Tail logs
 vaultguardian stats           # Pipeline performance
 vaultguardian rec status      # REC coverage + port status
+vaultguardian pair <code>     # Connect to the hosted dashboard
 vaultguardian update          # Update to latest release
 vaultguardian update v0.48    # Update to a specific version
 vaultguardian restart         # Restart observer
@@ -345,11 +347,11 @@ Additional REC tuning knobs exist (`REC_FLOW_*`, `REC_REASSEMBLY_MAX_BUFFERED_PA
 | Variable | Default | Description |
 |---|---|---|
 | `DASHBOARD_PORT` | `9090` | Port the API listens on |
-| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address; defaults to localhost only |
+| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address; local only, and the installer never writes anything else |
 | `DASHBOARD_KEY_FILE` | `/etc/vaultguardian/dashboard.key` | Path to bearer token file (auto-generated) |
 | `DASHBOARD_ALLOWED_ORIGINS` | (none) | Comma-separated CORS allowlist; empty = no CORS headers |
 
-> **Important:** the dashboard binds to `127.0.0.1` by default. If you change this to `0.0.0.0` to expose it on a network, do that behind a reverse proxy with TLS and authentication. Observer logs a warning when the dashboard is bound to a non-loopback address.
+> **Important:** this API is local. Connecting the [hosted dashboard](#dashboard) does **not** require changing it — Observer pairs and pushes outbound, so nothing connects in. The one reason to override `DASHBOARD_BIND_ADDR` is serving the API to your own LAN or to a reverse proxy on this host; do that behind TLS and authentication. Observer logs a warning when the dashboard is bound to a non-loopback address.
 
 ### Email alerts (optional)
 
@@ -397,7 +399,32 @@ When configured, escalation emails include the `HOSTNAME` (above) and the server
 
 ## Dashboard
 
-Observer exposes a REST API on the configured `DASHBOARD_PORT`, protected by a randomly generated bearer token stored at `/etc/vaultguardian/dashboard.key`.
+### Hosted dashboard (pairing)
+
+The multi-server dashboard is live at [app.vaultguardian.io](https://app.vaultguardian.io). It aggregates findings, events, and pipeline stats across your fleet.
+
+**The connection is outbound only.** Observer pairs once, then pushes to the dashboard on its own schedule. Nothing connects back to your server: there is no inbound port to open, no firewall rule to add, no security group to edit, and no reason to change `DASHBOARD_BIND_ADDR`.
+
+To connect a server:
+
+1. Open [app.vaultguardian.io](https://app.vaultguardian.io) and generate a pairing code.
+2. On the server, redeem it:
+
+```bash
+vaultguardian pair ABCD-1234
+```
+
+The installer also asks for a pairing code at the end of a fresh install; leaving it blank keeps the box local-only, and you can pair later with the command above. Codes are single-use and expire, so grab a fresh one if pairing is refused.
+
+Pairing claims the code, writes the `SYNC_*` variables into `/etc/vaultguardian/observer.env`, and restarts Observer. Re-running it against a new code re-pairs the instance and rotates the command-channel epoch, which invalidates anything issued under the old pairing. If a code is refused, Observer keeps running local-only — pairing never takes the monitor down.
+
+To go back to local-only, remove the `SYNC_*` lines from `observer.env` and restart. With `SYNC_URL`/`SYNC_TOKEN` unset, no sync code runs at all.
+
+The hosted dashboard stores the events Observer flags - including their log lines and redacted response previews - never your raw log stream. Self-hosted deployments send nothing to VaultGuardian.
+
+### Local API
+
+Observer exposes a REST API on the configured `DASHBOARD_PORT`, bound to `127.0.0.1` and protected by a randomly generated bearer token stored at `/etc/vaultguardian/dashboard.key`. It is unchanged by any of the above — pairing neither opens it up nor depends on it.
 
 The API provides:
 - Security findings (events, verdicts, evidence)
@@ -406,8 +433,6 @@ The API provides:
 - LLM decision audit trail
 - Trusted IP management
 - Policy rule status
-
-The multi-server dashboard is live at [app.vaultguardian.io](https://app.vaultguardian.io). Add your Observer instances, and the dashboard aggregates findings, events, and pipeline stats across your fleet.
 
 For operators who prefer direct API access, query the local endpoint:
 

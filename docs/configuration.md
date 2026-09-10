@@ -54,13 +54,20 @@ LLM_API_KEY=sk-xxxxxxxx
 | Variable | Default | Description |
 |---|---|---|
 | `DASHBOARD_PORT` | `9090` | Port the REST API listens on |
-| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address. Loopback-only by default. |
+| `DASHBOARD_BIND_ADDR` | `127.0.0.1` | Bind address. Loopback-only, and the installer never writes anything else. |
 | `DASHBOARD_KEY_FILE` | `/etc/vaultguardian/dashboard.key` | Bearer token file, auto-generated at `0600` on first start |
 | `DASHBOARD_ALLOWED_ORIGINS` | (none) | Comma-separated CORS allowlist. Empty = no CORS headers (correct for server-side proxy patterns). |
 
-> The dashboard binds to `127.0.0.1` by default. If you set
-> `DASHBOARD_BIND_ADDR=0.0.0.0` to expose it, do so behind a reverse proxy
-> with TLS and authentication, and firewall the port to known sources.
+> This API is local. The hosted dashboard does **not** reach it - Observer
+> pairs once and pushes findings outbound - so connecting a hosted dashboard
+> never requires changing the bind address or opening a port. See
+> [Dashboard](../README.md#dashboard) in the README.
+>
+> `DASHBOARD_BIND_ADDR` remains an override for one case only: serving this
+> API to your own LAN or to a reverse proxy on this host. If you use it, put
+> TLS and authentication in front of the API and restrict who can reach it.
+> Observer logs a warning whenever the dashboard is bound to a non-loopback
+> address.
 
 ## Email alerts (optional)
 
