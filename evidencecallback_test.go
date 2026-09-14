@@ -401,9 +401,11 @@ func TestEvidenceCallback_ClampedEventEscalates(t *testing.T) {
 	}
 	router.routeAlert(evt, &result, watcher.LogLine{})
 
-	// Drive the evidence check synchronously via the VIP push path.
+	// Drive the evidence check synchronously via the VIP push path. The key
+	// carries the Part 4 byte-count partition segment (the event line logs
+	// 83 response bytes).
 	_, nPath, _, _ := parseNormalizedLine(evt.NormalizedLine)
-	key := fmt.Sprintf("example.com|GET|%s|200", canonicalPath(nPath))
+	key := fmt.Sprintf("example.com|GET|%s|200|b=%d", canonicalPath(nPath), extractResponseBytes(evt.Line))
 	coord.TryResolveVIP(key)
 
 	select {
@@ -458,7 +460,7 @@ func TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd(t *testing.T) {
 	router.routeAlert(evt, &result, watcher.LogLine{})
 
 	_, nPath, _, _ := parseNormalizedLine(evt.NormalizedLine)
-	key := fmt.Sprintf("example.com|GET|%s|404", canonicalPath(nPath))
+	key := fmt.Sprintf("example.com|GET|%s|404|b=%d", canonicalPath(nPath), extractResponseBytes(evt.Line))
 	coord.TryResolveVIP(key)
 
 	select {
@@ -583,6 +585,40 @@ func TestEvidenceCallback_DeterministicDisclosureEscalates(t *testing.T) {
 			}
 			if got := h.stub.calls.Load(); got != 0 {
 				t.Errorf("LLM called %d times, want 0 (deterministic escalation must not consult the LLM)", got)
+			}
+			if rows := h.decisionRows(t); len(rows) != 0 {
+				t.Errorf("llm_decisions rows = %d, want 0", len(rows))
+			}
+		})
+	}
+}
+
+// TestEvidenceCallback_PHPSourceEscalatesAllStatuses: FormatPHP is fail-closed
+// (never a preview), and unlike PEM/passwd/dotenv its deterministic escalation
+// must fire on EVERY status - the Part 1 fix for served PHP source stalling on
+// HTTP 200 because the empty-preview disclosure arm was nested inside the
+// rejection-status tier block. Zero LLM calls, zero audit rows.
+func TestEvidenceCallback_PHPSourceEscalatesAllStatuses(t *testing.T) {
+	for _, status := range []int{200, 404, 403, 500} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			ev := reclassEvidence(status, "", 1, 0, "") // fail-closed: empty preview
+			ev.Disclosure.Format = rec.FormatPHP
+			ev.Disclosure.DisclosureSummary = "PHP SOURCE CODE DETECTED - METADATA ONLY"
+			h := newCallbackHarness(t, ev, verdictGenericDowngrade, 0, nil)
+
+			d := h.cb(reclassSnapshot("evt_php", "malicious"))
+
+			if !d.Escalated {
+				t.Fatalf("Escalated = false (downgraded=%v reason=%q), want true", d.Downgraded, d.Reason)
+			}
+			if d.NewSeverity != "malicious" {
+				t.Errorf("NewSeverity = %q, want \"malicious\"", d.NewSeverity)
+			}
+			if !strings.Contains(d.Reason, "PHP SOURCE CODE DETECTED") {
+				t.Errorf("reason %q does not carry the PHP disclosure summary", d.Reason)
+			}
+			if got := h.stub.calls.Load(); got != 0 {
+				t.Errorf("LLM called %d times, want 0 (deterministic escalation)", got)
 			}
 			if rows := h.decisionRows(t); len(rows) != 0 {
 				t.Errorf("llm_decisions rows = %d, want 0", len(rows))

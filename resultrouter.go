@@ -329,7 +329,43 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 		if hostKey == "" {
 			hostKey = "<unknown-host>"
 		}
-		correlationKey := fmt.Sprintf("%s|%s|%s|%d", hostKey, method, canonicalPath(normPath), statusCode)
+
+		// --- Part 4: byte-count key partition (limited Invariant-2 mitigation) ---
+		//
+		// Without it, Process() joins/suppresses on the request-derived key
+		// before anything looks at the response, so a divergent-length
+		// success could vanish into an active huddle or a graveyard
+		// tombstone. Partitioning by exact response byte count lets a
+		// different-length response open its own investigation. This is an
+		// ADMISSION HINT ONLY - byte counts never decide outcomes, and
+		// nothing may compare bytes to infer success/failure.
+		//
+		// "Reliable" = the parsed access-log byte count actually present for
+		// THIS event (respBytes > 0); never synthesized. Events with no
+		// count partition to "unknown".
+		//
+		// Documented trade-offs (design committee, on the record):
+		//   - Equal-length, same-status divergent outcomes still collapse
+		//     into one investigation (known Phase 2 gap).
+		//   - Events without byte counts partition to `unknown` and stop
+		//     joining sibling events that have counts.
+		//   - Compression/topology can split one logical request across
+		//     partitions (nginx "bytes sent" varies with encoding).
+		//   - An attacker varying response lengths can inflate the pending-
+		//     investigation count; the coordinator's existing
+		//     maxPendingInvestigations cap (100) is the backstop. (No
+		//     dedicated partition-inflated-eviction log: detecting it would
+		//     need coordinator-side changes, and Part 4 makes none.)
+		//
+		// Built ONCE, BEFORE both PinVIP and Process below, so evidence-push
+		// callbacks (tryEvidenceCheck applies async results by key) address
+		// the same investigation the event joined - partitioning avoids the
+		// replace-in-place race and nothing may reintroduce it.
+		byteSegment := "b=unknown"
+		if respBytes > 0 {
+			byteSegment = fmt.Sprintf("b=%d", respBytes)
+		}
+		correlationKey := fmt.Sprintf("%s|%s|%s|%d|%s", hostKey, method, canonicalPath(normPath), statusCode, byteSegment)
 
 		// Fix 1: Pin VIP evidence for malicious AND suspicious (Alert) events.
 		// The collector stores match criteria in a protected map that
