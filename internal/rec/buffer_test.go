@@ -33,7 +33,7 @@ func lookupPath(rb *RingBuffer, path string) []CapturedResponse {
 }
 
 func TestInsertBelowAllCaps(t *testing.T) {
-	rb := NewRingBuffer(BufferConfig{
+	rb := mustRing(BufferConfig{
 		MaxEntries:    100,
 		MaxTotalBytes: 1 << 20,
 		MaxAge:        time.Hour,
@@ -49,7 +49,12 @@ func TestInsertBelowAllCaps(t *testing.T) {
 	if s.Entries != 3 {
 		t.Fatalf("Entries = %d, want 3", s.Entries)
 	}
-	wantBytes := int64(3 * (body + approxEntryOverheadBytes))
+	// Part 2: accounting also charges the owned variable strings
+	// (Path/Host/UserAgent/ContentType) - here just the 4-byte "/p/N" path.
+	// Part 3: the three IDENTICAL 100-byte bodies intern to ONE shared body,
+	// charged once (bytes + store overhead); entries charge only their own
+	// records.
+	wantBytes := int64(3*(len("/p/0")+approxEntryOverheadBytes) + (body + bodyStoreOverheadBytes))
 	if s.TotalBytes != wantBytes {
 		t.Fatalf("TotalBytes = %d, want %d", s.TotalBytes, wantBytes)
 	}
@@ -64,18 +69,17 @@ func TestInsertBelowAllCaps(t *testing.T) {
 }
 
 func TestMemoryPressureEvictsOldestFirst(t *testing.T) {
-	// Each entry is 100 (body) + 256 (overhead) = 356 bytes. An 800-byte
-	// ceiling holds two entries; the third forces an oldest-first eviction.
-	rb := NewRingBuffer(BufferConfig{
-		MaxEntries:    100, // large, so capacity never binds - only bytes do
-		MaxTotalBytes: 800,
-		MaxAge:        time.Hour,
-		MaxBodyBytes:  2048,
-	})
+	// Part 3: bodies must be DISTINCT (identical bodies intern to one shared
+	// charge and never build pressure). Each insert costs ~258 (entry record)
+	// + ~2256 (unique 2000-byte body + store overhead) ≈ 2514 bytes: a
+	// 6000-byte EFFECTIVE ceiling (fix round v3: geometry is expressed as an
+	// effective budget, above the tiny-budget guard's worst-case-entry
+	// threshold) holds two; the third forces an oldest-first eviction.
+	rb := mustRing(cfgWithEffective(3, 6000, 2048))
 
-	rb.Insert(makeResp("/a", make([]byte, 100)))
-	rb.Insert(makeResp("/b", make([]byte, 100)))
-	rb.Insert(makeResp("/c", make([]byte, 100)))
+	rb.Insert(makeResp("/a", bytes.Repeat([]byte("a"), 2000)))
+	rb.Insert(makeResp("/b", bytes.Repeat([]byte("b"), 2000)))
+	rb.Insert(makeResp("/c", bytes.Repeat([]byte("c"), 2000)))
 
 	if got := lookupPath(rb, "/a"); len(got) != 0 {
 		t.Fatalf("oldest entry /a should have been evicted under byte pressure, found %d", len(got))
@@ -97,7 +101,7 @@ func TestMemoryPressureEvictsOldestFirst(t *testing.T) {
 }
 
 func TestAgeBackstopEvictsExpiredEntries(t *testing.T) {
-	rb := NewRingBuffer(BufferConfig{
+	rb := mustRing(BufferConfig{
 		MaxEntries:    100,
 		MaxTotalBytes: 1 << 20,
 		MaxAge:        50 * time.Millisecond,
@@ -126,7 +130,7 @@ func TestAgeBackstopEvictsExpiredEntries(t *testing.T) {
 func TestCapacityWrapEvictsOnFullEntryArray(t *testing.T) {
 	// Byte and age caps are effectively disabled, so the circular entry
 	// array is the only constraint that can bind.
-	rb := NewRingBuffer(BufferConfig{
+	rb := mustRing(BufferConfig{
 		MaxEntries:    2,
 		MaxTotalBytes: 1 << 30,
 		MaxAge:        time.Hour,
@@ -158,7 +162,7 @@ func TestCapacityWrapEvictsOnFullEntryArray(t *testing.T) {
 
 func TestBodyPreviewTruncatedToMaxBodyBytes(t *testing.T) {
 	const maxBody = 10
-	rb := NewRingBuffer(BufferConfig{
+	rb := mustRing(BufferConfig{
 		MaxEntries:    100,
 		MaxTotalBytes: 1 << 20,
 		MaxAge:        time.Hour,
@@ -172,19 +176,24 @@ func TestBodyPreviewTruncatedToMaxBodyBytes(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 candidate, got %d", len(got))
 	}
-	if len(got[0].BodyPreview) != maxBody {
-		t.Fatalf("BodyPreview length = %d, want %d (should be truncated to MaxBodyBytes)",
-			len(got[0].BodyPreview), maxBody)
+	// Part 3: stored entries hold the preview through the interned body
+	// store - read it via the accessor.
+	if len(got[0].BodyPreviewBytes()) != maxBody {
+		t.Fatalf("BodyPreviewBytes length = %d, want %d (should be truncated to MaxBodyBytes)",
+			len(got[0].BodyPreviewBytes()), maxBody)
 	}
 }
 
 func TestEvictionsTotalEqualsSumOfReasons(t *testing.T) {
-	rb := NewRingBuffer(BufferConfig{
-		MaxEntries:    3,
-		MaxTotalBytes: 2000,
-		MaxAge:        40 * time.Millisecond,
-		MaxBodyBytes:  4096,
-	})
+	// Fix round v3 geometry: a 6000-byte EFFECTIVE budget (above the
+	// tiny-budget guard's worst-case-entry threshold, so the 3-slot array
+	// survives construction) with 2000-byte DISTINCT bodies - two large
+	// entries fit, the third forces byte-pressure eviction without any
+	// single entry's worst case exceeding the budget (which would be an
+	// oversized rejection, not an eviction).
+	cfg := cfgWithEffective(3, 6000, 2048)
+	cfg.MaxAge = 40 * time.Millisecond
+	rb := mustRing(cfg)
 
 	// Capacity pressure: five small entries into a 3-slot array.
 	for i := 0; i < 5; i++ {
@@ -195,8 +204,11 @@ func TestEvictionsTotalEqualsSumOfReasons(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	rb.Insert(makeResp("/age", nil))
 
-	// Byte pressure: a single oversized entry forces oldest-first byte eviction.
-	rb.Insert(makeResp("/big", make([]byte, 1900)))
+	// Byte pressure: two large distinct bodies fit alongside /age; the third
+	// exceeds the effective budget and forces oldest-first byte eviction.
+	rb.Insert(makeResp("/big1", bytes.Repeat([]byte("1"), 2000)))
+	rb.Insert(makeResp("/big2", bytes.Repeat([]byte("2"), 2000)))
+	rb.Insert(makeResp("/big3", bytes.Repeat([]byte("3"), 2000)))
 
 	s := rb.Stats()
 	if s.EvictionsTotal != s.EvictionsAge+s.EvictionsBytes+s.EvictionsCapacity {

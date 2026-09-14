@@ -32,7 +32,7 @@ func pairingStream(s *sniffer) *httpStream {
 }
 
 func TestPairedResponseCarriesRequestTimestamp(t *testing.T) {
-	s := newSniffer(NewRingBuffer(DefaultBufferConfig()), "", []int{80}, 64,
+	s := newSniffer(mustRing(DefaultBufferConfig()), "", []int{80}, 64,
 		DefaultMaxBodyBytes, DefaultVXLANPort, false,
 		DefaultReassemblyConfig(), DefaultFlowConfig())
 
@@ -69,7 +69,7 @@ func TestPairedResponseCarriesRequestTimestamp(t *testing.T) {
 }
 
 func TestOrphanResponseHasNoRequestTimestamp(t *testing.T) {
-	s := newSniffer(NewRingBuffer(DefaultBufferConfig()), "", []int{80}, 64,
+	s := newSniffer(mustRing(DefaultBufferConfig()), "", []int{80}, 64,
 		DefaultMaxBodyBytes, DefaultVXLANPort, false,
 		DefaultReassemblyConfig(), DefaultFlowConfig())
 
@@ -92,7 +92,7 @@ func TestOrphanResponseHasNoRequestTimestamp(t *testing.T) {
 // the existing collector tests (collector_test.go).
 func testEvidenceCollector() *liveCollector {
 	lc := &liveCollector{
-		buffer:      NewRingBuffer(DefaultBufferConfig()),
+		buffer:      mustRing(DefaultBufferConfig()),
 		vipPins:     make(map[string]*vipPin),
 		vipEvidence: make(map[string]CapturedResponse),
 	}

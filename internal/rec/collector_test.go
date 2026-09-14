@@ -76,7 +76,7 @@ func TestMatchesVIP_NginxEscapedPath(t *testing.T) {
 // coordinator's evidence check (also escaped) then finds the promoted evidence.
 func TestPinVIP_EscapedPathMatchesLiteralCapture(t *testing.T) {
 	lc := &liveCollector{
-		buffer:      NewRingBuffer(DefaultBufferConfig()),
+		buffer:      mustRing(DefaultBufferConfig()),
 		vipPins:     make(map[string]*vipPin),
 		vipEvidence: make(map[string]CapturedResponse),
 	}

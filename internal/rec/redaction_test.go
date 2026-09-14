@@ -313,7 +313,7 @@ func TestClassifyAndRedact_SensitiveRedactionCounts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := classifyAndRedact([]byte(tt.body), tt.contentType)
+			a := classifyAndRedact([]byte(tt.body), tt.contentType, true)
 			if a.Format != tt.wantFormat {
 				t.Fatalf("Format = %q, want %q", a.Format, tt.wantFormat)
 			}
@@ -377,7 +377,7 @@ func TestDetectFormat_PEMPrivateKeys(t *testing.T) {
 
 func TestClassifyAndRedact_PEMFailClosed(t *testing.T) {
 	body := []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7bq0\n-----END RSA PRIVATE KEY-----\n")
-	a := classifyAndRedact(body, "text/plain")
+	a := classifyAndRedact(body, "text/plain", true)
 	if a.Format != FormatPEM {
 		t.Fatalf("Format = %q, want %q", a.Format, FormatPEM)
 	}
@@ -408,7 +408,7 @@ func TestClassifyAndRedact_FailClosedPathsCountZero(t *testing.T) {
 		{"unknown format", []byte("just some plain text with no structure"), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := classifyAndRedact(tc.body, tc.contentType)
+			a := classifyAndRedact(tc.body, tc.contentType, true)
 			if a.SensitiveRedactions != 0 {
 				t.Errorf("SensitiveRedactions = %d, want 0", a.SensitiveRedactions)
 			}

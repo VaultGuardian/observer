@@ -15,7 +15,7 @@ import (
 // use, plus the captures map.
 func bareCollector() *liveCollector {
 	return &liveCollector{
-		buffer:      NewRingBuffer(DefaultBufferConfig()),
+		buffer:      mustRing(DefaultBufferConfig()),
 		captures:    make(map[string]*namespaceCapture),
 		vipPins:     make(map[string]*vipPin),
 		vipEvidence: make(map[string]CapturedResponse),

@@ -249,8 +249,10 @@ func statusCodeRejectsAttack(code int) bool {
 // and the cache-hit status shortcut in resultrouter.go - one helper so the two
 // gates cannot drift.
 //
-// True only for format identity: passwd, dotenv, or PEM private-key material,
-// which the REC detectors only ever emit at high confidence. Deliberately NOT
+// True only for format identity: passwd, dotenv, PEM private-key material,
+// or served PHP source (Part 1, flood release - source disclosure IS the
+// impact regardless of status), which the REC detectors only ever emit at
+// high confidence. Deliberately NOT
 // keyed on Disclosure.SensitiveRedactions - that counter increments for every
 // href/src/meta-content in HTML and every long string or email in JSON, so a
 // styled 404 page would count as "disclosing." Bodies with redaction counts
@@ -268,6 +270,12 @@ func deterministicDisclosure(ev *rec.Evidence) (bool, string) {
 		return true, fmt.Sprintf(
 			"Captured response body discloses sensitive data despite rejection status: %s (%d sensitive values redacted)",
 			ev.Disclosure.DisclosureSummary, ev.Disclosure.SensitiveRedactions)
+	case rec.FormatPHP:
+		// Status-neutral wording (FIX 6b): PHP-source escalation fires on
+		// EVERY status - "despite rejection status" would be wrong on a 200.
+		return true, fmt.Sprintf(
+			"Captured response body discloses served source code: %s",
+			ev.Disclosure.DisclosureSummary)
 	}
 	return false, ""
 }

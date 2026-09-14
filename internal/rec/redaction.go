@@ -39,6 +39,33 @@ func detectFormat(body []byte, contentType string) (DetectedFormat, Confidence) 
 		return FormatPEM, ConfidenceHigh
 	}
 
+	// --- Served PHP source (checked BEFORE the Content-Type paths) ---
+	// Same rationale as PEM: PHP source served as text/html would take the
+	// ct == "text/html" fast path below and redactHTML would keep the source
+	// as "visible text" - leaking credentials, connection strings, and logic
+	// into the preview. The predicate anchors at body start only (see
+	// LooksLikePHPSource); high confidence is in the FORMAT identity - the
+	// preview is still withheld fail-closed in classifyAndRedact.
+	if LooksLikePHPSource(body) {
+		return FormatPHP, ConfidenceHigh
+	}
+
+	// --- Markup-prologue three-way dispatch (checked BEFORE the
+	// Content-Type paths; FIX 3, fix round v3) ---
+	// WordPress serves xmlrpc.php fault bodies as text/html; misleading MIME
+	// is a required capture, so this must pre-empt the Content-Type switch.
+	// XML rejection must never fall back to permissive HTML: anything
+	// XML-ish - declarations, comments, non-html DOCTYPEs, malformed or
+	// oversized prologues - classifies FormatXML and stays withheld unless
+	// the XML-RPC redactor (the sole acceptance authority) accepts it. Only
+	// the token-bounded HTML doctype takes the HTML path here.
+	switch classifyMarkupPrologue(body) {
+	case prologueHTMLDoctype:
+		return FormatHTML, ConfidenceHigh
+	case prologueXML:
+		return FormatXML, ConfidenceHigh
+	}
+
 	// --- Content-Type header (highest signal) ---
 	switch {
 	case ct == "application/json" || ct == "text/json":
@@ -142,6 +169,266 @@ func pemKeyType(body []byte) string {
 		}
 	}
 	return ""
+}
+
+// redactorVersion identifies the redaction ruleset revision. The Part 3 body
+// store keys interned disclosure analyses on it so an analysis produced under
+// old rules can never be reused after the rules change. Bump on EVERY change
+// to detection or redaction behavior in this package.
+//
+// v2 (fix round v3): the FIX 3 three-way prologue dispatch reroutes
+// DOCTYPE/comment-led bodies from FormatHTML to FormatXML, changing what a
+// cached analysis would say for the same bytes.
+const redactorVersion = 2
+
+// redactorMaxOutputBytes is the maximum retained redacted-preview size of
+// the CAPPED redactors, used for worst-case budget ADMISSION estimates (it
+// is an OUTPUT cap - MaxBodyBytes caps input, not output). Derivation:
+//   - redactXMLRPC:  xmlrpcMaxOutputBytes            = 2048
+//   - redactHTML:    2048 + len("...[TRUNCATED]")    = 2062
+//   - redactJSON:    2048 + len("\n...[TRUNCATED]")  = 2063  ← max
+//   - fail-closed formats (PEM/PHP/binary/unknown, rejected XML): 0
+//
+// redactDotenv and redactPasswd have NO output cap and can EXPAND
+// pathological input (many tiny lines each growing a "[REDACTED]" marker)
+// past this constant, so admission estimates built on it can UNDERSTATE for
+// such bodies. That is safe: the ACTUAL retained preview length is always
+// charged exactly (internedBody.byteCharge), and the post-eviction
+// admission recheck in Insert compares real totals, so any underestimate is
+// caught there rather than breaching the budget.
+const redactorMaxOutputBytes = 2063
+
+// utf8BOM is the UTF-8 byte-order mark, optionally present at body start.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// trimBOMAndSpace strips an optional leading UTF-8 BOM and leading whitespace.
+// Shared by the PHP and XML body-start predicates and the XML-RPC redactor so
+// all three anchor at the same "start of document" position.
+func trimBOMAndSpace(body []byte) []byte {
+	body = bytes.TrimPrefix(body, utf8BOM)
+	return bytes.TrimLeftFunc(body, unicode.IsSpace)
+}
+
+// LooksLikePHPSource reports whether the body preview is served (unexecuted)
+// PHP source: after an optional UTF-8 BOM and leading whitespace, the body
+// starts with the exact marker "<?php" followed by whitespace, '/', or
+// end-of-preview. NOT any "<?" short tag, NOT keyed on the URL ending in
+// .php, and NOT matched anywhere but the anchored body start - a normal HTML
+// page produced by EXECUTED PHP, or documentation quoting "<?php" mid-page,
+// must not classify as PHP source.
+//
+// Exported as the single shared definition of the predicate (used by format
+// detection here and available to callers outside the package) - one
+// definition, no copies.
+func LooksLikePHPSource(body []byte) bool {
+	b := trimBOMAndSpace(body)
+	const marker = "<?php"
+	if !bytes.HasPrefix(b, []byte(marker)) {
+		return false
+	}
+	if len(b) == len(marker) {
+		return true // end-of-preview directly after the marker
+	}
+	switch b[len(marker)] {
+	case ' ', '\t', '\r', '\n', '\v', '\f', '/':
+		return true
+	}
+	return false
+}
+
+// =============================================================================
+// Markup-prologue three-way dispatch (FIX 3, fix round v3)
+// =============================================================================
+//
+// Governing rule: an XML rejection must never be undone by HTML fallback.
+// Suspicious or unsupported XML prologue = FormatXML = withheld unless the
+// XML-RPC redactor (unchanged, the sole acceptance authority) accepts it.
+
+type markupPrologue int
+
+const (
+	// prologueNone: not XML-ish and not an HTML doctype - the caller falls
+	// through to the existing behavior (Content-Type switch, sniffs, the
+	// generic '<' branch).
+	prologueNone markupPrologue = iota
+	// prologueHTMLDoctype: token-bounded "<!doctype html" - the existing
+	// FormatHTML/ConfidenceHigh path.
+	prologueHTMLDoctype
+	// prologueXML: XML-ish - FormatXML, ALWAYS, regardless of what follows.
+	prologueXML
+)
+
+// markupPrologueScanBytes bounds how far the dispatcher examines the
+// prologue. A prologue construct still unresolved at this bound is treated
+// as XML (fail closed), never scanned further.
+const markupPrologueScanBytes = 512
+
+// classifyMarkupPrologue dispatches a body's leading markup, after an
+// optional UTF-8 BOM and leading whitespace, within a bounded scan:
+//
+//	(i)   "<!doctype" + whitespace + "html" + boundary, case-insensitive,
+//	      AND the remainder of the declaration closes cleanly with '>'
+//	      (quote-aware scan, see htmlDoctypeTail) → prologueHTMLDoctype.
+//	      "htmlfoo" does NOT qualify; neither does an internal subset
+//	      ('[' before '>'), an unclosed/truncated declaration ("<!DOCTYPE
+//	      html" at end of preview), or one exceeding the scan bound - all
+//	      of those are (ii).
+//	(ii)  XML-ish → prologueXML, always: an "<?xml" declaration (case-
+//	      insensitive - "<?XML" is a reserved/invalid PI name, fail closed);
+//	      a leading XML comment "<!--" (comment-led documents route to the
+//	      redactor whatever follows, and it rejects comments); any OTHER
+//	      "<!doctype ..." (non-html name, internal subset '[', no
+//	      whitespace, truncated, unclosed); a prologue construct cut off by
+//	      the preview or the scan bound. Also the declaration-less XML-RPC
+//	      root "<methodResponse" - retained from the Part 1 locked spec
+//	      ("the first element token is <methodResponse"): dropping it would
+//	      regress the required declaration-less XML-RPC acceptance.
+//	(iii) anything else → prologueNone (existing behavior).
+func classifyMarkupPrologue(body []byte) markupPrologue {
+	b := trimBOMAndSpace(body)
+	if len(b) > markupPrologueScanBytes {
+		b = b[:markupPrologueScanBytes]
+	}
+	if len(b) == 0 || b[0] != '<' {
+		return prologueNone
+	}
+
+	// XML declaration (case-insensitive: the canonical decl is lowercase,
+	// and a "<?XML"-style reserved PI is fail-closed XML, not HTML).
+	if hasFoldPrefix(b, "<?xml") {
+		return prologueXML
+	}
+	// Leading XML comment - closed or unclosed, whatever follows.
+	if bytes.HasPrefix(b, []byte("<!--")) {
+		return prologueXML
+	}
+	// Declaration-less XML-RPC root (Part 1 route, retained).
+	if hasElementTokenPrefix(b, "<methodResponse") {
+		return prologueXML
+	}
+
+	if len(b) >= 2 && b[1] == '!' {
+		if hasFoldPrefix(b, "<!doctype") {
+			rest := b[len("<!doctype"):]
+			// (i) requires whitespace, then the name "html", then a clean
+			// token boundary, AND (FIX A, fix round v4) a well-formed
+			// remainder of the SAME declaration: scanned to its closing
+			// '>' with quoted literals respected. An unquoted '[' (internal
+			// subset - the DTD-smuggling shape), an unclosed declaration,
+			// or one running past the scan bound is XML, fail closed.
+			// Everything else - other names, "htmlfoo", missing whitespace
+			// - is (ii).
+			j := 0
+			for j < len(rest) && isMarkupSpace(rest[j]) {
+				j++
+			}
+			if j > 0 && len(rest[j:]) >= 4 && foldEqualASCII(rest[j:j+4], "html") {
+				after := rest[j+4:]
+				if len(after) > 0 && (after[0] == '>' || isMarkupSpace(after[0])) {
+					return htmlDoctypeTail(after)
+				}
+				// Truncated right after the name: unclosed declaration.
+			}
+			return prologueXML
+		}
+		// The preview ends mid-token in a way that could still become a
+		// doctype or comment: an unclosed prologue → XML (fail closed).
+		if isWholeTruncatedPrefixOf(b, "<!doctype") || isWholeTruncatedPrefixOf(b, "<!--") {
+			return prologueXML
+		}
+		// Other "<!" constructs (e.g. "<![CDATA[") keep existing behavior.
+		return prologueNone
+	}
+
+	return prologueNone
+}
+
+// htmlDoctypeTail (FIX A, fix round v4) scans the remainder of an
+// "<!doctype html"-led declaration - tail starts at the byte after the name
+// token, already bounded by markupPrologueScanBytes - for its closing '>',
+// respecting single- and double-quoted literals: a '>' or '[' INSIDE quotes
+// neither terminates the declaration nor trips the subset check, so legacy
+// PUBLIC/SYSTEM doctypes with quoted identifiers keep the HTML path.
+//
+//   - unquoted '[' before the closing '>' → prologueXML (internal subset:
+//     the "<!DOCTYPE html [<!ENTITY ...>]>" DTD-smuggling shape must never
+//     reach the permissive HTML redactor),
+//   - no closing '>' within the bound (unclosed, truncated, over-limit, or
+//     an unterminated quote) → prologueXML,
+//   - clean unquoted '>' → prologueHTMLDoctype.
+func htmlDoctypeTail(tail []byte) markupPrologue {
+	var quote byte // 0 = not inside a quoted literal
+	for i := 0; i < len(tail); i++ {
+		c := tail[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '[':
+			return prologueXML
+		case '>':
+			return prologueHTMLDoctype
+		}
+	}
+	return prologueXML
+}
+
+// hasElementTokenPrefix reports whether b starts with the element token tok
+// (e.g. "<methodResponse") at a clean token boundary or end-of-preview.
+func hasElementTokenPrefix(b []byte, tok string) bool {
+	if !bytes.HasPrefix(b, []byte(tok)) {
+		return false
+	}
+	if len(b) == len(tok) {
+		return true // truncated right after the element name
+	}
+	switch b[len(tok)] {
+	case '>', ' ', '\t', '\r', '\n', '/':
+		return true
+	}
+	return false
+}
+
+// hasFoldPrefix reports whether b starts with prefix, ASCII case-insensitive.
+func hasFoldPrefix(b []byte, prefix string) bool {
+	return len(b) >= len(prefix) && foldEqualASCII(b[:len(prefix)], prefix)
+}
+
+// isWholeTruncatedPrefixOf reports whether b is the ENTIRE (scan-bounded)
+// input and a proper case-insensitive prefix of tok - i.e. the preview ended
+// mid-token.
+func isWholeTruncatedPrefixOf(b []byte, tok string) bool {
+	return len(b) < len(tok) && foldEqualASCII(b, tok[:len(b)])
+}
+
+// foldEqualASCII compares b to s, ASCII case-insensitive.
+func foldEqualASCII(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		c, d := b[i], s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if 'A' <= d && d <= 'Z' {
+			d += 'a' - 'A'
+		}
+		if c != d {
+			return false
+		}
+	}
+	return true
+}
+
+// isMarkupSpace reports ASCII markup whitespace.
+func isMarkupSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
 }
 
 // looksLikePasswd checks if the content appears to be a Unix passwd/shadow file.
@@ -762,9 +1049,12 @@ func redactPasswd(body []byte) (string, int) {
 // redacted preview safe for LLM re-classification. Exported for use by
 // the catch-all verification pipeline.
 //
-// IMPORTANT: operates on the TRUNCATED body preview
-func ClassifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalysis {
-	return classifyAndRedact(bodyPreview, contentType)
+// IMPORTANT: operates on the TRUNCATED body preview. bodyComplete reports
+// whether the preview covers the ENTIRE HTTP body (clean end-of-body read,
+// nothing truncated) - required by the XML-RPC redactor; len(preview) and
+// Content-Length are NOT proof of completeness.
+func ClassifyAndRedact(bodyPreview []byte, contentType string, bodyComplete bool) *DisclosureAnalysis {
+	return classifyAndRedact(bodyPreview, contentType, bodyComplete)
 }
 
 // IMPORTANT: classifyAndRedact operates on the TRUNCATED body preview
@@ -776,7 +1066,7 @@ func ClassifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 //   If format is unknown, no body preview at all. Only transport metadata.
 //   Content-Length: 45032 on a 404 path IS the evidence.
 
-func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalysis {
+func classifyAndRedact(bodyPreview []byte, contentType string, bodyComplete bool) *DisclosureAnalysis {
 	if len(bodyPreview) == 0 {
 		return &DisclosureAnalysis{
 			Format:              FormatUnknown,
@@ -805,6 +1095,29 @@ func classifyAndRedact(bodyPreview []byte, contentType string) *DisclosureAnalys
 	case FormatHTML:
 		analysis.redactedPreview, analysis.SensitiveRedactions = redactHTML(bodyPreview)
 		analysis.DisclosureSummary = "HTML CONTENT DETECTED"
+	case FormatXML:
+		// Narrow XML-RPC redactor. Success grants high confidence; ANY
+		// failure fails closed - recognizing XML does not grant confidence.
+		if preview, count, ok := redactXMLRPC(bodyPreview, bodyComplete); ok {
+			analysis.redactedPreview = preview
+			analysis.SensitiveRedactions = count
+			analysis.RedactionConfidence = ConfidenceHigh
+			analysis.DisclosureSummary = "XML-RPC RESPONSE STRUCTURE DETECTED"
+		} else {
+			analysis.redactedPreview = ""
+			analysis.RedactionConfidence = ConfidenceNone
+			analysis.SensitiveRedactions = 0
+			analysis.DisclosureSummary = "XML CONTENT DETECTED - METADATA ONLY"
+		}
+	case FormatPHP:
+		// Fail closed, PEM-style: served PHP source IS the disclosure, so no
+		// preview is ever emitted - escalation keys off Format identity.
+		// SensitiveRedactions is forced to 1 so count-based logic (the Lane A
+		// benign-cache gate) treats this body as disclosing.
+		analysis.redactedPreview = ""
+		analysis.RedactionConfidence = ConfidenceNone
+		analysis.SensitiveRedactions = 1
+		analysis.DisclosureSummary = "PHP SOURCE CODE DETECTED - METADATA ONLY"
 	case FormatPEM:
 		// Fail closed: never preview key material, not even redacted - the
 		// armor header alone is the disclosure. SensitiveRedactions is

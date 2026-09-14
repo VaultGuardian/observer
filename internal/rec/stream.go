@@ -254,6 +254,29 @@ func (s *httpStream) run() {
 // waiting request (or queue as orphan), then inserts into the ring buffer
 // and fires onCapture - all OUTSIDE any flow lock.
 
+// readBodyPreview reads up to maxBody bytes of a response body as the
+// evidence preview and reports whether the FULL body was cleanly consumed.
+// It reads maxBody+1 bytes so "exactly maxBody" and "more than maxBody" are
+// distinguishable; more than maxBody bytes, or any read error before a clean
+// end (drain included), means incomplete. The returned preview never exceeds
+// maxBody. len(preview) and Content-Length are NOT proof of completeness.
+//
+// The drain keeps the v0.42.3 deadlock fix: the remainder of the body MUST
+// be consumed so tcpassembly does not wedge - but its error now feeds the
+// completeness flag instead of being discarded.
+func readBodyPreview(body io.Reader, maxBody int) ([]byte, bool) {
+	buf, err := io.ReadAll(io.LimitReader(body, int64(maxBody)+1))
+	complete := err == nil
+	if len(buf) > maxBody {
+		buf = buf[:maxBody] // do not retain more than the preview cap
+		complete = false
+	}
+	if _, drainErr := io.Copy(io.Discard, body); drainErr != nil {
+		complete = false
+	}
+	return buf, complete
+}
+
 func (s *httpStream) runResponse(r *bufio.Reader) {
 	fk := s.flowKey()
 
@@ -268,11 +291,9 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 			return
 		}
 
-		// Capture up to maxBody bytes as evidence preview.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
-
-		// CRITICAL: drain the REMAINDER of the response body. (v0.42.3 fix.)
-		io.Copy(io.Discard, resp.Body)
+		// Capture up to maxBody bytes as evidence preview, tracking whether
+		// the FULL body was cleanly read (Part 1 completeness flag).
+		body, bodyComplete := readBodyPreview(resp.Body, s.maxBody)
 		resp.Body.Close()
 
 		bodyHash := HashBody(body)
@@ -289,6 +310,7 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 			ContentLength:   contentLength,
 			BodyPreview:     body,
 			BodyPreviewHash: bodyHash,
+			BodyComplete:    bodyComplete,
 		}
 
 		// Pair with waiting request via the flow state.
@@ -304,10 +326,10 @@ func (s *httpStream) runResponse(r *bufio.Reader) {
 			captured.RequestTimestamp = pendingReq.timestamp
 
 			// Insert into ring buffer and fire VIP callback OUTSIDE flow lock.
-			s.sniffer.buffer.Insert(captured)
-			if s.sniffer.onCapture != nil {
-				s.sniffer.onCapture(captured)
-			}
+			// The callback receives the STORED form (CaptureID assigned, body
+			// interned); deliverCapture drops rejected inserts (FIX 2d).
+			captured = s.sniffer.buffer.Insert(captured)
+			s.sniffer.deliverCapture(captured)
 		}
 		// If pendingReq == nil, the response was queued in flow.responses.
 		// The cleanup loop will expire it as an orphan after 2s, insert it

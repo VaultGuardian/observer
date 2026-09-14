@@ -568,13 +568,27 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"buffer_evictions_capacity": rStats.BufferEvictionsCapacity,
 			"buffer_evictions_age":      rStats.BufferEvictionsAge,
 			"buffer_evictions_bytes":    rStats.BufferEvictionsBytes,
-			"vip_pins":                  rStats.VIPPins,
-			"vip_evidence":              rStats.VIPEvidence,
-			"vip_capacity":              rStats.VIPMaxEntries,
-			"vip_capacity_evictions":    rStats.VIPCapacityEvictions,
-			"vip_expirations":           rStats.VIPExpirations,
-			"reassembly_stream_drops":   rStats.ReassemblyStreamDrops,
-			"flow_evictions_live":       rStats.FlowEvictionsLive,
+			// Part 2/v3/v4 loss counters. buffer_demanded_evidence_evicted:
+			// a known-demand RING entry was evicted; the promoted VIP copy,
+			// if any, may still hold the evidence - not proof the evidence
+			// was lost. rejected_oversized = the conservative worst-case
+			// ESTIMATE exceeded the effective budget (not proof the actual
+			// entry could never fit); rejected_budget = current owners
+			// occupy the space. The evicted_{ever,never}_selected split is
+			// telemetry only - "selected" is not "consumed".
+			"buffer_rejected_oversized":        rStats.BufferRejectedOversized,
+			"buffer_rejected_budget":           rStats.BufferRejectedBudget,
+			"buffer_demanded_evidence_evicted": rStats.BufferDemandedEvidenceEvicted,
+			"buffer_vip_reacquire_rejected":    rStats.BufferVIPReacquireRejected,
+			"buffer_evicted_ever_selected":     rStats.BufferEvictedEverSelected,
+			"buffer_evicted_never_selected":    rStats.BufferEvictedNeverSelected,
+			"vip_pins":                         rStats.VIPPins,
+			"vip_evidence":                     rStats.VIPEvidence,
+			"vip_capacity":                     rStats.VIPMaxEntries,
+			"vip_capacity_evictions":           rStats.VIPCapacityEvictions,
+			"vip_expirations":                  rStats.VIPExpirations,
+			"reassembly_stream_drops":          rStats.ReassemblyStreamDrops,
+			"flow_evictions_live":              rStats.FlowEvictionsLive,
 		},
 		"normalizer": map[string]interface{}{
 			"scopes_created_total": scopeStats.ScopesCreatedTotal,

@@ -182,7 +182,7 @@ func LoadConfig() Config {
 		RECLearnedPortCap: 64,
 
 		// REC evidence buffer (v1.0 burst hardening).
-		RECBufferMaxEntries: getEnvInt("REC_BUFFER_MAX_ENTRIES", 10000),
+		RECBufferMaxEntries: getEnvInt("REC_BUFFER_MAX_ENTRIES", 32768),
 		RECBufferMaxBytes:   getEnvInt64("REC_BUFFER_MAX_BYTES", 128*1024*1024),
 		RECBufferMaxMB:      getEnvInt("REC_BUFFER_MAX_MB", 64),
 		RECBufferMaxAge:     getEnvDuration("REC_BUFFER_MAX_AGE", 10*time.Minute),

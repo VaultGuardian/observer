@@ -1130,6 +1130,30 @@ func makeEvidenceCheckCallback(
 			return coordinator.EvidenceDecision{}
 		}
 
+		// --- FormatPHP deterministic escalation (Part 1, flood release) ---
+		// Served PHP source is fail-closed (never a preview), so the
+		// rejection-status tier block above covers only 403/404/405/410 and a
+		// 200 serving raw PHP source would stall in the empty-preview early
+		// return below. This narrow branch runs for ALL statuses and mirrors
+		// the Tier-1 empty-preview deterministic-disclosure arm exactly.
+		// It cannot disturb ExpectedEndpoint ordering for preview-bearing
+		// bodies: FormatPHP has no preview, so no shape hash can ever exist
+		// for the tracker to match.
+		if evidence.Disclosure != nil && evidence.Disclosure.Format == rec.FormatPHP {
+			if disclosing, why := deterministicDisclosure(evidence); disclosing {
+				log.Printf("[reclassify] Deterministic disclosure escalation (PHP source, any status): key=%s status=%d",
+					snapshot.Key, evidence.Transport.StatusCode)
+				return coordinator.EvidenceDecision{
+					Escalated:       true,
+					NewSeverity:     "malicious",
+					Reason:          why,
+					Evidence:        evidence,
+					EvidenceJournal: evidence.ForJournal(),
+					BodyPreviewHash: evidence.Transport.BodyPreviewHash,
+				}
+			}
+		}
+
 		// --- Path 2: Body-aware re-classification ---
 		// Even if we can't reclassify (no body preview), surface what we have
 		// so the coordinator's Phase 2 catch-all re-arm can fire on the
@@ -1562,9 +1586,33 @@ func makeVerifyCallback(
 				s.scheme, resp.StatusCode, bodyLen, responseBytes, bodyHash)
 
 			// Redact the body using existing REC pipeline (over the maxHash slice
-			// - that matches what REC redacts and what we hashed).
-			disclosure := rec.ClassifyAndRedact(body, contentType)
+			// - that matches what REC redacts and what we hashed). The body is
+			// complete only when the whole response fit inside the hash budget
+			// (readErr was already rejected above); a truncated slice must not
+			// claim completeness to the XML-RPC redactor.
+			disclosure := rec.ClassifyAndRedact(body, contentType, fullBodyLen <= maxHash)
 			safePreview := disclosure.RedactedPreview()
+
+			// FIX 4 (fix round v3): fail-closed formats stay failed closed in
+			// the verifier. A withheld preview for PHP source, PEM key
+			// material, or XML (which, with the FIX 3 dispatch, is every
+			// rejected-XML shape) must NEVER be substituted with the raw
+			// body (the ≤200-byte branch) and must NEVER take the
+			// hash-consistency auto-confirm branch or persist a verified
+			// catch-all - confirming would launder withheld content into a
+			// durable benign rule. FormatUnknown/FormatBinary keep legacy
+			// behavior this round (pre-existing; deferred to the Phase 2
+			// policy review, on the record).
+			if safePreview == "" {
+				switch disclosure.Format {
+				case rec.FormatPHP, rec.FormatPEM, rec.FormatXML:
+					return &coordinator.VerifyResult{
+						Confirmed: false,
+						Reason: fmt.Sprintf("fail-closed format (%s) - cannot verify safety without exposing withheld content",
+							disclosure.Format),
+					}
+				}
+			}
 
 			if safePreview == "" {
 				if bodyLen <= 200 {

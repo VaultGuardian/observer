@@ -381,7 +381,8 @@ type sniffer struct {
 	flowsMu sync.Mutex
 
 	// onCapture fires after each successfully paired/orphaned response so
-	// the collector can check VIP pins for push-mode resolution.
+	// the collector can check VIP pins for push-mode resolution. Always
+	// invoked through deliverCapture, never directly.
 	onCapture func(CapturedResponse)
 
 	// Response-only reassembly machinery.
@@ -908,6 +909,21 @@ func (s *sniffer) getOrCreateFlow(key streamKey) *flowPair {
 //	                  pairResponse avoids holding both simultaneously,
 //	                  handleInlineRequest releases flowsMu before fp.mu,
 //	                  runCleanup Step 3 holds both in canonical order)
+//
+// deliverCapture fires the VIP onCapture callback for a stored capture - the
+// single delivery point for both the paired-response path (stream.go) and
+// the orphan-expiry path (runCleanup below).
+//
+// FIX 2d: a rejected insert (CaptureID 0) is never delivered. The budget
+// refused to store the capture, so it must not reach VIP storage through the
+// promotion side door - rejection remains rejection across boundaries.
+func (s *sniffer) deliverCapture(captured CapturedResponse) {
+	if captured.CaptureID == 0 || s.onCapture == nil {
+		return
+	}
+	s.onCapture(captured)
+}
+
 func (s *sniffer) pairResponse(flowKey streamKey, captured CapturedResponse) *pendingRequest {
 	s.flowsMu.Lock()
 	fp := s.getOrCreateFlow(flowKey)
@@ -1186,10 +1202,10 @@ func (s *sniffer) runCleanup() {
 
 	// Step 4: Execute orphan insertions OUTSIDE all locks.
 	for _, o := range orphans {
-		s.buffer.Insert(o.captured)
-		if s.onCapture != nil {
-			s.onCapture(o.captured)
-		}
+		// The callback receives the STORED form (CaptureID assigned, body
+		// interned); deliverCapture drops rejected inserts (FIX 2d).
+		o.captured = s.buffer.Insert(o.captured)
+		s.deliverCapture(o.captured)
 		atomic.AddInt64(&s.orphanResponses, 1)
 	}
 

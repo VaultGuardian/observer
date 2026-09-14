@@ -197,9 +197,20 @@ func NewCollector(cfg CollectorConfig) EvidenceCollector {
 		return &noOpCollector{reason: EvidenceNotAvailableCollectorDisabled}
 	}
 
+	// FIX C (fix round v4): an unusable byte budget is an invalid
+	// configuration, refused at construction rather than limping on a
+	// floored effective budget. Same degradation style as the sibling
+	// checks above: loud log, REC runs as a no-op, the pipeline continues.
+	buffer, err := NewRingBuffer(cfg.Buffer)
+	if err != nil {
+		log.Printf("[rec] INVALID REC buffer configuration: %v - "+
+			"REC is disabled, fix REC_BUFFER_MAX_BYTES/REC_BUFFER_MAX_MB (log classification continues normally)", err)
+		return &noOpCollector{reason: EvidenceNotAvailableCollectorDisabled}
+	}
+
 	return &liveCollector{
 		config:      cfg,
-		buffer:      NewRingBuffer(cfg.Buffer),
+		buffer:      buffer,
 		captures:    make(map[string]*namespaceCapture),
 		vipPins:     make(map[string]*vipPin),
 		vipEvidence: make(map[string]CapturedResponse),
@@ -741,6 +752,10 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
+	// Part 2 telemetry: record that this entry won a candidate selection.
+	// Marking is observational only - it never affects the entry's lifetime.
+	lc.buffer.markSelectedBest(best.CaptureID)
+
 	// Detect orphan match
 	isOrphan := best.Method == ""
 
@@ -768,8 +783,12 @@ func (lc *liveCollector) Lookup(req LookupRequest) *Evidence {
 		}
 	}
 
-	// Build disclosure analysis (Layer 2)
-	disclosure := classifyAndRedact(best.BodyPreview, best.ContentType)
+	// Build disclosure analysis (Layer 2) from the interned, immutable
+	// analysis computed once at capture time (Part 3). Lookup no longer
+	// re-runs classifyAndRedact per call - re-running redaction on captured
+	// input could change counts and accidentally unlock the Lane A durable
+	// cache. The existing dual gate below is applied to it exactly as before.
+	disclosure := disclosureForEntry(&best)
 
 	// === DUAL-GATE RULE ===
 	safePreview := ""
@@ -894,6 +913,12 @@ func (lc *liveCollector) Stats() RECStats {
 		stats.BufferEvictionsCapacity = bs.EvictionsCapacity
 		stats.BufferEvictionsAge = bs.EvictionsAge
 		stats.BufferEvictionsBytes = bs.EvictionsBytes
+		stats.BufferRejectedOversized = bs.RejectedOversized
+		stats.BufferRejectedBudget = bs.RejectedBudget
+		stats.BufferDemandedEvidenceEvicted = bs.DemandedEvidenceEvicted
+		stats.BufferVIPReacquireRejected = bs.VIPReacquireRejected
+		stats.BufferEvictedEverSelected = bs.EvictedEverSelected
+		stats.BufferEvictedNeverSelected = bs.EvictedNeverSelected
 	}
 	stats.VIPMatches = atomic.LoadInt64(&lc.vipMatches)
 
@@ -997,8 +1022,20 @@ func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
 			}
 		}
 
+		// Part 2: the ring entry has observed demand regardless of whether
+		// the promotion below succeeds - if it is later evicted, the loss is
+		// counted as demandedEvidenceEvicted. Lock order vipMu → buffer.mu,
+		// same as the buffer.Lookup above. No-op if already evicted.
+		lc.buffer.markKnownDemand(best.CaptureID)
+
 		lc.enforceVIPCapLocked()
-		lc.vipEvidence[eventID] = best
+		if !lc.setVIPEvidenceLocked(eventID, best) {
+			// FIX 1: the candidate's body was evicted+released between
+			// Lookup and promotion, and the budget cannot resurrect it.
+			// No VIP protection for this event (counted by the buffer's
+			// vipReacquireRejected); rejection stays rejection.
+			return
+		}
 		atomic.AddInt64(&lc.vipMatches, 1)
 
 		log.Printf("[rec:prepin] Evidence promoted from buffer for %s: status=%d method=%s path=%s candidates=%d",
@@ -1019,6 +1056,44 @@ func (lc *liveCollector) PrePin(eventID string, req LookupRequest) {
 
 	log.Printf("[rec:prepin] Watching for future evidence for %s: method=%s path=%s host=%s status=%d",
 		eventID, req.Method, req.Path, req.Host, req.StatusCode)
+}
+
+// setVIPEvidenceLocked stores resp as the event's protected evidence and
+// reports whether the promotion succeeded.
+//
+// FIX 1 ordering: the NEW body is reacquired FIRST - the copy's store
+// reference may have been released by eviction in the window since the copy
+// was made (buffer.Lookup returns after unlocking rb.mu; Insert's return
+// travels to onCapture unlocked). Only on success is the OLD evidence's
+// reference released and the entry replaced, so old and new sharing the
+// SAME interned body can never hit a last-owner release mid-sequence. On
+// failure the EXISTING evidence stays in place untouched and no reference
+// was taken, so there is nothing to roll back.
+//
+// Must hold vipMu (reacquire/releaseBody take rb.mu: vipMu → rb.mu, the
+// established order).
+func (lc *liveCollector) setVIPEvidenceLocked(eventID string, resp CapturedResponse) bool {
+	if !lc.buffer.reacquire(&resp) {
+		log.Printf("[rec:vip] VIP promotion REJECTED for %s: body no longer store-resident and the "+
+			"effective budget has no room to resurrect it - existing evidence (if any) left in place", eventID)
+		return false
+	}
+	if old, ok := lc.vipEvidence[eventID]; ok {
+		lc.buffer.releaseBody(&old)
+	}
+	lc.vipEvidence[eventID] = resp
+	return true
+}
+
+// deleteVIPEvidenceLocked removes the event's protected evidence, releasing
+// its interned body reference (uncharged on last owner). Must hold vipMu.
+// ALL VIP evidence removal goes through here - expiry, consumption, cap
+// eviction - so a reference can never leak.
+func (lc *liveCollector) deleteVIPEvidenceLocked(eventID string) {
+	if old, ok := lc.vipEvidence[eventID]; ok {
+		lc.buffer.releaseBody(&old)
+		delete(lc.vipEvidence, eventID)
+	}
 }
 
 // enforceVIPCapLocked evicts the oldest VIP entry (pin or evidence) when
@@ -1057,7 +1132,7 @@ func (lc *liveCollector) enforceVIPCapLocked() {
 			delete(lc.vipPins, oldestID)
 			atomic.AddInt64(&lc.vipCapacityEvictions, 1)
 		} else {
-			delete(lc.vipEvidence, oldestID)
+			lc.deleteVIPEvidenceLocked(oldestID)
 			atomic.AddInt64(&lc.vipCapacityEvictions, 1)
 		}
 	}
@@ -1079,11 +1154,21 @@ func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
 
 	for eventID, pin := range lc.vipPins {
 		if matchesVIP(resp, pin.criteria) {
-			// Store in protected VIP evidence map
-			lc.vipEvidence[eventID] = resp
+			// Store in protected VIP evidence map. FIX 1: the promotion can
+			// be refused (body evicted+released in the Insert→onCapture
+			// window with no budget to resurrect it). Keep the pin armed
+			// for a possible future response; nothing replaced, no
+			// callback fired, rejection stays rejection.
+			if !lc.setVIPEvidenceLocked(eventID, resp) {
+				return
+			}
 			correlationKey := pin.correlationKey
 			delete(lc.vipPins, eventID)
 			atomic.AddInt64(&lc.vipMatches, 1)
+
+			// Part 2: a VIP pin matched this capture - record observed
+			// demand on the ring entry (vipMu → buffer.mu lock order).
+			lc.buffer.markKnownDemand(resp.CaptureID)
 
 			log.Printf("[rec:vip] Evidence matched for %s: status=%d method=%s path=%s",
 				eventID, resp.StatusCode, resp.Method, resp.Path)
@@ -1098,6 +1183,20 @@ func (lc *liveCollector) handleCapturedResponse(resp CapturedResponse) {
 			return
 		}
 	}
+}
+
+// disclosureForEntry returns a PRIVATE copy of the entry's disclosure
+// analysis, so nothing outside REC holds a reference into the interned
+// store. Interned entries reuse the analysis computed exactly once at
+// capture time; a non-interned entry (test-built, or a VIP copy of a
+// rejected insert) falls back to a fresh classification of its raw preview
+// - never of already-sanitized output.
+func disclosureForEntry(c *CapturedResponse) *DisclosureAnalysis {
+	if c.body != nil && c.body.disclosure != nil {
+		d := *c.body.disclosure
+		return &d
+	}
+	return classifyAndRedact(c.BodyPreview, c.ContentType, c.BodyComplete)
 }
 
 // normalizeLookupRequest returns req with its Path decoded from nginx
@@ -1247,7 +1346,7 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 				resp.Method, resp.Path, resp.StatusCode, resp.Host)
 			return nil
 		}
-		delete(lc.vipEvidence, req.EventID)
+		lc.deleteVIPEvidenceLocked(req.EventID)
 		log.Printf("[rec:vip] Exact VIP evidence consumed for %s: status=%d method=%s path=%s",
 			req.EventID, resp.StatusCode, resp.Method, resp.Path)
 		return []CapturedResponse{resp}
@@ -1269,7 +1368,7 @@ func (lc *liveCollector) lookupVIPEvidence(req LookupRequest) []CapturedResponse
 		}
 	}
 	if consumeID != "" {
-		delete(lc.vipEvidence, consumeID)
+		lc.deleteVIPEvidenceLocked(consumeID)
 	}
 
 	return candidates
@@ -1305,7 +1404,7 @@ func (lc *liveCollector) cleanupExpiredVIP(now time.Time) {
 	}
 	for id, resp := range lc.vipEvidence {
 		if resp.Timestamp.Before(cutoff) {
-			delete(lc.vipEvidence, id)
+			lc.deleteVIPEvidenceLocked(id)
 			atomic.AddInt64(&lc.vipExpirations, 1)
 		}
 	}

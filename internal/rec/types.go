@@ -47,6 +47,7 @@ const (
 	FormatPasswd  DetectedFormat = "passwd"
 	FormatHTML    DetectedFormat = "html"
 	FormatXML     DetectedFormat = "xml"
+	FormatPHP     DetectedFormat = "php"
 	FormatPEM     DetectedFormat = "pem"
 	FormatBinary  DetectedFormat = "binary"
 	FormatUnknown DetectedFormat = "unknown"
@@ -172,6 +173,36 @@ type RECStats struct {
 	BufferEvictionsCapacity int64 // entry cap hit
 	BufferEvictionsAge      int64 // MaxAge expired
 	BufferEvictionsBytes    int64 // byte cap hit
+
+	// Part 2/v3 loss counters. HONESTY NOTE (Invariant 5): the known-demand
+	// counter measures demand that was OBSERVED (a PrePin/VIP request had
+	// matched the entry before it was lost); it is NOT proof that no future
+	// event needed an evicted entry.
+	//
+	// BufferRejectedOversized: the insert's CONSERVATIVE worst-case estimate
+	// (entry record + raw preview + redactorMaxOutputBytes + store overhead)
+	// exceeded the effective budget - not proof the actual entry could never
+	// fit. BufferRejectedBudget: the estimate fit, but current owners
+	// (VIP-held bodies included) occupy the space even after full ring
+	// eviction.
+	BufferRejectedOversized int64
+	BufferRejectedBudget    int64
+
+	// BufferDemandedEvidenceEvicted: a known-demand RING entry was evicted;
+	// the promoted VIP copy, if any, may still hold the evidence - not
+	// proof the evidence was lost.
+	BufferDemandedEvidenceEvicted int64
+
+	// BufferVIPReacquireRejected: VIP promotions refused because the body
+	// was no longer store-resident and the effective budget had no room to
+	// resurrect it (existing VIP evidence left in place).
+	BufferVIPReacquireRejected int64
+
+	// FIX 5a eviction split: whether the evicted entry had ever been
+	// returned in a Lookup candidate set. "Ever selected" is not
+	// "consumed"; "never selected" is not "worthless".
+	BufferEvictedEverSelected  int64
+	BufferEvictedNeverSelected int64
 
 	// Inline request parser (synchronous in processFrame)
 	InlineRequests       int64 // successful inline parses

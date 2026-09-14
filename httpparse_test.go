@@ -2,6 +2,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/vaultguardian/observer/internal/rec"
@@ -132,6 +133,7 @@ func TestDeterministicDisclosure(t *testing.T) {
 		{"passwd", disclosure(rec.FormatPasswd, 1), true},
 		{"dotenv", disclosure(rec.FormatDotenv, 2), true},
 		{"pem_zero_preview", disclosure(rec.FormatPEM, 1), true},
+		{"php_source", disclosure(rec.FormatPHP, 1), true},
 		{"formatless_with_redactions", disclosure("", 3), false},
 		{"html_with_redactions", disclosure(rec.FormatHTML, 5), false},
 		{"json_with_redactions", disclosure(rec.FormatJSON, 2), false},
@@ -146,6 +148,17 @@ func TestDeterministicDisclosure(t *testing.T) {
 			}
 			if tc.want && reason == "" {
 				t.Errorf("disclosing verdict carried no reason")
+			}
+			// FIX 6b: PHP-source escalation fires on every status, so its
+			// reason must be status-neutral; the rejection-status wording
+			// stays reserved for passwd/dotenv/PEM.
+			if tc.ev != nil && tc.ev.Disclosure != nil && tc.ev.Disclosure.Format == rec.FormatPHP {
+				if !strings.Contains(reason, "discloses served source code") {
+					t.Errorf("PHP reason %q missing status-neutral wording", reason)
+				}
+				if strings.Contains(reason, "despite rejection status") {
+					t.Errorf("PHP reason %q carries rejection-status wording (wrong on a 200)", reason)
+				}
 			}
 		})
 	}
