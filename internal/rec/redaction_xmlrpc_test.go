@@ -6,26 +6,108 @@ import (
 	"testing"
 )
 
-// TODO(drew): replace with captured soak body once the real WordPress
-// xmlrpc.php fault capture from the soak run is available. This is the
-// canonical stand-in from the design document.
-const wpFaultBody = `<?xml version="1.0" encoding="UTF-8"?><methodResponse><fault><value><struct><member><name>faultCode</name><value><int>403</int></value></member><member><name>faultString</name><value><string>Incorrect username or password.</string></value></member></struct></value></fault></methodResponse>`
+// Real bodies captured 2026-09-14 from wp.soak.vaultguardian.io
+// (WordPress 6.9.4), byte-exact as served: UTF-8 declaration, two-space
+// indent, trailing newline. Do not reformat or re-indent - the production
+// wire shape, inter-element whitespace included, is exactly what these
+// tests pin. The canonical previews below carry no whitespace because the
+// emitter reconstructs the document from accepted tokens rather than
+// splicing input ranges.
+
+// wpFaultBody is the auth-failure fault - the shape the Sept 12-13 flood
+// produced ~46K times.
+const wpFaultBody = `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <fault>
+    <value>
+      <struct>
+        <member>
+          <name>faultCode</name>
+          <value><int>403</int></value>
+        </member>
+        <member>
+          <name>faultString</name>
+          <value><string>Incorrect username or password.</string></value>
+        </member>
+      </struct>
+    </value>
+  </fault>
+</methodResponse>
+`
 
 const wpFaultRedacted = `<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>403</int></value></member><member><name>faultString</name><value><string>[STRING]</string></value></member></struct></value></fault></methodResponse>`
 
+// wpUnknownMethodBody is the unknown-method fault from the same capture.
+const wpUnknownMethodBody = `<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse>
+  <fault>
+    <value>
+      <struct>
+        <member>
+          <name>faultCode</name>
+          <value><int>-32601</int></value>
+        </member>
+        <member>
+          <name>faultString</name>
+          <value><string>server error. requested method wp.bogus does not exist.</string></value>
+        </member>
+      </struct>
+    </value>
+  </fault>
+</methodResponse>
+`
+
+const wpUnknownMethodRedacted = `<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>-32601</int></value></member><member><name>faultString</name><value><string>[STRING]</string></value></member></struct></value></fault></methodResponse>`
+
+// wpFaults drives the fixture-based tests in this file over BOTH captured
+// bodies. A negative faultCode (-32601) is still a valid int32 and must be
+// preserved verbatim, exactly as 403 is.
+var wpFaults = []struct {
+	name           string
+	body           string
+	redacted       string
+	faultCode      string // int value preserved verbatim in the preview
+	secret         string // full faultString content, for padding replacement
+	secretFragment string // distinctive fragment that must never survive
+}{
+	{
+		name:           "auth_failure",
+		body:           wpFaultBody,
+		redacted:       wpFaultRedacted,
+		faultCode:      "403",
+		secret:         "Incorrect username or password.",
+		secretFragment: "Incorrect username",
+	},
+	{
+		name:           "unknown_method",
+		body:           wpUnknownMethodBody,
+		redacted:       wpUnknownMethodRedacted,
+		faultCode:      "-32601",
+		secret:         "server error. requested method wp.bogus does not exist.",
+		secretFragment: "wp.bogus",
+	},
+}
+
 func TestRedactXMLRPC_CanonicalWordPressFault(t *testing.T) {
-	out, redactions, ok := redactXMLRPC([]byte(wpFaultBody), true)
-	if !ok {
-		t.Fatalf("canonical WordPress fault body failed to parse")
-	}
-	if out != wpFaultRedacted {
-		t.Errorf("redacted preview:\n  got:  %q\n  want: %q", out, wpFaultRedacted)
-	}
-	if redactions != 1 {
-		t.Errorf("redactions = %d, want 1 (the faultString value)", redactions)
-	}
-	if strings.Contains(out, "Incorrect username") {
-		t.Errorf("secret fault message survived into preview")
+	for _, f := range wpFaults {
+		t.Run(f.name, func(t *testing.T) {
+			out, redactions, ok := redactXMLRPC([]byte(f.body), true)
+			if !ok {
+				t.Fatalf("captured WordPress fault body failed to parse")
+			}
+			if out != f.redacted {
+				t.Errorf("redacted preview:\n  got:  %q\n  want: %q", out, f.redacted)
+			}
+			if redactions != 1 {
+				t.Errorf("redactions = %d, want 1 (the faultString value)", redactions)
+			}
+			if !strings.Contains(out, "<value><int>"+f.faultCode+"</int></value>") {
+				t.Errorf("faultCode int %s not preserved in preview: %q", f.faultCode, out)
+			}
+			if strings.Contains(out, f.secretFragment) {
+				t.Errorf("secret fault message survived into preview")
+			}
+		})
 	}
 }
 
@@ -33,30 +115,34 @@ func TestRedactXMLRPC_SuccessAndFaultSameLengthDiverge(t *testing.T) {
 	// Same HTTP-status semantics, same byte length (strings padded), but a
 	// success-params document vs a fault document must produce DIFFERENT
 	// redacted previews and different hashes.
-	fault := wpFaultBody
-	successFmt := `<?xml version="1.0" encoding="UTF-8"?><methodResponse><params><param><value><struct><member><name>result</name><value><string>%s</string></value></member></struct></value></param></params></methodResponse>`
-	pad := len(fault) - (len(successFmt) - len("%s"))
-	if pad < 0 {
-		t.Fatalf("success skeleton longer than fault fixture by %d bytes", -pad)
-	}
-	success := strings.Replace(successFmt, "%s", strings.Repeat("w", pad), 1)
-	if len(fault) != len(success) {
-		t.Fatalf("fixture lengths diverged: fault=%d success=%d", len(fault), len(success))
-	}
+	for _, f := range wpFaults {
+		t.Run(f.name, func(t *testing.T) {
+			fault := f.body
+			successFmt := `<?xml version="1.0" encoding="UTF-8"?><methodResponse><params><param><value><struct><member><name>result</name><value><string>%s</string></value></member></struct></value></param></params></methodResponse>`
+			pad := len(fault) - (len(successFmt) - len("%s"))
+			if pad < 0 {
+				t.Fatalf("success skeleton longer than fault fixture by %d bytes", -pad)
+			}
+			success := strings.Replace(successFmt, "%s", strings.Repeat("w", pad), 1)
+			if len(fault) != len(success) {
+				t.Fatalf("fixture lengths diverged: fault=%d success=%d", len(fault), len(success))
+			}
 
-	fOut, _, fOK := redactXMLRPC([]byte(fault), true)
-	sOut, _, sOK := redactXMLRPC([]byte(success), true)
-	if !fOK || !sOK {
-		t.Fatalf("parse failed: fault=%v success=%v", fOK, sOK)
-	}
-	if fOut == sOut {
-		t.Errorf("fault and success previews identical - outcome divergence lost")
-	}
-	if HashBody([]byte(fOut)) == HashBody([]byte(sOut)) {
-		t.Errorf("fault and success preview hashes identical")
-	}
-	if !strings.Contains(fOut, "<fault>") || strings.Contains(sOut, "<fault>") {
-		t.Errorf("envelope shape not preserved: fault=%q success=%q", fOut, sOut)
+			fOut, _, fOK := redactXMLRPC([]byte(fault), true)
+			sOut, _, sOK := redactXMLRPC([]byte(success), true)
+			if !fOK || !sOK {
+				t.Fatalf("parse failed: fault=%v success=%v", fOK, sOK)
+			}
+			if fOut == sOut {
+				t.Errorf("fault and success previews identical - outcome divergence lost")
+			}
+			if HashBody([]byte(fOut)) == HashBody([]byte(sOut)) {
+				t.Errorf("fault and success preview hashes identical")
+			}
+			if !strings.Contains(fOut, "<fault>") || strings.Contains(sOut, "<fault>") {
+				t.Errorf("envelope shape not preserved: fault=%q success=%q", fOut, sOut)
+			}
+		})
 	}
 }
 
@@ -137,9 +223,14 @@ func TestRedactXMLRPC_SecretsNeverSurvive(t *testing.T) {
 			"aHVudGVyMi1iNjQ=",
 		},
 		{
-			"fault_message",
+			"fault_message_auth_failure",
 			wpFaultBody,
 			"Incorrect username or password",
+		},
+		{
+			"fault_message_unknown_method",
+			wpUnknownMethodBody,
+			"requested method wp.bogus does not exist",
 		},
 	}
 	for _, tc := range cases {
@@ -229,28 +320,32 @@ func TestRedactXMLRPC_Rejections(t *testing.T) {
 }
 
 func TestRedactXMLRPC_InputRequirements(t *testing.T) {
-	// Body incomplete flag → fail even for a valid document.
-	if _, _, ok := redactXMLRPC([]byte(wpFaultBody), false); ok {
-		t.Errorf("incomplete body accepted - completeness flag is required")
-	}
+	for _, f := range wpFaults {
+		t.Run(f.name, func(t *testing.T) {
+			// Body incomplete flag → fail even for a valid document.
+			if _, _, ok := redactXMLRPC([]byte(f.body), false); ok {
+				t.Errorf("incomplete body accepted - completeness flag is required")
+			}
 
-	// Over 2048 input bytes → fail; a valid document padded to EXACTLY 2048
-	// bytes is accepted.
-	padded := strings.Replace(wpFaultBody, "Incorrect username or password.",
-		strings.Repeat("p", 2048-len(wpFaultBody)+len("Incorrect username or password.")), 1)
-	if len(padded) != 2048 {
-		t.Fatalf("fixture padding wrong: %d bytes, want 2048", len(padded))
-	}
-	if _, _, ok := redactXMLRPC([]byte(padded), true); !ok {
-		t.Errorf("exact-2048-byte valid body rejected")
-	}
-	if _, _, ok := redactXMLRPC([]byte(padded+" "), true); ok {
-		t.Errorf("2049-byte body accepted, want input-size rejection")
-	}
+			// Over 2048 input bytes → fail; a valid document padded to EXACTLY
+			// 2048 bytes is accepted.
+			padded := strings.Replace(f.body, f.secret,
+				strings.Repeat("p", 2048-len(f.body)+len(f.secret)), 1)
+			if len(padded) != 2048 {
+				t.Fatalf("fixture padding wrong: %d bytes, want 2048", len(padded))
+			}
+			if _, _, ok := redactXMLRPC([]byte(padded), true); !ok {
+				t.Errorf("exact-2048-byte valid body rejected")
+			}
+			if _, _, ok := redactXMLRPC([]byte(padded+" "), true); ok {
+				t.Errorf("2049-byte body accepted, want input-size rejection")
+			}
 
-	// Depth exactly at the limit is fine (canonical fault is depth 7).
-	if _, _, ok := redactXMLRPC([]byte(wpFaultBody), true); !ok {
-		t.Errorf("canonical body rejected")
+			// Depth exactly at the limit is fine (captured fault is depth 7).
+			if _, _, ok := redactXMLRPC([]byte(f.body), true); !ok {
+				t.Errorf("captured body rejected")
+			}
+		})
 	}
 }
 
@@ -261,7 +356,9 @@ func TestRedactXMLRPC_AcceptedVariants(t *testing.T) {
 	}{
 		{"missing_xml_declaration", `<methodResponse><params><param><value><int>1</int></value></param></params></methodResponse>`},
 		{"utf8_bom", "\xEF\xBB\xBF" + wpFaultBody},
+		{"utf8_bom_unknown_method", "\xEF\xBB\xBF" + wpUnknownMethodBody},
 		{"leading_whitespace", "\n  " + wpFaultBody},
+		{"leading_whitespace_unknown_method", "\n  " + wpUnknownMethodBody},
 		{"numeric_character_references", `<methodResponse><params><param><value><string>a&#65;&#x42;</string></value></param></params></methodResponse>`},
 		{"builtin_entities", `<methodResponse><params><param><value><string>&lt;&gt;&amp;&apos;&quot;</string></value></param></params></methodResponse>`},
 		{"utf8_encoding_declared", `<?xml version="1.0" encoding="utf-8"?><methodResponse><params><param><value><int>1</int></value></param></params></methodResponse>`},
@@ -311,36 +408,51 @@ func TestRedactXMLRPC_DifferentSecretsSameSanitizedPreview(t *testing.T) {
 	// previews must never imply transaction equality - identical shapes can
 	// have different outcomes, and nothing may transfer one response's
 	// verdict to a different response.
-	a := strings.Replace(wpFaultBody, "Incorrect username or password.", "secret-one-aaaaaaaaaaaaaaaaaaaa", 1)
-	b := strings.Replace(wpFaultBody, "Incorrect username or password.", "secret-two-bbbbbbbbbbbbbbbbbbbb", 1)
-	aOut, _, aOK := redactXMLRPC([]byte(a), true)
-	bOut, _, bOK := redactXMLRPC([]byte(b), true)
-	if !aOK || !bOK {
-		t.Fatalf("parse failed: a=%v b=%v", aOK, bOK)
-	}
-	if aOut != bOut {
-		t.Errorf("sanitized previews differ for same-shape documents:\n  a=%q\n  b=%q", aOut, bOut)
+	for _, f := range wpFaults {
+		t.Run(f.name, func(t *testing.T) {
+			a := strings.Replace(f.body, f.secret, "secret-one-aaaaaaaaaaaaaaaaaaaa", 1)
+			b := strings.Replace(f.body, f.secret, "secret-two-bbbbbbbbbbbbbbbbbbbb", 1)
+			aOut, _, aOK := redactXMLRPC([]byte(a), true)
+			bOut, _, bOK := redactXMLRPC([]byte(b), true)
+			if !aOK || !bOK {
+				t.Fatalf("parse failed: a=%v b=%v", aOK, bOK)
+			}
+			if aOut != bOut {
+				t.Errorf("sanitized previews differ for same-shape documents:\n  a=%q\n  b=%q", aOut, bOut)
+			}
+		})
 	}
 }
 
 func TestClassifyAndRedact_XMLArms(t *testing.T) {
 	// Misleading MIME: text/html content type with a valid XML-RPC body must
 	// still classify FormatXML, parse, and grant a high-confidence preview.
-	a := classifyAndRedact([]byte(wpFaultBody), "text/html", true)
-	if a.Format != FormatXML {
-		t.Fatalf("Format = %q, want %q (misleading MIME must not win)", a.Format, FormatXML)
-	}
-	if a.RedactionConfidence != ConfidenceHigh {
-		t.Errorf("RedactionConfidence = %q, want %q", a.RedactionConfidence, ConfidenceHigh)
-	}
-	if a.RedactedPreview() != wpFaultRedacted {
-		t.Errorf("preview = %q, want canonical redaction", a.RedactedPreview())
-	}
-	if a.SensitiveRedactions != 1 {
-		t.Errorf("SensitiveRedactions = %d, want 1", a.SensitiveRedactions)
-	}
-	if a.DisclosureSummary != "XML-RPC RESPONSE STRUCTURE DETECTED" {
-		t.Errorf("DisclosureSummary = %q", a.DisclosureSummary)
+	for _, f := range wpFaults {
+		t.Run(f.name, func(t *testing.T) {
+			a := classifyAndRedact([]byte(f.body), "text/html", true)
+			if a.Format != FormatXML {
+				t.Fatalf("Format = %q, want %q (misleading MIME must not win)", a.Format, FormatXML)
+			}
+			if a.RedactionConfidence != ConfidenceHigh {
+				t.Errorf("RedactionConfidence = %q, want %q", a.RedactionConfidence, ConfidenceHigh)
+			}
+			if a.RedactedPreview() != f.redacted {
+				t.Errorf("preview = %q, want canonical redaction", a.RedactedPreview())
+			}
+			if a.SensitiveRedactions != 1 {
+				t.Errorf("SensitiveRedactions = %d, want 1", a.SensitiveRedactions)
+			}
+			if a.DisclosureSummary != "XML-RPC RESPONSE STRUCTURE DETECTED" {
+				t.Errorf("DisclosureSummary = %q", a.DisclosureSummary)
+			}
+
+			// Incomplete body: format recognized, parse refused, fail closed.
+			inc := classifyAndRedact([]byte(f.body), "text/xml", false)
+			if inc.Format != FormatXML || inc.RedactedPreview() != "" || inc.RedactionConfidence != ConfidenceNone {
+				t.Errorf("incomplete XML body not fail-closed: format=%q preview=%q conf=%q",
+					inc.Format, inc.RedactedPreview(), inc.RedactionConfidence)
+			}
+		})
 	}
 
 	// XHTML served as text/html starting with <?xml: FormatXML, grammar
@@ -355,12 +467,5 @@ func TestClassifyAndRedact_XMLArms(t *testing.T) {
 	}
 	if x.DisclosureSummary != "XML CONTENT DETECTED - METADATA ONLY" {
 		t.Errorf("XHTML DisclosureSummary = %q", x.DisclosureSummary)
-	}
-
-	// Incomplete body: format recognized, parse refused, fail closed.
-	inc := classifyAndRedact([]byte(wpFaultBody), "text/xml", false)
-	if inc.Format != FormatXML || inc.RedactedPreview() != "" || inc.RedactionConfidence != ConfidenceNone {
-		t.Errorf("incomplete XML body not fail-closed: format=%q preview=%q conf=%q",
-			inc.Format, inc.RedactedPreview(), inc.RedactionConfidence)
 	}
 }
