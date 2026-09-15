@@ -450,7 +450,11 @@ func LoadConfig() Config {
 		}
 		cfg.LineageEnabled = len(cfg.LineageAnchorSources) > 0
 		if cfg.LineageEnabled {
-			log.Printf("[observer] Request-lineage coalescing enabled; anchor sources: %s", raw)
+			// Log the normalized set too: it is what a runtime source is
+			// actually matched against, so a typo shows up at boot instead of
+			// as a silently never-anchored lineage.
+			log.Printf("[observer] Request-lineage coalescing enabled; anchor sources: %s (matching on: %s)",
+				raw, strings.Join(normalizedAnchorNames(cfg.LineageAnchorSources), ", "))
 		}
 	}
 

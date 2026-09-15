@@ -3,6 +3,9 @@ package main
 
 import (
 	"context"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,10 +230,15 @@ const (
 
 // httpOutcomeSink funnels and (optionally) coalesces HTTP outcomes.
 type httpOutcomeSink struct {
-	enabled       bool
-	anchorSources map[string]bool
-	tracker       *requestcorr.Tracker
-	tickInterval  time.Duration
+	enabled bool
+	// anchorSources is the operator's configured set verbatim; anchorNormalized
+	// is the same set reduced by normalizeAnchorSource. A source matches on
+	// EITHER, so both a pasted full container name and the documented service
+	// name work. See isAnchorSource.
+	anchorSources    map[string]bool
+	anchorNormalized map[string]bool
+	tracker          *requestcorr.Tracker
+	tickInterval     time.Duration
 
 	// Lineage-status telemetry (correlation block). Only counted when the
 	// feature is on, so they double as an adoption metric.
@@ -254,18 +262,87 @@ type httpOutcomeSink struct {
 
 func newHTTPOutcomeSink(cfg Config) *httpOutcomeSink {
 	s := &httpOutcomeSink{
-		enabled:       cfg.LineageEnabled,
-		anchorSources: cfg.LineageAnchorSources,
-		tickInterval:  500 * time.Millisecond,
-		parked:        make(map[string]*parkedOutcome),
-		attempts:      make(map[uint64]*notifyAttempt),
-		work:          make(map[uint64]workRef),
+		enabled:          cfg.LineageEnabled,
+		anchorSources:    cfg.LineageAnchorSources,
+		anchorNormalized: normalizedAnchorSet(cfg.LineageAnchorSources),
+		tickInterval:     500 * time.Millisecond,
+		parked:           make(map[string]*parkedOutcome),
+		attempts:         make(map[uint64]*notifyAttempt),
+		work:             make(map[uint64]workRef),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	if s.enabled {
 		s.tracker = requestcorr.New(requestcorr.Config{}, nil)
 	}
 	return s
+}
+
+// --- anchor-source matching ------------------------------------------------
+//
+// The configured name and the runtime source name are rarely the same string.
+// Operators configure the service ("captain-nginx", per the README), the sink
+// sees the bare container name Docker actually runs
+// ("captain-nginx.1.4ab3nsk74355533fkk0iadqza"), and a name pasted out of the
+// coordinator logs carries the scope prefix ("docker:captain-nginx.1.<id>").
+// Comparing those raw meant the documented value never matched and the feature
+// silently stayed off, with every observation unanchored. Both sides are now
+// normalized before comparing, and the raw comparison is kept alongside it.
+
+// swarmTaskSuffix matches the ".<slot>.<task-id>" suffix the Docker daemon
+// appends to a swarm service's container name.
+var swarmTaskSuffix = regexp.MustCompile(`\.\d+\.[a-z0-9]{20,}$`)
+
+// normalizeAnchorSource reduces a name to the service identity an operator
+// would configure: an optional "docker:" scope prefix and a swarm task suffix
+// are stripped, so "captain-nginx", "docker:captain-nginx" and
+// "captain-nginx.1.4ab3nsk74355533fkk0iadqza" all reduce to "captain-nginx".
+// Anything else (a plain container name, "journal:sshd") is returned as-is.
+func normalizeAnchorSource(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "docker:")
+	return swarmTaskSuffix.ReplaceAllString(name, "")
+}
+
+// normalizedAnchorSet reduces the configured anchor set to normalized keys.
+func normalizedAnchorSet(configured map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(configured))
+	for name, on := range configured {
+		if !on {
+			continue
+		}
+		if n := normalizeAnchorSource(name); n != "" {
+			out[n] = true
+		}
+	}
+	return out
+}
+
+// normalizedAnchorNames is the normalized anchor set sorted for startup logging,
+// so an operator can see what their LINEAGE_ANCHOR_SOURCES entries actually
+// match on rather than inferring it from a silent zero-coalescing counter.
+func normalizedAnchorNames(configured map[string]bool) []string {
+	set := normalizedAnchorSet(configured)
+	names := make([]string, 0, len(set))
+	for n := range set {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// isAnchorSource reports whether an observation's source is one of the
+// operator-declared trusted-ingress anchors (D2). The raw match is kept first
+// so a pasted full container name and non-docker sources ("journal:sshd")
+// behave exactly as before; the normalized match is what lets the documented
+// "captain-nginx" match the container the sink actually sees.
+func (s *httpOutcomeSink) isAnchorSource(source string) bool {
+	if source == "" {
+		return false
+	}
+	if s.anchorSources[source] {
+		return true
+	}
+	return s.anchorNormalized[normalizeAnchorSource(source)]
 }
 
 // --- registry (completion authority) ---------------------------------------
@@ -345,7 +422,7 @@ func (s *httpOutcomeSink) Emit(o httpOutcome) {
 	ds := s.tracker.Observe(requestcorr.Observation{
 		LineageID:      id,
 		Source:         o.source,
-		IsAnchorSource: s.anchorSources[o.source],
+		IsAnchorSource: s.isAnchorSource(o.source),
 		EventID:        o.eventID,
 		Outcome:        o.outcome,
 		Timestamp:      o.timestamp,
