@@ -13,6 +13,7 @@ import (
 	"github.com/vaultguardian/observer/internal/notifier"
 	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/rec"
+	"github.com/vaultguardian/observer/internal/requestcorr"
 	"github.com/vaultguardian/observer/internal/store"
 	"github.com/vaultguardian/observer/internal/watcher"
 )
@@ -26,6 +27,9 @@ type resultRouter struct {
 	collector        rec.EvidenceCollector
 	alertCoordinator *coordinator.Coordinator
 	dispatch         *notifier.Dispatcher
+	// sink funnels every HTTP finding-producing path through the request-
+	// lineage coalescer (D8 pass-through when the feature is off). Never nil.
+	sink *httpOutcomeSink
 }
 
 // Route processes a classification result: records LLM decision to audit trail,
@@ -146,29 +150,39 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			evt.ID, evt.ScopeKey(), result.LLMClassification, result.Reason, result.Source,
 			truncate(evt.Line, 200))
 
-		// Fix 3: Use async writer for recon (droppable under DDoS)
-		r.db.SubmitFinding(&store.Finding{
-			EventID:              evt.ID,
-			Timestamp:            evt.Timestamp,
-			SourceType:           evt.SourceType,
-			SourceName:           evt.SourceName,
-			DestHost:             host,
-			HTTPMethod:           method,
-			HTTPPath:             rawPath,
-			HTTPStatus:           statusCode,
-			Verdict:              "recon",
-			Classification:       result.LLMClassification,
-			Confidence:           result.LLMConfidence,
-			Reason:               result.Reason,
-			MatchedVia:           result.Source,
-			MatchedPatternScope:  result.PatternScope,
-			MatchedPatternBucket: result.PatternBucket,
-			MatchedPatternValue:  result.PatternValue,
-			OriginEventID:        result.OriginEventID,
-			RawLine:              evt.Line,
-			NormalizedLine:       evt.NormalizedLine,
-			NormalizedHash:       evt.Hash,
-			Notified:             false,
+		// Fix 3: Use async writer for recon (droppable under DDoS).
+		// Routed through the lineage sink (recon never notifies; SevSafe).
+		r.sink.Emit(httpOutcome{
+			eventID:   evt.ID,
+			rawLine:   evt.Line,
+			source:    evt.SourceName,
+			outcome:   requestcorr.OutcomeRecon,
+			timestamp: evt.Timestamp,
+			writeFinding: func(bool) {
+				r.db.SubmitFinding(&store.Finding{
+					EventID:              evt.ID,
+					Timestamp:            evt.Timestamp,
+					SourceType:           evt.SourceType,
+					SourceName:           evt.SourceName,
+					DestHost:             host,
+					HTTPMethod:           method,
+					HTTPPath:             rawPath,
+					HTTPStatus:           statusCode,
+					Verdict:              "recon",
+					Classification:       result.LLMClassification,
+					Confidence:           result.LLMConfidence,
+					Reason:               result.Reason,
+					MatchedVia:           result.Source,
+					MatchedPatternScope:  result.PatternScope,
+					MatchedPatternBucket: result.PatternBucket,
+					MatchedPatternValue:  result.PatternValue,
+					OriginEventID:        result.OriginEventID,
+					RawLine:              evt.Line,
+					NormalizedLine:       evt.NormalizedLine,
+					NormalizedHash:       evt.Hash,
+					Notified:             false,
+				})
+			},
 		})
 		return
 	}
@@ -230,7 +244,18 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			// shortcut's finding is intentionally NOT written - the
 			// coordinator dispatch writes the single finding for this event.
 		} else {
-			r.shortCircuitStatusRejection(evt, result, host, method, rawPath, statusCode)
+			// SevSafe recon; never notifies. Routed through the sink so a
+			// lineage-instrumented deployment coalesces the edge+backend pair.
+			r.sink.Emit(httpOutcome{
+				eventID:   evt.ID,
+				rawLine:   evt.Line,
+				source:    evt.SourceName,
+				outcome:   requestcorr.OutcomeRecon,
+				timestamp: evt.Timestamp,
+				writeFinding: func(bool) {
+					r.shortCircuitStatusRejection(evt, result, host, method, rawPath, statusCode)
+				},
+			})
 			return
 		}
 	}
@@ -266,33 +291,42 @@ func (r *resultRouter) routeAlert(evt *event.Event, result *analyzer.AnalysisRes
 			evt.ID, evt.ScopeKey(), host, statusCode, result.LLMClassification, result.Source,
 			truncate(evt.Line, 200))
 
-		r.db.SubmitFinding(&store.Finding{
-			EventID:              evt.ID,
-			Timestamp:            evt.Timestamp,
-			SourceType:           evt.SourceType,
-			SourceName:           evt.SourceName,
-			DestHost:             host,
-			HTTPMethod:           method,
-			HTTPPath:             rawPath,
-			HTTPStatus:           statusCode,
-			Verdict:              "recon",
-			Classification:       "edge_inferred",
-			Confidence:           result.LLMConfidence,
-			Reason:               reason,
-			MatchedVia:           result.Source,
-			MatchedPatternScope:  result.PatternScope,
-			MatchedPatternBucket: result.PatternBucket,
-			MatchedPatternValue:  result.PatternValue,
-			OriginEventID:        result.OriginEventID,
-			RawLine:              evt.Line,
-			NormalizedLine:       evt.NormalizedLine,
-			NormalizedHash:       evt.Hash,
-			Notified:             false,
-			Downgraded:           true,
-			DowngradeReason:      reason,
-			ResolutionStatus:     "resolved",
-			ResolutionMethod:     "bare_ip_default_server",
-			PreviousVerdict:      string(result.Verdict),
+		r.sink.Emit(httpOutcome{
+			eventID:   evt.ID,
+			rawLine:   evt.Line,
+			source:    evt.SourceName,
+			outcome:   requestcorr.OutcomeRecon,
+			timestamp: evt.Timestamp,
+			writeFinding: func(bool) {
+				r.db.SubmitFinding(&store.Finding{
+					EventID:              evt.ID,
+					Timestamp:            evt.Timestamp,
+					SourceType:           evt.SourceType,
+					SourceName:           evt.SourceName,
+					DestHost:             host,
+					HTTPMethod:           method,
+					HTTPPath:             rawPath,
+					HTTPStatus:           statusCode,
+					Verdict:              "recon",
+					Classification:       "edge_inferred",
+					Confidence:           result.LLMConfidence,
+					Reason:               reason,
+					MatchedVia:           result.Source,
+					MatchedPatternScope:  result.PatternScope,
+					MatchedPatternBucket: result.PatternBucket,
+					MatchedPatternValue:  result.PatternValue,
+					OriginEventID:        result.OriginEventID,
+					RawLine:              evt.Line,
+					NormalizedLine:       evt.NormalizedLine,
+					NormalizedHash:       evt.Hash,
+					Notified:             false,
+					Downgraded:           true,
+					DowngradeReason:      reason,
+					ResolutionStatus:     "resolved",
+					ResolutionMethod:     "bare_ip_default_server",
+					PreviousVerdict:      string(result.Verdict),
+				})
+			},
 		})
 		return
 	}

@@ -84,6 +84,7 @@ func newPartitionHarness(t *testing.T) *partitionHarness {
 		cfg:              Config{},
 		collector:        &fakeCollector{},
 		alertCoordinator: h.coord,
+		sink:             newHTTPOutcomeSink(Config{}),
 	}
 	return h
 }

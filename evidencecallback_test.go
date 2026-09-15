@@ -387,6 +387,7 @@ func TestEvidenceCallback_ClampedEventEscalates(t *testing.T) {
 		cfg:              Config{},
 		collector:        &stubEvidenceCollector{ev: ev},
 		alertCoordinator: coord,
+		sink:             newHTTPOutcomeSink(Config{}),
 	}
 
 	evt := httpAlertEvent()
@@ -449,6 +450,7 @@ func TestEvidenceCallback_DisclosureRepeatEscalatesEndToEnd(t *testing.T) {
 		cfg:              Config{},
 		collector:        &stubEvidenceCollector{ev: ev},
 		alertCoordinator: coord,
+		sink:             newHTTPOutcomeSink(Config{}),
 	}
 
 	evt := http404AlertEvent()

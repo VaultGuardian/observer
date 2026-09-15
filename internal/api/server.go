@@ -106,6 +106,12 @@ type Server struct {
 	// rate limiter, and the number of active notification channels.
 	getNotifierStats func() (dropped, rateLimited int64, channels int)
 
+	// getCorrelationStats exposes the request-lineage coalescer's counters to
+	// /api/stats (pipeline_health.correlation) without coupling the API server
+	// to the requestcorr package. Returns a ready-to-serialize block; nil when
+	// the feature is off. Installed by main after the sink is constructed.
+	getCorrelationStats func() map[string]interface{}
+
 	// health holds the pipeline-health telemetry sources, installed by main
 	// AFTER the server has started serving (the pipeline and coordinator do
 	// not exist yet at Start() time). One atomic pointer carries both the
@@ -177,6 +183,13 @@ func NewServer(
 // import internal/notifier.
 func (s *Server) SetNotifierStatsCallback(notifierStats func() (dropped, rateLimited int64, channels int)) {
 	s.getNotifierStats = notifierStats
+}
+
+// SetCorrelationStatsCallback wires the request-lineage coalescer's counters
+// into /api/stats (pipeline_health.correlation). Called from main after the
+// outcome sink is constructed.
+func (s *Server) SetCorrelationStatsCallback(correlationStats func() map[string]interface{}) {
+	s.getCorrelationStats = correlationStats
 }
 
 // SetCorrectionCallbacks wires the human correction system to the coordinator
@@ -634,8 +647,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"pending":            runtime.CoordinatorPending,
 			"capacity":           runtime.CoordinatorCapacity,
 			"capacity_evictions": runtime.CoordinatorCapacityEvictions,
+			// Promoted to first-class stats (request-lineage cut) as a
+			// cumulative parser-health signal. NOT an adoption gauge (it
+			// cannot fall); adoption reads from pipeline_health.correlation.
+			"hostless_keys": runtime.CoordinatorHostlessKeys,
 		}
 	}
+	// Request-lineage correlation counters (proxy topology instrumentation).
+	// Nil-safe: the block is omitted until main installs the callback, and the
+	// callback itself reports enabled=false when the feature is off.
+	if s.getCorrelationStats != nil {
+		pipelineHealth["correlation"] = s.getCorrelationStats()
+	}
+
 	result["pipeline_health"] = pipelineHealth
 
 	jsonOK(w, result)

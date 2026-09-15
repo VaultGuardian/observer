@@ -30,6 +30,7 @@ import (
 	"github.com/vaultguardian/observer/internal/patternstore"
 	"github.com/vaultguardian/observer/internal/policy"
 	"github.com/vaultguardian/observer/internal/rec"
+	"github.com/vaultguardian/observer/internal/requestcorr"
 	"github.com/vaultguardian/observer/internal/store"
 	syncengine "github.com/vaultguardian/observer/internal/sync"
 	"github.com/vaultguardian/observer/internal/watcher"
@@ -401,11 +402,19 @@ func main() {
 	expectedEndpointTracker := coordinator.NewExpectedEndpointTracker(coordinator.DefaultExpectedEndpointCap)
 	seedExpectedEndpointsFromDB(db, expectedEndpointTracker)
 
+	// ------- Request-lineage outcome sink (proxy topology instrumentation) -------
+	// Funnels every HTTP finding-producing path through the post-verdict
+	// lineage coalescer. Off by default (D8 pass-through) unless
+	// LINEAGE_ANCHOR_SOURCES is set. Constructed before the coordinator so the
+	// dispatch callback can hand it its outcomes; its settle/tombstone loop is
+	// started with the rest of the pipeline goroutines below.
+	lineageSink := newHTTPOutcomeSink(cfg)
+
 	// ------- Alert Coordinator -------
 	alertCoordinator := coordinator.New(
 		ctx,
 		coordinator.DefaultConfig(),
-		makeDispatchCallback(dispatch, db),
+		makeDispatchCallback(dispatch, db, lineageSink),
 		makeEvidenceCheckCallback(collector, llmClient, reclassCache, db, cfg, llmScheduler, ctx, expectedEndpointTracker),
 		makeVerifyCallback(db, llmClient, selfSuppress, cfg, llmScheduler, ctx),
 		selfSuppress,
@@ -480,6 +489,10 @@ func main() {
 		apiServer.SetNotifierStatsCallback(func() (dropped, rateLimited int64, channels int) {
 			return dispatch.DroppedCount(), dispatch.RateLimitedCount(), dispatch.ChannelCount()
 		})
+
+		// Request-lineage coalescer counters → /api/stats
+		// (pipeline_health.correlation). Reports enabled=false when off.
+		apiServer.SetCorrelationStatsCallback(lineageSink.statsBlock)
 	}
 
 	// ------- Ingestion Pipeline -------
@@ -499,7 +512,12 @@ func main() {
 		collector:        collector,
 		alertCoordinator: alertCoordinator,
 		dispatch:         dispatch,
+		sink:             lineageSink,
 	}
+
+	// Drive the lineage coalescer's settle/tombstone lifecycle (no-op when the
+	// feature is off).
+	go lineageSink.Run(ctx)
 
 	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, healthStats, policyEngine, dispatch)
 
@@ -555,6 +573,7 @@ func main() {
 				CoordinatorPending:           coordPending,
 				CoordinatorCapacity:          coordCapacity,
 				CoordinatorCapacityEvictions: coordEvictions,
+				CoordinatorHostlessKeys:      alertCoordinator.HostlessKeys(),
 			}
 		})
 	}
@@ -633,8 +652,22 @@ func main() {
 	// Producers are now quiesced BEFORE the writer is drained:
 	//
 	//   stop API → stop ingestion + drain pipeline/retry workers →
+	//   JOIN the request-lineage sink (barrier for accepted in-flight Emits) →
 	//   stop notifier → stop sync engine → persist patterns →
 	//   close DB (drains the findings writer, then closes SQLite)
+	//
+	// [R2-3] The lineage sink is BOTH a consumer (of pipeline outcomes) and has
+	// its own producers: makeDispatchCallback runs on the coordinator's
+	// finalize/evidence goroutines, which are not explicitly joined here (we do
+	// not treat loop-cancellation as proof they finished). So the sink itself
+	// owns a completion barrier: Shutdown() sets `closed` (late Emits then
+	// commit synchronously instead of parking), drains all parked findings, and
+	// WAITS for every ACCEPTED in-flight Emit — including those late synchronous
+	// commits already entered — to finish its finding write. A coordinator
+	// dispatch that arrives entirely after the barrier still writes directly to
+	// the store, which stays open until step 6. The barrier is placed after the
+	// pipeline drain (the bulk producer) and before the DB close, so no accepted
+	// finding write is outstanding when the writer drains.
 	log.Println("[observer] Shutting down...")
 
 	// 1. Stop API server - no new requests accepted, in-flight get 5s to finish.
@@ -668,6 +701,17 @@ func main() {
 		// closing it under a live producer would panic.
 		log.Println("[observer] Pipeline workers did not finish in time - skipping retry queue close")
 	}
+
+	// 2b. Join the request-lineage sink (F6 + R2-3 completion barrier).
+	// Producers on the pipeline side have stopped; the coordinator's dispatch
+	// goroutines may still deliver a late finalize, which now commits
+	// synchronously (closed) and is JOINED by the barrier below. Shutdown()
+	// flushes every pending coalesced finding to the store writer (suppressing
+	// new notifications) and BLOCKS until both the drain AND every accepted
+	// in-flight Emit have submitted their rows — so nothing is outstanding when
+	// the writer drains in step 6. No-op when the feature is off. ctx is
+	// already cancelled, so the Run goroutine's drain is in flight.
+	lineageSink.Shutdown()
 
 	// 3. Stop notifier dispatcher - drain queued alerts up to 3s, then drop.
 	if dispatch != nil {
@@ -771,7 +815,7 @@ func evidenceFields(e interface{}) (status string, code int, contentType string,
 	return
 }
 
-func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordinator.DispatchFunc {
+func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store, sink *httpOutcomeSink) coordinator.DispatchFunc {
 	return func(alert coordinator.FinalAlert) {
 		// Extract evidence fields once per dispatch - used by all three
 		// finding-write branches below.
@@ -795,42 +839,52 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				alert.EventID, alert.ScopeKey, alert.Reason, alert.DowngradeReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
-			// Fix 4: Set resolution status on downgraded findings
-			now := time.Now()
-			db.SubmitFinding(&store.Finding{
-				EventID:              alert.EventID,
-				Timestamp:            alert.Timestamp,
-				SourceType:           alert.SourceType,
-				SourceName:           sourceName,
-				DestHost:             alert.Host,
-				HTTPMethod:           alert.HTTPMethod,
-				HTTPPath:             alert.HTTPPath,
-				HTTPStatus:           alert.StatusCode,
-				ResponseBytes:        alert.ResponseBytes,
-				Verdict:              "downgraded",
-				Classification:       alert.Severity,
-				Reason:               alert.Reason,
-				MatchedVia:           alert.MatchedVia,
-				MatchedPatternScope:  alert.PatternScope,
-				MatchedPatternBucket: alert.PatternBucket,
-				MatchedPatternValue:  alert.PatternValue,
-				OriginEventID:        alert.OriginEventID,
-				RawLine:              alert.Line,
-				NormalizedHash:       alert.Hash,
-				CoordinatorKey:       alert.Key, // Real correlation key, not source identity
-				CoordinatorEvents:    alert.EventCount,
-				EvidenceStatus:       evStatus,
-				EvidenceStatusCode:   evCode,
-				EvidenceContentType:  evCT,
-				EvidenceBodyHash:     evHash,
-				EvidenceCaptureMode:  evMode,
-				Downgraded:           true,
-				DowngradeReason:      alert.DowngradeReason,
-				Notified:             false,
-				ResolutionStatus:     "resolved",
-				ResolvedAt:           &now,
-				ResolutionMethod:     "rec_evidence",
-				PreviousVerdict:      alert.Verdict,
+			// Fix 4: Set resolution status on downgraded findings. SevSafe;
+			// never notifies. Routed through the lineage sink.
+			sink.Emit(httpOutcome{
+				eventID:   alert.EventID,
+				rawLine:   alert.Line,
+				source:    sourceName,
+				outcome:   requestcorr.OutcomeDowngraded,
+				timestamp: alert.Timestamp,
+				writeFinding: func(bool) {
+					now := time.Now()
+					db.SubmitFinding(&store.Finding{
+						EventID:              alert.EventID,
+						Timestamp:            alert.Timestamp,
+						SourceType:           alert.SourceType,
+						SourceName:           sourceName,
+						DestHost:             alert.Host,
+						HTTPMethod:           alert.HTTPMethod,
+						HTTPPath:             alert.HTTPPath,
+						HTTPStatus:           alert.StatusCode,
+						ResponseBytes:        alert.ResponseBytes,
+						Verdict:              "downgraded",
+						Classification:       alert.Severity,
+						Reason:               alert.Reason,
+						MatchedVia:           alert.MatchedVia,
+						MatchedPatternScope:  alert.PatternScope,
+						MatchedPatternBucket: alert.PatternBucket,
+						MatchedPatternValue:  alert.PatternValue,
+						OriginEventID:        alert.OriginEventID,
+						RawLine:              alert.Line,
+						NormalizedHash:       alert.Hash,
+						CoordinatorKey:       alert.Key, // Real correlation key, not source identity
+						CoordinatorEvents:    alert.EventCount,
+						EvidenceStatus:       evStatus,
+						EvidenceStatusCode:   evCode,
+						EvidenceContentType:  evCT,
+						EvidenceBodyHash:     evHash,
+						EvidenceCaptureMode:  evMode,
+						Downgraded:           true,
+						DowngradeReason:      alert.DowngradeReason,
+						Notified:             false,
+						ResolutionStatus:     "resolved",
+						ResolvedAt:           &now,
+						ResolutionMethod:     "rec_evidence",
+						PreviousVerdict:      alert.Verdict,
+					})
+				},
 			})
 			return
 		}
@@ -842,57 +896,69 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 				alert.EventID, alert.ScopeKey, alert.EscalateReason,
 				alert.EvidenceJournal, truncate(alert.Line, 200))
 
-			// Compute notified by trying to dispatch. The notified flag in
-			// the finding must reflect whether anything actually entered a
-			// notifier queue - queue-full drops or no-channels-configured
-			// both count as "not notified."
-			notified := false
-			if alert.BuildAlert != nil {
-				// Section 3 / Finding 7: pass the coordinator's already-attached
-				// evidence to the closure instead of doing a second host-less
-				// REC lookup at dispatch time.
-				if builtAlert, ok := alert.BuildAlert(alert.Evidence).(notifier.Alert); ok {
-					builtAlert.Severity = notifier.SeverityMalicious
-					builtAlert.Reason = alert.EscalateReason
-					if dispatch.Dispatch(context.Background(), builtAlert) > 0 {
-						notified = true
+			// Escalation is the sole actionable HTTP outcome (SevActionable).
+			// The notification is immediate even under coalescing (D6); only the
+			// finding ROW may be delayed for a settle window. The notify closure
+			// carries the original dispatch, returning whether anything actually
+			// entered a notifier queue (queue-full / no-channels = not notified).
+			sink.Emit(httpOutcome{
+				eventID:   alert.EventID,
+				rawLine:   alert.Line,
+				source:    sourceName,
+				outcome:   requestcorr.OutcomeEscalated,
+				timestamp: alert.Timestamp,
+				notify: func() bool {
+					notified := false
+					if alert.BuildAlert != nil {
+						// Section 3 / Finding 7: pass the coordinator's
+						// already-attached evidence to the closure instead of a
+						// second host-less REC lookup at dispatch time.
+						if builtAlert, ok := alert.BuildAlert(alert.Evidence).(notifier.Alert); ok {
+							builtAlert.Severity = notifier.SeverityMalicious
+							builtAlert.Reason = alert.EscalateReason
+							if dispatch.Dispatch(context.Background(), builtAlert) > 0 {
+								notified = true
+							}
+						}
 					}
-				}
-			}
-
-			now := time.Now()
-			db.SubmitFinding(&store.Finding{
-				EventID:              alert.EventID,
-				Timestamp:            alert.Timestamp,
-				SourceType:           alert.SourceType,
-				SourceName:           sourceName,
-				DestHost:             alert.Host,
-				HTTPMethod:           alert.HTTPMethod,
-				HTTPPath:             alert.HTTPPath,
-				HTTPStatus:           alert.StatusCode,
-				ResponseBytes:        alert.ResponseBytes,
-				Verdict:              "malicious",
-				Classification:       "malicious",
-				Reason:               alert.EscalateReason,
-				MatchedVia:           alert.MatchedVia,
-				MatchedPatternScope:  alert.PatternScope,
-				MatchedPatternBucket: alert.PatternBucket,
-				MatchedPatternValue:  alert.PatternValue,
-				OriginEventID:        alert.OriginEventID,
-				RawLine:              alert.Line,
-				NormalizedHash:       alert.Hash,
-				CoordinatorKey:       alert.Key, // Real correlation key, not source identity
-				CoordinatorEvents:    alert.EventCount,
-				EvidenceStatus:       evStatus,
-				EvidenceStatusCode:   evCode,
-				EvidenceContentType:  evCT,
-				EvidenceBodyHash:     evHash,
-				EvidenceCaptureMode:  evMode,
-				Notified:             notified,
-				ResolutionStatus:     "resolved",
-				ResolvedAt:           &now,
-				ResolutionMethod:     "rec_evidence",
-				PreviousVerdict:      "alert",
+					return notified
+				},
+				writeFinding: func(notified bool) {
+					now := time.Now()
+					db.SubmitFinding(&store.Finding{
+						EventID:              alert.EventID,
+						Timestamp:            alert.Timestamp,
+						SourceType:           alert.SourceType,
+						SourceName:           sourceName,
+						DestHost:             alert.Host,
+						HTTPMethod:           alert.HTTPMethod,
+						HTTPPath:             alert.HTTPPath,
+						HTTPStatus:           alert.StatusCode,
+						ResponseBytes:        alert.ResponseBytes,
+						Verdict:              "malicious",
+						Classification:       "malicious",
+						Reason:               alert.EscalateReason,
+						MatchedVia:           alert.MatchedVia,
+						MatchedPatternScope:  alert.PatternScope,
+						MatchedPatternBucket: alert.PatternBucket,
+						MatchedPatternValue:  alert.PatternValue,
+						OriginEventID:        alert.OriginEventID,
+						RawLine:              alert.Line,
+						NormalizedHash:       alert.Hash,
+						CoordinatorKey:       alert.Key, // Real correlation key, not source identity
+						CoordinatorEvents:    alert.EventCount,
+						EvidenceStatus:       evStatus,
+						EvidenceStatusCode:   evCode,
+						EvidenceContentType:  evCT,
+						EvidenceBodyHash:     evHash,
+						EvidenceCaptureMode:  evMode,
+						Notified:             notified,
+						ResolutionStatus:     "resolved",
+						ResolvedAt:           &now,
+						ResolutionMethod:     "rec_evidence",
+						PreviousVerdict:      "alert",
+					})
+				},
 			})
 			return
 		}
@@ -919,36 +985,47 @@ func makeDispatchCallback(dispatch *notifier.Dispatcher, db *store.Store) coordi
 			log.Printf("[dispatch] WARN: LLM-matched malicious reached unresolved dispatch (event=%s) - should be impossible after the T1 clamp; investigate", alert.EventID)
 		}
 
-		// Fix 4: Non-resolved findings get "pending" resolution status
-		db.SubmitFinding(&store.Finding{
-			EventID:              alert.EventID,
-			Timestamp:            alert.Timestamp,
-			SourceType:           alert.SourceType,
-			SourceName:           sourceName,
-			DestHost:             alert.Host,
-			HTTPMethod:           alert.HTTPMethod,
-			HTTPPath:             alert.HTTPPath,
-			HTTPStatus:           alert.StatusCode,
-			ResponseBytes:        alert.ResponseBytes,
-			Verdict:              alert.Verdict,
-			Classification:       alert.Severity,
-			Reason:               alert.Reason,
-			MatchedVia:           alert.MatchedVia,
-			MatchedPatternScope:  alert.PatternScope,
-			MatchedPatternBucket: alert.PatternBucket,
-			MatchedPatternValue:  alert.PatternValue,
-			OriginEventID:        alert.OriginEventID,
-			RawLine:              alert.Line,
-			NormalizedHash:       alert.Hash,
-			CoordinatorKey:       alert.Key, // Real correlation key, not source identity
-			CoordinatorEvents:    alert.EventCount,
-			EvidenceStatus:       evStatus,
-			EvidenceStatusCode:   evCode,
-			EvidenceContentType:  evCT,
-			EvidenceBodyHash:     evHash,
-			EvidenceCaptureMode:  evMode,
-			Notified:             false,
-			ResolutionStatus:     "pending",
+		// Fix 4: Non-resolved findings get "pending" resolution status.
+		// SevUnresolved; never notifies at dispatch time (evidence still
+		// pending). Routed through the lineage sink.
+		sink.Emit(httpOutcome{
+			eventID:   alert.EventID,
+			rawLine:   alert.Line,
+			source:    sourceName,
+			outcome:   requestcorr.OutcomeUnresolved,
+			timestamp: alert.Timestamp,
+			writeFinding: func(bool) {
+				db.SubmitFinding(&store.Finding{
+					EventID:              alert.EventID,
+					Timestamp:            alert.Timestamp,
+					SourceType:           alert.SourceType,
+					SourceName:           sourceName,
+					DestHost:             alert.Host,
+					HTTPMethod:           alert.HTTPMethod,
+					HTTPPath:             alert.HTTPPath,
+					HTTPStatus:           alert.StatusCode,
+					ResponseBytes:        alert.ResponseBytes,
+					Verdict:              alert.Verdict,
+					Classification:       alert.Severity,
+					Reason:               alert.Reason,
+					MatchedVia:           alert.MatchedVia,
+					MatchedPatternScope:  alert.PatternScope,
+					MatchedPatternBucket: alert.PatternBucket,
+					MatchedPatternValue:  alert.PatternValue,
+					OriginEventID:        alert.OriginEventID,
+					RawLine:              alert.Line,
+					NormalizedHash:       alert.Hash,
+					CoordinatorKey:       alert.Key, // Real correlation key, not source identity
+					CoordinatorEvents:    alert.EventCount,
+					EvidenceStatus:       evStatus,
+					EvidenceStatusCode:   evCode,
+					EvidenceContentType:  evCT,
+					EvidenceBodyHash:     evHash,
+					EvidenceCaptureMode:  evMode,
+					Notified:             false,
+					ResolutionStatus:     "pending",
+				})
+			},
 		})
 	}
 }

@@ -363,6 +363,54 @@ Additional REC tuning knobs exist (`REC_FLOW_*`, `REC_REASSEMBLY_MAX_BUFFERED_PA
 
 When configured, escalation emails include the `HOSTNAME` (above) and the server's primary IP, so it's obvious which machine fired the alert when you're running Observer on multiple servers.
 
+### Proxy topology instrumentation (optional)
+
+One HTTP request that crosses a proxy topology (edge nginx → backend app) is logged twice — once by each hop. Uninstrumented, Observer treats those as two independent observations: two dashboard findings, two evidence lookups, and, on a confirmed breach, **two escalation emails for one attack**. This is by design — the correlation key deliberately keeps distinct services apart, and the edge and backend log different byte counts and hosts, so the two lines can never structurally join.
+
+This is **opt-in and off by default**. Leaving it off changes nothing: uninstrumented deployments behave exactly as before.
+
+To coalesce the duplicates into one logical finding, have the edge proxy stamp a trusted per-request ID and both hops log it, then declare the edge as the anchor source. Correlation happens **only** through that trusted ID — Observer never guesses a pairing from timing, response shape, or byte counts, because in an identical-response flood such guesses can be manufactured by an attacker. No ID means no correlation, and double-counting one attack is always preferred over merging two.
+
+**1. CapRover root nginx template** (`/etc/nginx/nginx.conf`) — append a trailing ` vgrid=$request_id` to the existing `log_format main` (the root-level `access_log ... main if=$ip_in_log` picks it up for every app).
+
+This is an **EDIT ILLUSTRATION** — you keep your own existing fields and only add the suffix:
+
+```nginx
+log_format main '... your existing fields ...' ' vgrid=$request_id';
+```
+
+The real line as deployed on the soak box is the stock CapRover `log_format main` with exactly that suffix appended, emitting log lines of this shape (copyable reference, from the design's A1 record):
+
+```
+107.155.87.173 - - [15/Sep/2026:04:01:00 +0000] "wp.soak.vaultguardian.io" "GET /?vg-lineage-test=3 HTTP/2.0" 200 70037 "-" "curl/8.5.0" "-" vgrid=2fb2cf19c82b36ceb7f89d50b381fcf1
+```
+
+**2. Per-app proxy template** (the wp app's main proxy `location`) — forward the ID to the backend, right after the `X-Forwarded-Proto` line. Do **not** add an `add_header`; the ID must never be echoed to the internet:
+
+```nginx
+proxy_set_header X-VaultGuardian-Request-ID $request_id;
+```
+
+**3. Apache backend** — mount a host file `/var/lib/vg-lineage/zz-vg-lineage.conf` to `/etc/apache2/conf-enabled/zz-vg-lineage.conf`, redefining `combined` to log the forwarded header:
+
+```apache
+LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\" vgrid=%{X-VaultGuardian-Request-ID}i" combined
+```
+
+**4. Declare the anchor source** in Observer's environment:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LINEAGE_ANCHOR_SOURCES` | (none) | Comma-separated source/container names that generate the trusted ingress ID (your edge proxy, e.g. `captain-nginx`). Empty = feature entirely off. |
+
+Only observations from an anchor source can anchor a lineage; a backend that self-labels requests with an ID it minted itself is never coalesced by this layer. The token is a volatile per-request value: it is stripped before normalization and never enters a learned pattern or cache key.
+
+Watch `pipeline_health.correlation` in `/api/stats`: `multi_observation_groups_total` and `observations_absorbed_total` climbing are the adoption signals (proxy-topology duplicates being removed). `anchor_conflicts_total` and `invalid_ids_total` must stay near zero. (`coordinator.hostless_keys` is a lifetime cumulative counter — a parser-health signal, not an adoption gauge; it cannot fall.)
+
+> **REC-disabled boundary.** Coalescing engages on the finding paths that flow through the sink (the recon/status/bare-IP shortcuts and the coordinator dispatch). When REC (evidence capture) is disabled, an HTTP finding takes the direct-dispatch branch, which does **not** enter the sink and therefore is **not** coalesced — instrumented or not. Coalescing targets REC-enabled deployments; with REC off you still get one finding per log line.
+
+> **Not a flood guarantee.** This layer never *creates* findings and does not promise "N requests ⇒ N findings" under a flood: the upstream coordinator already huddles identical-shape requests into one investigation before an outcome ever reaches the sink. What it guarantees is that it removes the proxy-topology duplicate it can *prove* via the trusted ID, and never merges two requests it cannot.
+
 ---
 
 ## What it catches

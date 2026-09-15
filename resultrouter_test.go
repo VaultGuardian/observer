@@ -60,6 +60,7 @@ func newTestRouter(t *testing.T) (*resultRouter, *fakeCollector) {
 		cfg:              Config{},
 		collector:        fc,
 		alertCoordinator: coord,
+		sink:             newHTTPOutcomeSink(Config{}),
 	}, fc
 }
 

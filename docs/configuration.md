@@ -77,6 +77,18 @@ LLM_API_KEY=sk-xxxxxxxx
 | `ALERT_EMAIL_TO` | (none) | Destination address for alert emails |
 | `ALERT_EMAIL_FROM` | `VaultGuardian Observer <onboarding@resend.dev>` | Sender address. Must be verified in **your** Resend account. The default uses Resend's sandbox sender, which works without domain setup; switch to your own verified domain once you have one. |
 
+## Proxy topology instrumentation (optional)
+
+Opt-in request-lineage coalescing. When an HTTP request is logged by both an edge proxy and its backend, the two log lines double-count as two findings and, on a confirmed breach, two escalation emails. Instrument the edge to stamp a trusted per-request ID that both hops log, then declare the edge as the anchor source, and the duplicates coalesce into one finding with one notification. Off by default — uninstrumented behavior is unchanged. Correlation is only ever through the trusted ID; there are no timing/shape heuristics. See the README "Proxy topology instrumentation" section for the nginx/Apache log setup.
+
+| Variable | Default | Description |
+|---|---|---|
+| `LINEAGE_ANCHOR_SOURCES` | (none) | Comma-separated source/container names that generate the trusted ingress ID (your edge proxy, e.g. `captain-nginx`). Empty = feature entirely off. |
+
+Adoption/health signals live in `/api/stats` under `pipeline_health.correlation`: `multi_observation_groups_total` and `observations_absorbed_total` rising indicate proxy-topology duplicates being removed; `anchor_conflicts_total` and `invalid_ids_total` must stay near zero. `pipeline_health.coordinator.hostless_keys` is a lifetime cumulative counter (a parser-health signal that cannot fall), not an adoption gauge.
+
+**REC-disabled boundary:** coalescing engages only on the finding paths that flow through the sink (the recon/status/bare-IP shortcuts and the coordinator dispatch). With REC disabled, an HTTP finding takes the direct-dispatch branch, which bypasses the sink and is not coalesced. The feature targets REC-enabled deployments.
+
 ## Response Evidence Capture (REC)
 
 REC sniffs the reverse proxy's network namespace to capture the HTTP

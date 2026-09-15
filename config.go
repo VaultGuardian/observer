@@ -160,6 +160,19 @@ type Config struct {
 	SyncCommandEpoch    string
 	SyncCommandInterval time.Duration
 	SyncCommandsEnabled bool
+
+	// Request-lineage coalescing (proxy topology instrumentation).
+	//
+	// LineageAnchorSources is the set of source/container names the operator
+	// has declared as trusted-ingress anchors (frozen design D2): the edge
+	// proxy that generates the per-request vgrid ID. Only observations from an
+	// anchor source can anchor a lineage; unanchored IDs never coalesce.
+	//
+	// LINEAGE_ANCHOR_SOURCES is a comma list of names. Empty = the feature is
+	// entirely OFF (LineageEnabled false), and every finding path is a
+	// structural pass-through (D8) — zero added work on the hot path.
+	LineageAnchorSources map[string]bool
+	LineageEnabled       bool
 }
 
 // LoadConfig reads configuration from environment variables with sane defaults.
@@ -423,6 +436,22 @@ func LoadConfig() Config {
 	default:
 		log.Printf("[sync] command channel disabled (pairing incomplete: missing %s)",
 			strings.Join(missing, ", "))
+	}
+
+	// Request-lineage anchor sources (proxy topology instrumentation, D2).
+	// Same comma-list shape as EXCLUDE_CONTAINERS. Empty = feature off.
+	cfg.LineageAnchorSources = make(map[string]bool)
+	if raw := getEnv("LINEAGE_ANCHOR_SOURCES", ""); raw != "" {
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				cfg.LineageAnchorSources[name] = true
+			}
+		}
+		cfg.LineageEnabled = len(cfg.LineageAnchorSources) > 0
+		if cfg.LineageEnabled {
+			log.Printf("[observer] Request-lineage coalescing enabled; anchor sources: %s", raw)
+		}
 	}
 
 	// Journald watcher

@@ -67,7 +67,7 @@ func TestDispatchCallbackPersistsBareSourceName(t *testing.T) {
 
 			// dispatch is nil-safe here: the Downgraded branch persists the
 			// finding without ever touching the dispatcher.
-			cb := makeDispatchCallback(nil, db)
+			cb := makeDispatchCallback(nil, db, newHTTPOutcomeSink(Config{}))
 			cb(tc.alert)
 
 			f, err := db.GetFindingByEventID(context.Background(), tc.alert.EventID)
@@ -104,7 +104,7 @@ func TestDispatchCallbackEvidenceBearingPendingStaysOutOfTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	cb := makeDispatchCallback(nil, db)
+	cb := makeDispatchCallback(nil, db, newHTTPOutcomeSink(Config{}))
 
 	// Evidence-bearing pending: reaches the third branch (BuildAlert non-nil,
 	// not escalated, not downgraded) with high-confidence evidence attached.

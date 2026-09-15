@@ -57,6 +57,13 @@ type RuntimeSnapshot struct {
 	CoordinatorPending           int
 	CoordinatorCapacity          int
 	CoordinatorCapacityEvictions int64
+	// CoordinatorHostlessKeys is the lifetime count of investigations opened
+	// with the "<unknown-host>" placeholder. Promoted to first-class stats
+	// alongside the request-lineage correlation block as a parser-health
+	// signal (backend lines losing host attribution). It is CUMULATIVE and
+	// cannot fall, so it is not an adoption gauge — adoption reads from the
+	// correlation block's multi_observation_groups/observations_absorbed.
+	CoordinatorHostlessKeys int64
 }
 
 // NewStats constructs the process-run stats. The epoch is a random ID

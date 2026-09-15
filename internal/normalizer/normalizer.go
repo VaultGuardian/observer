@@ -3,11 +3,29 @@ package normalizer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/vaultguardian/observer/internal/event"
 )
+
+// reLineageToken matches a trailing ` vgrid=<value>` request-lineage token.
+// The token is a volatile per-request value (nginx $request_id) appended to
+// access logs by the proxy-topology instrumentation. It MUST be stripped
+// before normalization: if it survived into the normalized line it would
+// enter the hash, learned patterns, and cache keys, poisoning the pattern
+// store (each request would look structurally unique). See frozen design D3.
+// \S* (not \S+) also strips a present-but-empty `vgrid=` or whitespace-only
+// tail, so the empty-token form (F7) never survives into normalized output.
+var reLineageToken = regexp.MustCompile(`\s+vgrid=\S*\s*$`)
+
+// stripLineageToken removes a trailing vgrid request-lineage token so it never
+// reaches a normalizer. Lines without the token are returned unchanged, so
+// normalized output is byte-identical with and without instrumentation.
+func stripLineageToken(line string) string {
+	return reLineageToken.ReplaceAllString(line, "")
+}
 
 // Normalizer transforms a raw log line into a stable, hashable form
 // by stripping source-family-specific variable fields (timestamps, PIDs,
@@ -109,6 +127,11 @@ func (r *Registry) NormalizeEvent(e *event.Event) {
 
 	// Strip collector framing ONCE, upstream of all normalizers.
 	line := stripCollectorFraming(e.Line)
+
+	// Strip the request-lineage token (D3) before any normalizer sees the
+	// line, so the volatile per-request vgrid value can never enter the
+	// normalized line, the hash, learned patterns, or a cache key.
+	line = stripLineageToken(line)
 
 	e.NormalizedLine = n.Normalize(line)
 	e.Hash = hashLine(e.NormalizedLine)

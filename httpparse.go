@@ -310,6 +310,80 @@ func recDeterministicDisclosureForEvent(collector rec.EvidenceCollector, evt *ev
 	return deterministicDisclosure(ev)
 }
 
+// =============================================================================
+// Request lineage token (vgrid) extraction — Part 1 / frozen design D3
+// =============================================================================
+//
+// The edge proxy generates a fresh random 32-hex request ID per request
+// (nginx $request_id), forwards it as X-VaultGuardian-Request-ID, and both
+// edge and backend append it to their access logs as a trailing ` vgrid=<token>`
+// field (see the A1 instrumentation record). The token is the ONLY thing that
+// proves two log observations describe one request; there is no heuristic
+// fallback, by design.
+//
+// Token discipline (D3): exactly 32 lowercase hex characters. Anything else is
+// invalid (counted, ignored). The token appears ONLY on the raw server-side log
+// line — it is stripped before normalization (see internal/normalizer:
+// stripLineageToken) so it can never enter a normalized line, a learned
+// pattern, or a cache key (volatile per-request tokens would poison the
+// pattern store).
+//
+// vgrid appears as the last field of every instrumented format, so a single
+// end-anchored match handles Format 1/2/3/4 alike.
+
+// reVgridToken captures the raw token value of a trailing ` vgrid=<value>`
+// field. Anchored to end-of-line: vgrid is always the last logged field. The
+// value group is \S* (not \S+) so a PRESENT-but-empty `vgrid=` (or a
+// whitespace-only tail) still MATCHES and is classified invalid, not missing
+// (F7). Absence of the key altogether yields no match ⇒ missing.
+var reVgridToken = regexp.MustCompile(`(?:^|\s)vgrid=(\S*)\s*$`)
+
+// reLineageID is the D3 validity gate: exactly 32 lowercase hex.
+var reLineageID = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// lineageStatus classifies the vgrid field on a log line for telemetry.
+type lineageStatus int
+
+const (
+	// lineageMissing: no vgrid key at all, or the explicit `vgrid=-` sentinel
+	// that nginx logs when the header is absent (D3: "vgrid=- means header
+	// absent, count under missing not invalid").
+	lineageMissing lineageStatus = iota
+	// lineageValid: a syntactically valid 32-hex trusted ID.
+	lineageValid
+	// lineageInvalid: a vgrid key was present but the value is malformed
+	// (wrong length, uppercase, non-hex). Counted as a correctness alarm.
+	lineageInvalid
+)
+
+// extractLineageID parses the trailing vgrid token from a RAW log line and
+// validates it per D3. Returns the valid 32-hex ID (empty unless status is
+// lineageValid) and the status classification for counter instrumentation.
+//
+// USE THE RAW LINE (evt.Line / FinalAlert.Line): the token is deliberately
+// stripped from the normalized line, so parseNormalizedLine's input never
+// carries it.
+func extractLineageID(raw string) (string, lineageStatus) {
+	m := reVgridToken.FindStringSubmatch(raw)
+	if m == nil {
+		// No vgrid key present at all.
+		return "", lineageMissing
+	}
+	tok := m[1]
+	if tok == "-" {
+		// Header absent at generation time — nginx logged the placeholder.
+		return "", lineageMissing
+	}
+	if reLineageID.MatchString(tok) {
+		return tok, lineageValid
+	}
+	// The key was present but the value is malformed — wrong length/charset,
+	// or empty/whitespace-only (F7). A present-but-empty token is a
+	// misconfiguration/attacker signal, not an honest "no header", so it is
+	// counted as invalid rather than missing.
+	return "", lineageInvalid
+}
+
 // isBareIP returns true if the host string is an IP address rather than a
 // domain name. Handles IPv4, IPv6, and host:port formats.
 //
