@@ -57,7 +57,10 @@ func TestBackendFirstEscalationCoalesces(t *testing.T) {
 	}
 	// F3 (round-2): the ledger records SUCCESS, not intent. The owner feeds the
 	// enqueue result back; only then does the next actionable sibling dedupe.
-	tr.NotifyResult(idA, "ev_back", SevActionable, true)
+	// Round-5: the result is addressed by the ATTEMPT TOKEN the directive minted,
+	// not by EventID — a superseded attempt can no longer disturb a live one.
+	fire1, _ := firstOfKind(d1, DirNotifyFire)
+	tr.NotifyResult(idA, fire1.Token, SevActionable, true)
 
 	d2 := tr.Observe(obs(idA, anchorSrc, true, "ev_nginx", OutcomeEscalated))
 	if countKind(d2, DirNotifySuppressed) != 1 {
@@ -187,7 +190,8 @@ func TestTombstoneAttachLateUpgradeIsDurable(t *testing.T) {
 	}
 	// A second, equally-severe late escalation now: high-water no longer below ⇒
 	// no new row; and (were the first fire successful) no further notify.
-	tr.NotifyResult(idA, "ev_late_esc", SevActionable, true) // record the fire's success
+	lateFire, _ := firstOfKind(dHigh, DirNotifyFire)
+	tr.NotifyResult(idA, lateFire.Token, SevActionable, true) // record the fire's success
 	dHigh2 := tr.Observe(obs(idA, backSrc, false, "ev_late_esc2", OutcomeEscalated))
 	if countKind(dHigh2, DirEmitIndependent) != 0 || countKind(dHigh2, DirDrop) != 1 {
 		t.Errorf("equal-severity straggler must add no row (monotonic high-water), got %+v", dHigh2)

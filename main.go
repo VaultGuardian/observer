@@ -516,7 +516,9 @@ func main() {
 	}
 
 	// Drive the lineage coalescer's settle/tombstone lifecycle (no-op when the
-	// feature is off).
+	// feature is off). Run owns the write callbacks its Ticks select, so
+	// lineageSink.Shutdown() in step 2b JOINS this goroutine before main lets
+	// the findings writer close.
 	go lineageSink.Run(ctx)
 
 	pipelineHandler := makeLogHandler(cfg, a, collector, alertCoordinator, db, router, retryQueue, healthStats, policyEngine, dispatch)
@@ -652,22 +654,27 @@ func main() {
 	// Producers are now quiesced BEFORE the writer is drained:
 	//
 	//   stop API → stop ingestion + drain pipeline/retry workers →
-	//   JOIN the request-lineage sink (barrier for accepted in-flight Emits) →
+	//   JOIN the request-lineage sink (barrier for ALL accepted sink work) →
 	//   stop notifier → stop sync engine → persist patterns →
 	//   close DB (drains the findings writer, then closes SQLite)
 	//
-	// [R2-3] The lineage sink is BOTH a consumer (of pipeline outcomes) and has
-	// its own producers: makeDispatchCallback runs on the coordinator's
-	// finalize/evidence goroutines, which are not explicitly joined here (we do
-	// not treat loop-cancellation as proof they finished). So the sink itself
-	// owns a completion barrier: Shutdown() sets `closed` (late Emits then
-	// commit synchronously instead of parking), drains all parked findings, and
-	// WAITS for every ACCEPTED in-flight Emit — including those late synchronous
-	// commits already entered — to finish its finding write. A coordinator
-	// dispatch that arrives entirely after the barrier still writes directly to
-	// the store, which stays open until step 6. The barrier is placed after the
-	// pipeline drain (the bulk producer) and before the DB close, so no accepted
-	// finding write is outstanding when the writer drains.
+	// [R2-3 / round-5] The lineage sink is BOTH a consumer (of pipeline
+	// outcomes) and has its own producers: makeDispatchCallback runs on the
+	// coordinator's finalize/evidence goroutines, which are not explicitly
+	// joined here (we do not treat loop-cancellation as proof they finished).
+	// So the sink itself owns a completion barrier. Shutdown() sets `closed`
+	// (late Emits then commit synchronously instead of parking), drains every
+	// parked finding, and then waits on its detached-work REGISTRY — one entry
+	// per callback execution, registered in the same critical section that
+	// selected it — until nothing is outstanding. That covers Emit-applied,
+	// Tick-applied, drain-applied and retry work alike, including a row write
+	// deferred to an in-flight notification. It also JOINS the sink's Run loop,
+	// because a write callback selected by a Tick belongs to Run rather than to
+	// any Emit. A coordinator dispatch that arrives entirely after the barrier
+	// still writes directly to the store, which stays open until step 6. The
+	// barrier is placed after the pipeline drain (the bulk producer) and before
+	// the DB close, so no accepted finding write is outstanding when the writer
+	// drains.
 	log.Println("[observer] Shutting down...")
 
 	// 1. Stop API server - no new requests accepted, in-flight get 5s to finish.
@@ -702,15 +709,24 @@ func main() {
 		log.Println("[observer] Pipeline workers did not finish in time - skipping retry queue close")
 	}
 
-	// 2b. Join the request-lineage sink (F6 + R2-3 completion barrier).
+	// 2b. Join the request-lineage sink (F6 + round-5/6 completion barrier).
 	// Producers on the pipeline side have stopped; the coordinator's dispatch
 	// goroutines may still deliver a late finalize, which now commits
-	// synchronously (closed) and is JOINED by the barrier below. Shutdown()
-	// flushes every pending coalesced finding to the store writer (suppressing
-	// new notifications) and BLOCKS until both the drain AND every accepted
-	// in-flight Emit have submitted their rows — so nothing is outstanding when
-	// the writer drains in step 6. No-op when the feature is off. ctx is
-	// already cancelled, so the Run goroutine's drain is in flight.
+	// synchronously (closed) and is registered like any other accepted work.
+	// Shutdown() flushes every pending coalesced finding to the store writer
+	// (suppressing NEW notifications, waiting out in-flight ones) and BLOCKS
+	// until the registry is empty AND the Run loop below has exited — so
+	// nothing is outstanding when the writer drains in step 6. No-op when the
+	// feature is off. ctx is already cancelled, so the Run goroutine is on its
+	// way out and Shutdown joins it rather than assuming it.
+	//
+	// DOCUMENTED LIMITATION (carried forward, unchanged): the sink still accepts
+	// synchronous commits after `closed`, and main does not join the coordinator's
+	// dispatch/evidence producers. The registry drains all ACCEPTED work; it does
+	// not stop future producers, and keeping the database open until step 6 is not
+	// by itself a guarantee that an entirely later callback finishes before the
+	// close. Closing that gap is the producer/admission boundary, which is a
+	// separate piece of work from this barrier.
 	lineageSink.Shutdown()
 
 	// 3. Stop notifier dispatcher - drain queued alerts up to 3s, then drop.

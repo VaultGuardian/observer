@@ -367,7 +367,9 @@ When configured, escalation emails include the `HOSTNAME` (above) and the server
 
 One HTTP request that crosses a proxy topology (edge nginx → backend app) is logged twice — once by each hop. Uninstrumented, Observer treats those as two independent observations: two dashboard findings, two evidence lookups, and, on a confirmed breach, **two escalation emails for one attack**. This is by design — the correlation key deliberately keeps distinct services apart, and the edge and backend log different byte counts and hosts, so the two lines can never structurally join.
 
-This is **opt-in and off by default**. Leaving it off changes nothing: uninstrumented deployments behave exactly as before.
+This is **opt-in and off by default**. Leaving it off changes nothing: uninstrumented deployments behave exactly as before — with the feature off, the outcome commits straight through (notify, then write) with no lineage extraction, no lock and no bookkeeping.
+
+> **Pass-through cost once it is enabled.** A log line that carries no trusted ID still commits synchronously, in the same order, with the callbacks run outside any lock — but the sink does take its mutex once per outcome, solely for admission and shutdown-registry accounting (constant work: no lineage tracking, no grouping, no allocation). That registration is what lets an ordered shutdown prove every accepted finding reached the store writer before the database closes. Feature-off remains fully lock-free.
 
 To coalesce the duplicates into one logical finding, have the edge proxy stamp a trusted per-request ID and both hops log it, then declare the edge as the anchor source. Correlation happens **only** through that trusted ID — Observer never guesses a pairing from timing, response shape, or byte counts, because in an identical-response flood such guesses can be manufactured by an attacker. No ID means no correlation, and double-counting one attack is always preferred over merging two.
 

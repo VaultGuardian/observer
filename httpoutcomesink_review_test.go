@@ -33,7 +33,8 @@ func setupReview() (*httpOutcomeSink, *reviewClock) {
 	return s, c
 }
 
-const reviewRaw = `x vgrid=2fb2cf19c82b36ceb7f89d50b381fcf1`
+const reviewLineageID = "2fb2cf19c82b36ceb7f89d50b381fcf1"
+const reviewRaw = `x vgrid=` + reviewLineageID
 
 func outcome(id, src string, o requestcorr.Outcome, notify func() bool, write func(bool)) httpOutcome {
 	return httpOutcome{eventID: id, rawLine: reviewRaw, source: src, outcome: o, notify: notify, writeFinding: write}
