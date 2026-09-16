@@ -825,7 +825,7 @@ case "$1" in
     echo "Usage: vaultguardian <command> [args]"
     echo ""
     echo "  update [version]  Download and deploy (default: latest)"
-    echo "  pair <code>       Connect to the hosted dashboard with a pairing code"
+    echo "  pair --url URL <code>  Connect to a compatible hosted dashboard (URL required first time)"
     echo "  logs              Tail observer logs"
     echo "  status            Service status + recent logs"
     echo "  stats             Latest pipeline stats"
@@ -983,11 +983,11 @@ run_pairing() {
         systemctl start observer || true
     fi
     if systemctl is-active --quiet observer; then
-        ok "Observer is running local-only. Nothing is sent to VaultGuardian."
+        ok "Observer is running with its saved configuration. An existing pairing may still be active."
     else
         warn "Observer is NOT running. Check: journalctl -u observer -n 50 --no-pager"
     fi
-    info "Retry any time with a fresh code: vaultguardian pair <code>"
+    info "Retry with a fresh code from a compatible dashboard: vaultguardian pair --url $HOSTED_BASE_URL <code>"
     return 0
 }
 
@@ -1059,7 +1059,7 @@ if systemctl is-active --quiet observer; then
     # Only nudge a box that is actually unpaired. On the preserve path a blank
     # code means "keep the pairing I already have", not "never paired".
     if [ -z "$(env_value SYNC_URL)" ]; then
-        info "Hosted dashboard: get a pairing code at $DASHBOARD_URL, then run 'vaultguardian pair <code>'"
+        info "Hosted dashboard: get a pairing code at $DASHBOARD_URL, then run 'vaultguardian pair --url $HOSTED_BASE_URL <code>'"
     else
         ok "Hosted dashboard: paired (syncing outbound to $DASHBOARD_URL)"
     fi
