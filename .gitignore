@@ -37,3 +37,16 @@ Thumbs.db
 coverage.out
 *.test
 *.prof
+
+# internal working docs
+plan.txt
+*-prompt-*.md
+cc-prompt-*.md
+frozen-design-*.md
+problem-statement-*.md
+design-brief-*.md
+agreement-round-*.md
+*-runbook.md
+REVIEW.md
+*.Zone.Identifier
+*:Zone.Identifier
