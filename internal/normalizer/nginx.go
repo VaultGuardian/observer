@@ -133,15 +133,25 @@ func (n *NginxNormalizer) normalizeAccess(line string) string {
 		}
 	}
 
-	// Build the normalized output.
-	// The request line is SACRED - method, path, query string, protocol all preserved.
-	// This ensures different attack payloads produce different hashes.
-	//
-	// We strip: IP, timestamp, byte count, referrer, user-agent, x-forwarded-for.
-	// We keep: host (if present), full request line, status code.
 	_ = requestFieldIdx // used above for host detection
 
-	parts := make([]string, 0, 4)
+	return joinAccessParts(host, requestLine, status)
+}
+
+// joinAccessParts builds the normalized form of an HTTP access-log line.
+//
+// Shared by NginxNormalizer and by the http-combined-v1 shape profile, so a
+// container matched to the nginx normalizer by name and a proxy the operator
+// hinted produce a byte-identical normalized line - and therefore the same
+// hash - for the same request.
+//
+// The request line is SACRED - method, path, query string, protocol all preserved.
+// This ensures different attack payloads produce different hashes.
+//
+// We strip: IP, timestamp, byte count, referrer, user-agent, x-forwarded-for.
+// We keep: host (if present), full request line, status code.
+func joinAccessParts(host, requestLine, status string) string {
+	parts := make([]string, 0, 3)
 	if host != "" {
 		parts = append(parts, host)
 	}

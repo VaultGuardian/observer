@@ -89,8 +89,11 @@ func main() {
 	}
 
 	// ------- Init components -------
-	normReg := normalizer.NewRegistry()
+	normReg := normalizer.NewRegistryWithProfileHints(cfg.NormalizerHints)
 	log.Println("[observer] Normalizer registry initialized")
+	if n := len(cfg.NormalizerHints); n > 0 {
+		log.Printf("[observer] Normalizer shape profiles: %d source hint(s) from NORMALIZER_HINTS_JSON", n)
+	}
 
 	patterns, err := patternstore.NewStore(cfg.DataDir)
 	if err != nil {

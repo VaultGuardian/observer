@@ -294,14 +294,23 @@ if [ -n "$RESEND_KEY" ]; then
     else
         # The 'From' address must be verified in the USER'S Resend account.
         # Default to onboarding@resend.dev - Resend's pre-verified sandbox
-        # sender - so first-time installs work immediately without domain
-        # setup. Users can switch to their own verified domain later by
-        # editing ALERT_EMAIL_FROM in the env file.
+        # sender - so first-time installs complete without domain setup.
+        #
+        # The sandbox sender is NOT a working alert channel: an unverified
+        # sender domain means the provider only delivers to the address that
+        # owns the Resend account. Say so here rather than at first missed
+        # alert - an operator who sends themselves a test, sees it arrive and
+        # concludes alerting works has been misled by us, not by Resend.
+        # Users switch to their own verified domain by editing
+        # ALERT_EMAIL_FROM in the env file.
         echo ""
         echo "  The 'From' address must be verified in YOUR Resend account."
-        echo "  Default uses Resend's sandbox sender (onboarding@resend.dev),"
-        echo "  which works out of the box. Switch to your own verified"
-        echo "  domain later via ALERT_EMAIL_FROM in $CONFIG_DIR/observer.env."
+        echo "  The default is Resend's sandbox sender (onboarding@resend.dev)."
+        echo "  Until you verify your own domain, Resend delivers only to the"
+        echo "  email address that owns the Resend account - a test alert"
+        echo "  arriving there is NOT evidence that alerts will reach anyone"
+        echo "  else. To alert any other address, verify a domain and set"
+        echo "  ALERT_EMAIL_FROM in $CONFIG_DIR/observer.env."
         DEFAULT_FROM="VaultGuardian Observer <onboarding@resend.dev>"
         ask "  Alert 'From' address [$DEFAULT_FROM]: " ALERT_EMAIL_FROM
         ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM:-$DEFAULT_FROM}"

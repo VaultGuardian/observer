@@ -156,7 +156,21 @@ Sync includes original attached log lines, normalized lines, decisions and redac
 
 ## Normalizer selection
 
-Selection checks exact source scope, exact source name, a source-name substring matching a registered family, collector type, then generic fallback. Collector framing and the trailing lineage token are stripped before normalization. Generic formats may retain changing values and reuse poorly; a low hit rate alone does not prove misconfiguration. Existing `[hints]` log suggestions do not install new normalization rules. `NORMALIZER_HINTS_JSON`, shape profiles, `/api/guidance`, and `vaultguardian doctor` are not shipped interfaces in this snapshot.
+An operator-declared shape profile is checked first. If none is configured, or the declared profile does not parse the line, selection checks exact source scope, exact source name, a source-name substring matching a registered family, collector type, then generic fallback. Collector framing and the trailing lineage token are stripped before normalization. Generic formats may retain changing values and reuse poorly; a low hit rate alone does not prove misconfiguration. Existing `[hints]` log suggestions do not install new normalization rules.
+
+| Variable | Default | Description |
+|---|---|---|
+| `NORMALIZER_HINTS_JSON` | (unset) | JSON object mapping a source key to a shape profile name. Keys are `source_type:source_name` or a bare `source_name`; no other key form is recognized. A malformed document or an unknown profile name stops startup |
+
+```
+NORMALIZER_HINTS_JSON='{"docker:edge":"http-combined-v1","router":"http-combined-v1"}'
+```
+
+One profile name is available: `http-combined-v1`. It accepts the combined access-log grammar, with or without a trailing `$http_x_forwarded_for` field, and keeps the request line and status code while dropping the client address, identd/user fields, bracket timestamp, byte count, referrer and user-agent. It is strict: a line that does not satisfy the whole grammar is declined and normalized by the selection chain above instead, unchanged. Declining is also what happens to formats it does not cover, including the five-field variant that carries a leading vhost.
+
+A hint applies because it is configured. Log content does not select a profile, change one, or turn one off.
+
+A source that resolves to generic normalization while emitting combined access-log lines is reported once per source per process run. That message is advisory; it does not change normalization, and it is not emitted for a source that already has a hint. `/api/guidance` and `vaultguardian doctor` are not shipped interfaces in this snapshot.
 
 ## Persistence and backups
 

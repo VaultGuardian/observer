@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vaultguardian/observer/internal/normalizer"
 )
 
 // Config holds all Observer configuration loaded from environment variables.
@@ -25,6 +27,10 @@ type Config struct {
 	SelfID            string
 	Hostname          string
 	ExcludeContainers map[string]bool
+
+	// NormalizerHints holds the validated NORMALIZER_HINTS_JSON shape-profile
+	// declarations. Empty means no hints, which is the default behavior.
+	NormalizerHints normalizer.ProfileHints
 
 	// Response Evidence Capture
 	RECEnabled     bool
@@ -279,6 +285,20 @@ func LoadConfig() Config {
 			}
 		}
 		log.Printf("[observer] Excluding containers: %s", raw)
+	}
+
+	// NORMALIZER_HINTS_JSON - operator-declared shape profiles, mapping a
+	// source key ("source_type:source_name" or a bare "source_name") to a
+	// log grammar the normalizer should apply instead of resolving by name.
+	//
+	// Fails startup rather than warning and continuing. Normalization feeds
+	// the hash, the learned pattern store and the LLM cache key, so a typo'd
+	// profile name that silently degraded to generic would quietly poison
+	// classification with no error anywhere to show for it.
+	if hints, err := normalizer.ParseProfileHints(getEnv("NORMALIZER_HINTS_JSON", "")); err != nil {
+		log.Fatalf("[observer] %v", err)
+	} else {
+		cfg.NormalizerHints = hints
 	}
 
 	// REC_EXCLUDE_CONTAINERS - containers to exclude from REC namespace

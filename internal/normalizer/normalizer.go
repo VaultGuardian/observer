@@ -51,13 +51,41 @@ type Registry struct {
 	mu          sync.RWMutex
 	normalizers map[string]Normalizer // key: "source_type" or "source_type:source_name"
 	fallback    Normalizer
+
+	// profileHints holds operator-declared shape profiles, keyed by scope key
+	// or bare source name. Written once at construction and never mutated, so
+	// reads on the hot path need no lock. Nil means no hints configured, which
+	// is today's behavior bit for bit.
+	profileHints ProfileHints
+
+	// suggest tracks which sources have already been told they might want a
+	// shape profile. Advisory only; see maybeSuggestShapeProfile.
+	suggest shapeSuggestState
 }
 
-// NewRegistry creates a registry with the default normalizers pre-registered.
+// NewRegistry creates a registry with the default normalizers pre-registered
+// and no shape-profile hints.
 func NewRegistry() *Registry {
+	return NewRegistryWithProfileHints(nil)
+}
+
+// NewRegistryWithProfileHints creates a registry with the default normalizers
+// pre-registered and the operator's declared shape profiles applied.
+//
+// Hints come from ParseProfileHints, which has already validated them; an
+// invalid hint set cannot reach here. Passing nil or an empty map is exactly
+// equivalent to NewRegistry().
+func NewRegistryWithProfileHints(hints ProfileHints) *Registry {
 	r := &Registry{
 		normalizers: make(map[string]Normalizer),
 		fallback:    &GenericNormalizer{},
+		suggest: shapeSuggestState{
+			done:    make(map[string]bool),
+			samples: make(map[string]int),
+		},
+	}
+	if len(hints) > 0 {
+		r.profileHints = hints
 	}
 
 	// Register built-in source-family normalizers
@@ -122,19 +150,41 @@ func (r *Registry) Lookup(e *event.Event) Normalizer {
 // Before calling the source-specific normalizer, we strip collector-level
 // framing (Docker 8-byte stream headers, Docker ISO timestamp prefixes).
 // This means normalizers only deal with the application's native log format.
+//
+// An operator-declared shape profile takes precedence over every step of
+// Lookup - but only if the profile actually parses the line. A profile that
+// declines falls through to the normal Lookup chain exactly as if no hint
+// existed, so a hint can improve normalization for the lines it understands
+// without changing anything about the lines it does not.
 func (r *Registry) NormalizeEvent(e *event.Event) {
-	n := r.Lookup(e)
-
 	// Strip collector framing ONCE, upstream of all normalizers.
 	line := stripCollectorFraming(e.Line)
 
 	// Strip the request-lineage token (D3) before any normalizer sees the
 	// line, so the volatile per-request vgrid value can never enter the
-	// normalized line, the hash, learned patterns, or a cache key.
+	// normalized line, the hash, learned patterns, or a cache key. This runs
+	// before profile resolution too: a profile must never see the token.
 	line = stripLineageToken(line)
+
+	profile, hinted := r.profileFor(e.ScopeKey(), e.SourceName)
+	if hinted {
+		if normalized, ok := profile.Normalize(line); ok {
+			e.NormalizedLine = normalized
+			e.Hash = hashLine(e.NormalizedLine)
+			return
+		}
+	}
+
+	n := r.Lookup(e)
 
 	e.NormalizedLine = n.Normalize(line)
 	e.Hash = hashLine(e.NormalizedLine)
+
+	// Advisory only, and never for a source the operator already configured -
+	// they have answered the question this would ask.
+	if !hinted && isFormatAgnostic(n) {
+		r.maybeSuggestShapeProfile(e.ScopeKey(), line)
+	}
 }
 
 // stripCollectorFraming removes Docker-specific framing from a log line.
