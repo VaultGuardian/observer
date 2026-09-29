@@ -44,6 +44,8 @@ plan.txt
 cc-prompt-*.md
 frozen-design-*.md
 problem-statement-*.md
+CLAUDE.md
+.claude/
 design-brief-*.md
 agreement-round-*.md
 *-runbook.md
