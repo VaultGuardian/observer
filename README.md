@@ -10,7 +10,7 @@ Observer is a single Go binary that watches your Docker and Linux logs, classifi
 
 Observer is for people who want fewer security alerts, not fewer security signals.
 
-**Latest release: v1.5.1.** v1.4.0 made it survive floods. v1.5.0 added opt-in request lineage so proxy/backend observations can coalesce when their trusted ID, routing, and verdict timing line up. v1.5.1 lets you write `captain-nginx` instead of the full Docker task name.
+**Latest release: v1.6.0.** v1.4.0 made it survive floods. v1.5.0 added opt-in request lineage so one request through a proxy is one finding, not two. v1.5.1 lets you write `captain-nginx` instead of the full Docker task name. v1.6.0 adds a strict combined-access-log profile you can pin per source with `NORMALIZER_HINTS_JSON`, so Apache-style lines behind a generic container name stop missing the cache.
 
 ---
 
@@ -42,7 +42,7 @@ Tools that only look at the request can't tell the difference. Signature matches
 
 Observer is built around the reality that **most probes fail**. Failed probes should become probe intelligence, not panic. The things that should interrupt you are proven impact and explicit policy hits. Everything else gets recorded so you can review it on your own time.
 
-The product decision: **notify on observable impact, malicious direct-dispatch matches, and explicit policy escalations.** Non-HTTP malicious log classifications can notify without HTTP proof; with REC off, HTTP malicious pattern matches can also take that direct path. Allow/suppress traffic is counted rather than archived as findings. Delivery still depends on what channels you configured and their rate limits, and under a flood Observer sheds work and counts what it shed. It is not a raw log archive and doesn't pretend to be.
+The product decision: **notify on proven impact and policy hits. Record everything else, don't email it.** Delivery still depends on what channels you configured and their rate limits, and under a flood Observer sheds work and counts what it shed. It is not a raw log archive and doesn't pretend to be.
 
 ---
 
@@ -60,7 +60,7 @@ I planted a fake `.env` in the WordPress webroot on my soak box, loaded with Can
 
 ![.env canary: cache hit, REC capture, evidence confirmed, escalated](docs/images/env-canary-cache-hit-evidence.png)
 
-Note the **Cache lineage** line: this event was classified by a pattern learned from `evt_9fad64d1877d259d`, the Sept 12 catch. And the response evidence panel is what the server actually returned to the attacker, redacted structurally before persistence as an evidence preview. REC temporarily retains bounded raw preview bytes in memory.
+Note the **Cache lineage** line: this event was classified by a pattern learned from `evt_9fad64d1877d259d`, the Sept 12 catch. And the response evidence panel is what the server actually returned to the attacker, redacted structurally before it was stored anywhere.
 
 ![.env canary: event list with the cached and original catches](docs/images/env-canary-event-list.png)
 
@@ -84,7 +84,7 @@ What Observer did:
 
 1. **Tier 1 classification (as it ran at the time):** the LLM identified command execution via `setup.cgi` and returned `malicious` at 0.78 confidence. Only the exact normalized hash was cached, no broad pattern was learned. Today the flow is stricter: a Tier 1 `malicious` verdict on an HTTP event is capped to `alert` before caching, and a plain 404 usually never reaches the LLM at all.
 2. **Coordinator held for evidence:** instead of firing immediately, the finding was held through a 5-second evidence window (10-second finalize) while REC delivered the response.
-3. **REC captured the HTTP response:** the reverse proxy returned `404 Not Found`. In this historical demonstration, the response was treated as a failed probe; a 404 alone is not proof of no side effects.
+3. **REC captured the HTTP response:** the reverse proxy returned `404 Not Found`. The path doesn't exist on this server.
 4. **Final verdict: `recon` (downgraded by evidence).** Recorded as probe intelligence. **No email**, no incident.
 
 That's one alert saved. Multiply by the thousands of automated probes a public server sees daily. Stored `recon` findings are queryable at `/api/findings?verdict=recon`. Noise that got suppressed deterministically is counted, not stored as a finding.
@@ -160,7 +160,7 @@ verdict                  recon       → record as probe intelligence, no email
 7. **Catch-all suppression**: Tracks response fingerprints (host, method, status, body hash) across distinct paths and verifies candidates before using them to downgrade repeats. A separate REC-miss fallback can match byte similarity to a previously verified benign response; a byte count alone is not proof of failure.
 8. **Evidence reconciler**: Checks every 60 s for eligible unresolved HTTP `alert`/`malicious` findings older than 15 minutes, marking them `evidence_unavailable` when they have no attached available evidence. Findings with available evidence remain pending for review rather than being relabeled unavailable.
 
-The whole thing ships as one Go binary. No external database, no state service. SQLite and pattern files live locally (the systemd install puts them in `/var/lib/observer`). It builds without CGO (see [Build from source](#build-from-source)). The LLM endpoint is a separate dependency. Hosted sync and notification providers are additional dependencies when enabled.
+The whole thing ships as one Go binary. No external database, no state service. SQLite and pattern files live locally (the systemd install puts them in `/var/lib/observer`). It builds without CGO (see [Build from source](#build-from-source)). The LLM endpoint and any notification providers you turn on are the only outside dependencies.
 
 **Flood behavior (v1.4.0 onward):** Observer has now ridden through two real xmlrpc brute-force floods on my soak box. Findings kept resolving mid-flood and the review queue didn't pile up. Queues and evidence storage are bounded, so under enough load it sheds work, and every shed event is counted by reason in `/api/stats` and shown in the dashboard's health banner. It recovers on its own once the queues drain, and the counters keep the history. This is counted loss with recovery. It is not zero loss, and I won't claim it is.
 
@@ -239,12 +239,12 @@ Observer installs a systemd service and reads container network namespaces, so i
 
 ## Manual install
 
-If you'd rather not pipe a script to root (reasonable, especially on a security tool), install by hand. Run this from a checkout of the release you are installing, containing `observer.env.example` and `observer.service`. The example below pins v1.5.1 so the binary, checksum, and checked-out config/unit can match. Review the env example: it enables journald and REC and points Ollama at localhost; the interactive installer detects sources and asks for your settings.
+If you'd rather not pipe a script to root (reasonable, especially on a security tool), install by hand. Run this from a checkout of the release you are installing, containing `observer.env.example` and `observer.service`. The example below pins v1.6.0 so the binary, checksum, and checked-out config/unit can match. Review the env example: it enables journald and REC and points Ollama at localhost; the interactive installer detects sources and asks for your settings.
 
 ```bash
 (
 set -e
-RELEASE=v1.5.1
+RELEASE=v1.6.0
 # Download the binary and checksum matching your checkout
 curl -fsSL https://github.com/VaultGuardian/observer/releases/download/$RELEASE/observer -o observer
 curl -fsSL https://github.com/VaultGuardian/observer/releases/download/$RELEASE/observer.sha256 -o observer.sha256
@@ -268,7 +268,7 @@ sudo systemctl enable --now observer
 )
 ```
 
-The one-liner is the convenience path. It also installs the `vaultguardian` wrapper, walks you through configuration, and verifies the published SHA256 before installing the downloaded binary. The short URL redirects to the GitHub raw installer:
+The one-liner is the convenience path. It does the same steps, plus installs the `vaultguardian` wrapper, walks you through configuration, and verifies the published SHA256 before anything lands on disk. The short URL redirects to the GitHub raw installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VaultGuardian/observer/main/install.sh | sudo bash
@@ -313,7 +313,7 @@ vaultguardian stats           # Pipeline performance
 vaultguardian rec status      # REC coverage + port status
 vaultguardian pair --url https://vaultguardian.io <code>  # First-time pairing
 vaultguardian update          # Update to latest release
-vaultguardian update v1.5.1  # Update to a specific version
+vaultguardian update v1.6.0  # Update to a specific version
 vaultguardian restart         # Restart observer
 vaultguardian version         # Current + available versions
 vaultguardian uninstall       # Remove observer (data preserved)
@@ -337,6 +337,7 @@ Settings and secrets are environment variables, loaded from `/etc/vaultguardian/
 | `EXCLUDE_CONTAINERS` | | Comma-separated container names to skip |
 | `JOURNALD_EXCLUDE_UNITS` | | Additional systemd units to suppress |
 | `HOSTNAME` | (empty; falls back to system hostname) | Label for this server, included in alert emails alongside the IP. The installer's "server nickname" prompt writes this. |
+| `NORMALIZER_HINTS_JSON` | (unset) | JSON object pinning a shape profile per source, e.g. `{"docker:wp":"http-combined-v1"}`. Keys are `source_type:source_name` or a bare `source_name`. The one profile so far is `http-combined-v1` (strict combined access-log grammar; lines that don't match fall through to the normal selection chain). Never switched automatically on traffic. A malformed document or unknown profile name stops startup. See [`docs/configuration.md`](docs/configuration.md). |
 
 ### LLM
 
@@ -384,7 +385,7 @@ Additional REC tuning knobs exist (`REC_FLOW_*`, `REC_REASSEMBLY_MAX_BUFFERED_PA
 | `DASHBOARD_KEY_FILE` | `/etc/vaultguardian/dashboard.key` | Path to bearer token file (auto-generated) |
 | `DASHBOARD_ALLOWED_ORIGINS` | (none) | Comma-separated CORS allowlist; empty = no CORS headers |
 
-> **Important:** the outbound client needs no change to this local API. It pairs and pushes to a compatible hosted backend. See [pairing and data handling](#hosted-dashboard-pairing) before connecting. The one reason to override `DASHBOARD_BIND_ADDR` is serving the API to your own LAN or to a reverse proxy on this host; do that behind TLS and authentication. Observer logs a warning when the dashboard is bound to a non-loopback address.
+> **Important:** this API is local. Connecting the [hosted dashboard](#dashboard) does **not** require changing it. Observer pairs and pushes outbound, so nothing connects in. The one reason to override `DASHBOARD_BIND_ADDR` is serving the API to your own LAN or to a reverse proxy on this host; do that behind TLS and authentication. Observer logs a warning when the dashboard is bound to a non-loopback address.
 
 ### Email alerts (optional)
 
@@ -414,7 +415,7 @@ This is an **edit illustration**, not a copy-paste line: keep your own existing 
 log_format main '... your existing fields ...' ' vgrid=$request_id';
 ```
 
-Example shape (host and IP replaced with documentation values):
+On my box that produces log lines of this shape (host and IP swapped for documentation values):
 
 ```
 203.0.113.42 - - [15/Sep/2026:04:01:00 +0000] "app.example.com" "GET /?vg-lineage-test=3 HTTP/2.0" 200 70037 "-" "curl/8.5.0" "-" vgrid=2fb2cf19c82b36ceb7f89d50b381fcf1
@@ -498,7 +499,7 @@ SSH failure logs get a dedicated normalizer so repeated shapes reuse learned cla
 
 ### Hosted dashboard (pairing)
 
-The optional multi-server dashboard lives at [vaultguardian.io/dashboard](https://vaultguardian.io/dashboard). Observer pushes findings, LLM decisions, pipeline stats and snapshots to the hosted database. The current website implements pairing, ingestion and signed command polling; it does not connect inbound to the local API.
+The optional multi-server dashboard lives at [vaultguardian.io/dashboard](https://vaultguardian.io/dashboard). Observer pushes findings, LLM decisions, pipeline stats, and snapshots so you can see your whole fleet in one place.
 
 **The connection is outbound only.** Observer pairs once, then pushes to the dashboard on its own schedule. Nothing connects back to your server: there is no inbound port to open, no firewall rule to add, no security group to edit, and no reason to change `DASHBOARD_BIND_ADDR`.
 
@@ -511,17 +512,17 @@ To connect a server:
 vaultguardian pair --url https://vaultguardian.io VG-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX
 ```
 
-The installer asks for a pairing code at the end of a fresh install or reinstall. Blank keeps a fresh box local-only, or leaves an existing pairing alone. The `--url` is required the first time; once `SYNC_URL` is set, plain `vaultguardian pair <code>` works for re-pairing. Manual installs without the wrapper: `sudo observer pair --url https://vaultguardian.io VG-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX`. Codes expire after 15 minutes and are single-use. Generate another for the same instance if yours expires or is lost. If the installer already redeemed a code, do not run it again.
+The installer asks for a pairing code at the end of a fresh install or reinstall. Blank keeps a fresh box local-only, or leaves an existing pairing alone. The `--url` is required the first time; once `SYNC_URL` is set, plain `vaultguardian pair <code>` works for re-pairing. Manual installs without the wrapper: `sudo observer pair --url https://vaultguardian.io VG-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX`. Codes are single-use and expire after 15 minutes, so grab a fresh one if pairing is refused. If the installer already redeemed a code, don't run it again.
 
-Pairing stops Observer, claims the code, writes the `SYNC_*` values to `observer.env` atomically, and starts the service. The hosted claim rotates the sync token and command epoch. **Re-pairing an already-paired instance deletes its hosted findings, decisions, stats and snapshot, and cancels pending commands.** Generating the code alone does not wipe anything; the successful claim does. Observer re-syncs what it still holds locally. History no longer on the box cannot be recovered from that mirror, and cancellation does not undo a command already applied locally. **If the claim fails after the stop, the standalone `pair` command leaves Observer stopped and the env untouched.** Retry with a fresh code, or remove the sync settings and start it yourself for local-only. The installer's pairing step has its own recovery path that restarts the service, and on an upgrade that can resume the old pairing, so check `systemctl status observer` and the env file instead of assuming.
+Pairing stops Observer, claims the code, writes the `SYNC_*` values to `observer.env` atomically, and starts the service. Re-pairing against a new code rotates the sync token and the command-channel epoch, which invalidates anything signed under the old one. **Re-pairing an instance that's already paired wipes its hosted findings, decisions, stats, and snapshot, and cancels any pending commands.** Generating the code doesn't wipe anything; the successful claim does. Observer then re-syncs whatever it still holds locally, so anything already pruned on the box is gone from the mirror too, and a cancelled command that already ran locally stays run. **If the claim fails after the stop, the standalone `pair` command leaves Observer stopped and the env untouched.** Retry with a fresh code, or remove the sync settings and start it yourself for local-only. The installer's pairing step has its own recovery path that restarts the service, and on an upgrade that can resume the old pairing, so check `systemctl status observer` and the env file instead of assuming.
 
 To go back to local-only, remove the `SYNC_*` lines from `observer.env` and restart. With `SYNC_URL`/`SYNC_TOKEN` unset, no sync code runs at all.
 
-What sync actually sends: findings and LLM decision records (which include their raw log lines and any redacted evidence previews), plus pipeline stats, pattern data, trusted IPs, and REC coverage snapshots. It never streams your raw log feed. Be aware that the log lines attached to findings are the original lines, not run through the REC preview redactor. With sync unset, the sync client sends nothing to VaultGuardian. Other configured endpoints remain independent. Using local Ollama does not turn sync or notifications off; those are separate switches. When paired, the command channel also polls outbound for signed dashboard actions (default 30 s). A queued correction is not yet applied: the box verifies it, invokes the local handler, records a receipt, and acknowledges the result. The dashboard can show stored records while a box is offline. Its configured pruning job removes findings/decisions older than 90 days by event time and stats older than 30 days by server capture time; this describes the application job, not verified deletion from backups or provider logs. Removing the instance cascades its hosted records and commands, without deleting local state. See the [dashboard docs](https://vaultguardian.io/docs/observer/dashboard#data-residency) for the full boundary.
+What sync actually sends: findings and LLM decision records (which include their raw log lines and any redacted evidence previews), plus pipeline stats, pattern data, trusted IPs, and REC coverage snapshots. It never streams your raw log feed. Be aware that the log lines attached to findings are the original lines, not run through the REC preview redactor. With sync unset, nothing goes to VaultGuardian at all. Using local Ollama does not turn sync or notifications off; those are separate switches. When paired, the command channel also polls outbound (every 30 s) for signed dashboard actions: a queued correction isn't applied until the box verifies the signature, runs the local handler, records a receipt, and acks the result. The hosted side prunes findings and decisions older than 90 days (by event time) and stats older than 30 days; that's the application job, not a promise about backups or provider logs. Removing an instance from the dashboard deletes its hosted records and commands and touches nothing on the box. See the [dashboard docs](https://vaultguardian.io/docs/observer/dashboard#data-residency) for the full boundary.
 
 ### Local API
 
-Observer exposes a REST API on `DASHBOARD_PORT`, bound to `127.0.0.1` by default. Everything except `/api/health` requires the bearer token from `/etc/vaultguardian/dashboard.key`. Pairing never exposes this listener; the sync engine calls the same handlers over an authenticated local HTTP connection, so hosted access still needs no inbound connection.
+Observer exposes a REST API on `DASHBOARD_PORT`, bound to `127.0.0.1` by default. Everything except `/api/health` requires the bearer token from `/etc/vaultguardian/dashboard.key`. Pairing never exposes this listener; the sync engine calls the same handlers over an authenticated loopback connection, so hosted access still needs no inbound connection.
 
 The API provides:
 
@@ -561,7 +562,7 @@ Honest disclaimers. Security tools that overclaim are worse than security tools 
 - **Not a replacement for patching.** Observer telling you an attack failed because it hit a 404 doesn't mean the application is secure. Patch your stuff.
 - **Not a full SIEM.** Observer focuses on log security and response-evidence verification. It doesn't do log aggregation across infrastructure, compliance reporting, or long-term forensic storage. If you have a SIEM, Observer complements it; it does not replace it.
 - **Not a firewall or IPS.** Observer observes. It doesn't block traffic, drop connections, or modify packets. Use it alongside a real edge filter.
-- **Not magic exploit detection.** REC captures HTTP response evidence when it can. Edge cases (mid-stream attach during Observer restart, responses generated upstream of the sniffed device, encrypted tunnels that don't traverse the sniffed namespace) produce findings without evidence. Eligible unresolved HTTP findings are later marked `evidence_unavailable`; missing or suppressed observations cannot be recovered by that label.
+- **Not magic exploit detection.** REC captures HTTP response evidence when it can. Edge cases (mid-stream attach during Observer restart, responses generated upstream of the sniffed device, encrypted tunnels that don't traverse the sniffed namespace) produce findings without evidence. Observer marks those `evidence_unavailable` rather than guessing.
 - **Not a guarantee.** No security tool is. Observer reduces alert fatigue and surfaces real impact when it can. It does not eliminate the need for skilled operators.
 
 ---
@@ -585,7 +586,7 @@ Honest disclaimers. Security tools that overclaim are worse than security tools 
 │   ├── coordinator/            # Evidence huddle + catch-all suppression
 │   ├── event/                  # Canonical event model
 │   ├── llm/                    # LLM client, Tier 1 + Tier 2 prompts
-│   ├── normalizer/             # Source-specific log normalization
+│   ├── normalizer/             # Source-specific log normalization + profile hints
 │   ├── notifier/               # Email, webhook, SMS, APNs, FCM (env-configured)
 │   ├── patternstore/           # 4-bucket, 4-tier pattern matching
 │   ├── policy/                 # Deterministic pre-LLM policy engine
@@ -617,8 +618,6 @@ Requires Go 1.25+.
 ---
 
 ## Contributing
-
-Normalizer selection uses source scope/name, family-name substring matching, collector type, then a generic fallback. A custom app format can retain changing fields and get poor reuse. Low reuse alone is not a diagnosis. Existing `[hints]` log suggestions are developer input, not an operator guidance system or automatically applied normalizer rules.
 
 Observer's normalizers are the primary contribution path. Each normalizer teaches Observer to recognize a specific service's log format, improving hash-hit rates and reducing LLM calls.
 
