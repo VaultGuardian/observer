@@ -1,14 +1,10 @@
 package rec
 
 import (
-	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"log"
-	"net"
-	"net/http"
-	"time"
 )
 
 // =============================================================================
@@ -162,18 +158,7 @@ type SwarmInfo struct {
 // detectSwarm queries the Docker daemon for Swarm state and VXLAN data-path port.
 // Returns sane defaults if the Docker socket is unreachable.
 func detectSwarm(dockerSocket string) SwarmInfo {
-	if dockerSocket == "" {
-		dockerSocket = "/var/run/docker.sock"
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", dockerSocket, 5*time.Second)
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
+	client := newDockerClient(dockerSocket)
 
 	resp, err := client.Get("http://localhost/info")
 	if err != nil {

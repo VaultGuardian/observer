@@ -2104,6 +2104,20 @@ func runReconciler(ctx context.Context, db *store.Store) {
 // Periodic Stats
 // =============================================================================
 
+// countOpenFDs samples the number of open file descriptors for this process by
+// counting /proc/self/fd entries (Linux). Returns -1 where /proc is
+// unavailable. One directory read every stats tick (30s) - cheap, off the hot
+// path. This is the canary for descriptor leaks (e.g. unclosed Docker-socket
+// connections): a count that grows without bound while the pipeline reports
+// healthy is exactly the failure mode the rest of this telemetry cannot see.
+func countOpenFDs() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	return len(entries)
+}
+
 func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patternstore.Store, collector rec.EvidenceCollector, db *store.Store, coord *coordinator.Coordinator, scheduler *LLMScheduler, policyEngine *policy.Engine, healthStats *health.Stats, dispatch *notifier.Dispatcher) {
 	ticker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(1 * time.Hour)
@@ -2127,9 +2141,9 @@ func runPeriodicStats(ctx context.Context, a *analyzer.Analyzer, patterns *patte
 			drops := healthStats.PipelineDrops()
 			retryDrops := healthStats.RetryDrops()
 			asyncDrops := db.AsyncWriterStats() // Fix 3: async writer drops
-			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d async_drops=%d",
+			log.Printf("[observer] Pipeline: processed=%d pattern_hits=%d noise_suppressed=%d llm_calls=%d llm_errors=%d learned=%d deferred=%d retried=%d retry_pattern=%d llm_sched_total=%d llm_sched_dropped=%d pipeline_drops=%d retry_drops=%d async_drops=%d open_fds=%d",
 				aStats.TotalProcessed, aStats.PatternHits, aStats.NoiseSuppressed, aStats.LLMCalls, aStats.LLMErrors, aStats.PatternsLearned,
-				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops, asyncDrops)
+				aStats.LLMDropped, aStats.Retried, aStats.RetriedPatternHit, llmTotal, llmDropped, drops, retryDrops, asyncDrops, countOpenFDs())
 			log.Printf("[observer] Patterns: hash=%d prefix=%d regex=%d contains=%d malicious=%d alert=%d suppress=%d misses=%d",
 				pStats.HashHits, pStats.PrefixHits, pStats.RegexHits, pStats.ContainsHits,
 				pStats.MaliciousHits, pStats.AlertHits, pStats.SuppressHits, pStats.Misses)

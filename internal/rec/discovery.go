@@ -102,6 +102,13 @@ func isLoopbackIP(ip string) bool {
 
 // newDockerClient builds a unix-socket HTTP client, mirroring the shape used by
 // findContainerPID (nsenter.go). No new dependency.
+//
+// DisableKeepAlives is load-bearing: callers construct a throwaway client per
+// request, and a pooled keep-alive connection would outlive its Transport with
+// no way to ever reuse or close it - the pool's readLoop goroutine pins the
+// conn, so even GC never reclaims the fd. With keep-alives off, Body.Close()
+// closes the socket. One extra unix-socket dial per call is negligible at the
+// reconcile cadence.
 func newDockerClient(dockerSocket string) *http.Client {
 	if dockerSocket == "" {
 		dockerSocket = "/var/run/docker.sock"
@@ -111,6 +118,7 @@ func newDockerClient(dockerSocket string) *http.Client {
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return net.DialTimeout("unix", dockerSocket, 5*time.Second)
 			},
+			DisableKeepAlives: true,
 		},
 		Timeout: 10 * time.Second,
 	}
@@ -130,6 +138,10 @@ func newDockerStreamClient(dockerSocket string) *http.Client {
 				return net.DialTimeout("unix", dockerSocket, 5*time.Second)
 			},
 			ResponseHeaderTimeout: 30 * time.Second,
+			// Same rationale as newDockerClient: one throwaway client per
+			// /events (re)connect, so the connection must die with Body.Close()
+			// rather than parking in an unreachable idle pool.
+			DisableKeepAlives: true,
 		},
 		Timeout: 0,
 	}

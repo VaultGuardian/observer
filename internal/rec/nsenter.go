@@ -1,16 +1,12 @@
 package rec
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // =============================================================================
@@ -153,18 +149,7 @@ type containerInfo struct {
 // (case-insensitive). For CapRover: "captain-nginx" matches
 // "captain-nginx.1.hjfscqq05nqtarebk0ps5xsgo".
 func findContainerPID(dockerSocket, namePattern string) (*containerInfo, error) {
-	if dockerSocket == "" {
-		dockerSocket = "/var/run/docker.sock"
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", dockerSocket, 5*time.Second)
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
+	client := newDockerClient(dockerSocket)
 
 	// List running containers
 	resp, err := client.Get("http://localhost/containers/json")
